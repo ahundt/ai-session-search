@@ -203,7 +203,11 @@ pub(crate) fn atomic_write_file(
             )
         }
         Ok(_) if mode == AtomicWriteMode::CreateNew => {
-            bail!("destination already exists: {}", destination.display())
+            return Err(crate::ServiceError::destination_exists(
+                destination,
+                format!("destination already exists: {}", destination.display()),
+            )
+            .into())
         }
         Ok(metadata) => Some(metadata.permissions()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,

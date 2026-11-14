@@ -138,6 +138,7 @@ mod analysis_service_tests {
                     crate::skill_run::MessageClassificationQuery {
                         filters,
                         additional_skills: Vec::new(),
+                        include_unattributed_input: false,
                     },
                 ),
             })
@@ -182,6 +183,7 @@ mod analysis_service_tests {
                     crate::skill_run::MessageClassificationQuery {
                         filters: MessageFilters::default(),
                         additional_skills: Vec::new(),
+                        include_unattributed_input: false,
                     },
                 ),
             })
@@ -224,6 +226,7 @@ mod analysis_service_tests {
                         additional_skills: vec![crate::skill_catalog::SkillSelector::Path(
                             crate::skill_catalog::SkillPathSelector { path: skill_root },
                         )],
+                        include_unattributed_input: false,
                     },
                 ),
             })
@@ -430,6 +433,7 @@ mod analysis_service_tests {
                             "additional",
                         )
                         .unwrap()],
+                        include_unattributed_input: false,
                     },
                 ),
             })
@@ -930,6 +934,9 @@ mod analysis_service_tests {
 
 impl SessionSearch {
     /// Load platform configuration and open the configured index.
+    ///
+    /// Opening never refreshes the index. Call [`IndexService::prepare_for_read`] before the
+    /// first query to apply the configured refresh policy, as the command line does.
     pub fn load() -> Result<Self> {
         Self::open(Config::load()?)
     }
@@ -942,17 +949,54 @@ impl SessionSearch {
     /// are absent; it does not modify the durable database contents. Other refresh modes
     /// may create a new current-schema database and later perform the configured incremental
     /// refresh. Newer, hybrid, and incomplete current schemas fail before an ordinary query.
+    ///
+    /// Opening never reads session sources. This published constructor preserves empty reads
+    /// before the first refresh. Use [`SessionSearch::open_strict`] to distinguish an unrefreshed
+    /// index from an empty history, then call [`IndexService::prepare_for_read`] before querying.
+    ///
+    /// # Threads
+    ///
+    /// `SessionSearch` is `Send` but not `Sync`: it owns one SQLite connection. Move it into a
+    /// thread, open one instance per thread, or share one behind a `Mutex`.
     pub fn open(config: Config) -> Result<Self> {
         let inputs = TrustedAccessInputs::capture(&config.search.scope, Vec::new())?;
         Self::open_with_access_inputs(config, inputs)
     }
 
-    /// Open an index with trusted runtime roots supplied by a harness integration.
+    /// Open an index with trusted runtime roots, preserving published empty-read behavior.
     pub fn open_with_access_inputs(
         config: Config,
         access_inputs: TrustedAccessInputs,
     ) -> Result<Self> {
         Self::open_with_access_inputs_and_runtime(config, access_inputs, None)
+    }
+
+    /// Open without reading sources, refusing reads until the index contains sessions or has
+    /// completed a refresh. Call [`IndexService::prepare_for_read`] to apply the refresh policy.
+    pub fn open_strict(config: Config) -> Result<Self> {
+        let inputs = TrustedAccessInputs::capture(&config.search.scope, Vec::new())?;
+        Self::open_strict_with_access_inputs(config, inputs)
+    }
+
+    /// Like [`SessionSearch::open_strict`], with trusted roots supplied by a harness integration.
+    pub fn open_strict_with_access_inputs(
+        config: Config,
+        access_inputs: TrustedAccessInputs,
+    ) -> Result<Self> {
+        let mut app = Self::open_with_access_inputs(config, access_inputs)?;
+        app.db.set_reject_unrefreshed_reads(true);
+        Ok(app)
+    }
+
+    /// Serve an index that has never been refreshed as an empty one instead of returning
+    /// [`ServiceError::IndexNotRefreshed`](crate::ServiceError::IndexNotRefreshed).
+    ///
+    /// For frontends that apply the refresh policy themselves and print an empty result when
+    /// another process is still writing the first index: the command line, the MCP server, and
+    /// the Python binding. A Rust program should call [`IndexService::prepare_for_read`] instead.
+    #[doc(hidden)]
+    pub fn serve_unrefreshed_index_as_empty(&mut self) {
+        self.db.set_reject_unrefreshed_reads(false);
     }
 
     /// Open an independent prepared-index reader sharing one fixed data-parallel worker budget.
@@ -982,10 +1026,14 @@ impl SessionSearch {
         let schema_state = IndexCoordinator::new(&config).inspect_schema()?;
         match schema_state {
             SchemaState::Missing if config.index.refresh == IndexRefresh::ExistingOnly => {
-                anyhow::bail!(
-                    "existing-only index {} does not exist; run `aise reindex --full` without --index-refresh existing-only",
-                    config.db_path().display()
+                return Err(crate::ServiceError::index_missing(
+                    &config.db_path(),
+                    format!(
+                        "existing-only index {} does not exist; run `aise reindex --full` without --index-refresh existing-only",
+                        config.db_path().display()
+                    ),
                 )
+                .into())
             }
             SchemaState::Older { current, .. }
                 if config.index.refresh == IndexRefresh::ExistingOnly
@@ -1077,7 +1125,7 @@ impl SessionSearch {
 
     /// Session catalog operations.
     pub const fn catalog(&self) -> CatalogService<'_> {
-        CatalogService::new(&self.db)
+        CatalogService::with_config(&self.db, &self.config)
     }
 
     /// Message search and context operations.
@@ -1109,6 +1157,7 @@ impl SessionSearch {
         request: MessageSearchRequest,
         batch_rows: NonZeroUsize,
     ) -> Result<MessageSearchBatches> {
+        self.db.ensure_refreshed_for_read()?;
         self.message_search_batches_for_surface(SearchSurface::Rust, request, batch_rows)
     }
 
@@ -1157,6 +1206,11 @@ impl SessionSearch {
     /// Indexed correction, planning, and statistics operations.
     pub const fn analysis(&self) -> AnalysisService<'_> {
         AnalysisService::new(&self.config, &self.db)
+    }
+
+    /// Read-only SQL over the index, as `aise db query` and `aise db schema` run it.
+    pub const fn sql(&self) -> SqlService<'_> {
+        SqlService::new(&self.config)
     }
 
     /// Crate-internal storage access for operations not yet represented by a service.
@@ -1247,7 +1301,7 @@ mod execution_runtime_tests {
     /// build cannot decode. Before this guard the older build failed deep inside whichever query
     /// touched such a row with "unrecognized provider ... run `aise reindex --full`", and that
     /// command failed the same way while enumerating retained sessions -- circular advice that
-    /// locked the older build out of every command (observed from a Pi session on 2026-08-13).
+    /// locked the older build out of every command that opens the index.
     /// The open must refuse once, name the provider, and say the fix: upgrade aise.
     #[test]
     fn ordinary_open_refuses_an_index_carrying_a_provider_this_build_does_not_know() {
@@ -1465,11 +1519,23 @@ mod execution_runtime_tests {
             .unwrap();
         assert_eq!(message_response.hits().len(), 1);
         assert_eq!(message_response.hits()[0].session_id, "claude:allowed");
+        // Legacy exact-ID reads and resolving reads both preserve the access boundary.
         assert!(app
             .messages()
             .context("claude:hidden", 0, 1, 1)
             .unwrap()
             .is_empty());
+        let hidden = app
+            .messages()
+            .context_resolved("claude:hidden", 0, 1, 1)
+            .unwrap_err();
+        assert_eq!(
+            hidden
+                .downcast_ref::<crate::ServiceError>()
+                .map(crate::ServiceError::code),
+            Some("session-not-found"),
+            "{hidden:#}"
+        );
         assert!(app
             .messages()
             .session_metadata(&["claude:hidden".into()])
@@ -1632,8 +1698,8 @@ mod execution_runtime_tests {
             observed_calls.fetch_add(1, Ordering::Relaxed);
         });
         let hits = app
-            .messages()
-            .search_legacy(
+            .database()
+            .search_messages(
                 "ECONNRESET",
                 &MessageFilters {
                     match_mode: MessageSearchMode::Regex,
@@ -1713,6 +1779,7 @@ pub struct AnalysisService<'app> {
 
 /// Immutable analytical provenance produced with one result under the same SQLite snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct AnalysisReceipt {
     /// Population strategy applied after structural session filtering.
     pub selection: crate::models::AnalysisSessionSelection,
@@ -1740,6 +1807,7 @@ pub struct AnalysisReceipt {
 
 /// Pure analysis result paired with the exact selection, snapshot input, policy, and result facts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
 pub struct ReceiptedAnalysis {
     /// Canonical classifications, relationships, vocabulary, and graph inputs.
     pub result: crate::analysis_pipeline::AnalysisResult,
@@ -1758,13 +1826,19 @@ impl<'app> AnalysisService<'app> {
 
     pub(crate) fn corrections_with_resolved_policies(
         &self,
-        filters: &crate::models::MessageFilters,
+        query: &crate::skill_run::MessageClassificationQuery,
         policies: &crate::corrections::ResolvedCorrectionPolicySet,
     ) -> Result<crate::corrections::MessageClassificationReport> {
-        let matches = self.db.find_corrections(policies, filters)?;
+        let (matches, unattributed_input_count) = self.db.find_corrections_with_receipt(
+            policies,
+            &query.filters,
+            query.include_unattributed_input,
+        )?;
         Ok(crate::corrections::MessageClassificationReport {
             policies: policies.receipts(),
             matches,
+            unattributed_input_count,
+            unattributed_input_included: query.include_unattributed_input,
         })
     }
 
@@ -1778,6 +1852,7 @@ impl<'app> AnalysisService<'app> {
         &self,
         query: &crate::skill_run::SkillRunQuery,
     ) -> Result<crate::skill_run::SkillRunReport> {
+        self.db.ensure_refreshed_for_read()?;
         let crate::skill_run::SkillCapabilityInput::MessageClassification(arguments) = &query.input;
         let embedded_primary = matches!(
             &query.skill,
@@ -1912,7 +1987,7 @@ impl<'app> AnalysisService<'app> {
             };
             (resolved_skill, policies)
         };
-        let report = self.corrections_with_resolved_policies(&arguments.filters, &policies)?;
+        let report = self.corrections_with_resolved_policies(arguments, &policies)?;
         let receipt = report
             .policies
             .first()
@@ -1942,6 +2017,7 @@ impl<'app> AnalysisService<'app> {
         filters: &MessageFilters,
         command_patterns: &[String],
     ) -> Result<Vec<crate::models::PlanningCount>> {
+        self.db.ensure_refreshed_for_read()?;
         let command_filters =
             crate::analytics::compile_planning_filters(self.config, command_patterns)?;
         self.db.planning_usage(filters, &command_filters)
@@ -1956,6 +2032,7 @@ impl<'app> AnalysisService<'app> {
         &self,
         filters: &MessageFilters,
     ) -> Result<Vec<crate::analytics::RoleStat>> {
+        self.db.ensure_refreshed_for_read()?;
         let rows: Vec<_> = self
             .db
             .message_role_counts(filters)?
@@ -1970,6 +2047,79 @@ impl<'app> AnalysisService<'app> {
         Ok(rows.into_iter().skip(filters.offset).take(limit).collect())
     }
 
+    /// Find phrases a person keeps typing across messages, as `aise repeats` does.
+    ///
+    /// Each message is split into lowercase words. A run of `phrase_min_words` to
+    /// `phrase_max_words` words is a candidate when it contains no digit, neither starts nor
+    /// ends with a stop word, and holds a word of four or more letters that is not a stop word;
+    /// a candidate found in at least `min_matches` messages becomes a group. Unset limits come from
+    /// `[analytics]` in the configuration, exactly as the command line resolves them.
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::InvalidArgument`](crate::ServiceError::InvalidArgument) for a zero
+    /// `min_matches` or `phrase_min_words`, or `phrase_max_words` below the minimum;
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) for an unknown
+    /// `filters.session_id`; an error for an invalid regex.
+    ///
+    /// # Complexity
+    ///
+    /// Time and memory are proportional to the candidate messages' text times the phrase-width
+    /// range, plus sorting the distinct candidate phrases.
+    pub fn repeats(
+        &self,
+        query: &crate::analytics::RepeatsQuery,
+    ) -> Result<crate::analytics::RepeatsReport> {
+        self.db.ensure_refreshed_for_read()?;
+        crate::analytics::mine_repeats(self.db, &self.config.analytics, query)
+    }
+
+    /// Report indexed terms by frequency, as `aise vocab` does.
+    ///
+    /// Counts come from the full-text index and cover every indexed message, so they cannot be
+    /// limited to some sessions. For that reason this call is refused when the application's
+    /// access scope is `allowed-roots`; use message search for scoped counts.
+    ///
+    /// # Errors
+    ///
+    /// Fails under an `allowed-roots` access scope or when the index query fails.
+    ///
+    /// # Complexity
+    ///
+    /// A prefix is answered from the term index order in `O(log T + K)` for `T` terms and `K`
+    /// returned rows; without one SQLite reads and sorts every term, `O(T log T)`. The first
+    /// trigram read on an older schema builds the trigram table once.
+    pub fn vocabulary(
+        &self,
+        query: &crate::analytics::VocabularyQuery,
+    ) -> Result<Vec<crate::analytics::TermFrequency>> {
+        self.db.ensure_refreshed_for_read()?;
+        if !matches!(
+            self.db.access_scope(),
+            crate::search_scope::EffectiveAccessScope::All
+        ) {
+            bail!(
+                "term frequency is unavailable under an allowed-roots access scope because the \
+                 index counts terms across every session; use message search for scoped counts"
+            );
+        }
+        self.index_vocabulary(query)
+    }
+
+    /// Index-wide term counts without the access-scope refusal, for `aise vocab`.
+    pub(crate) fn index_vocabulary(
+        &self,
+        query: &crate::analytics::VocabularyQuery,
+    ) -> Result<Vec<crate::analytics::TermFrequency>> {
+        let limit = query.limit.unwrap_or(self.config.analytics.vocab_limit);
+        Ok(self
+            .db
+            .vocabulary(query.trigram, limit, query.prefix.as_deref())?
+            .into_iter()
+            .map(|(term, docs, count)| crate::analytics::TermFrequency { term, docs, count })
+            .collect())
+    }
+
     /// Return one bounded keyset page of provider-normalized session text for outward analysis.
     ///
     /// # Complexity
@@ -1982,6 +2132,7 @@ impl<'app> AnalysisService<'app> {
         filters: &SearchFilters,
         cursor: Option<&crate::models::AnalysisCursor>,
     ) -> Result<crate::models::AnalysisDocumentPage> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.analysis_documents(filters, cursor)
     }
 
@@ -2004,6 +2155,7 @@ impl<'app> AnalysisService<'app> {
         request: &crate::models::AnalysisRequest,
         policy: &crate::analysis_pipeline::AnalysisPolicy,
     ) -> Result<ReceiptedAnalysis> {
+        self.db.ensure_refreshed_for_read()?;
         self.run_with_session_batch_size(request, DEFAULT_ANALYSIS_SESSION_BATCH_SIZE, policy)
     }
 
@@ -2075,6 +2227,7 @@ impl<'db> ExportService<'db> {
         id_or_prefix: &str,
         format: crate::export::ExportFormat,
     ) -> Result<crate::export::ExportDocument> {
+        self.db.ensure_refreshed_for_read()?;
         let session = self.db.resolve_session(id_or_prefix)?;
         crate::export::render_full(&session, format)
     }
@@ -2090,6 +2243,7 @@ impl<'db> ExportService<'db> {
         filters: &SearchFilters,
         plan: &crate::export::ExportPublicationPlan,
     ) -> Result<crate::export::ExportPublicationReceipt> {
+        self.db.ensure_refreshed_for_read()?;
         let sessions = self.db.list_recent(filters)?;
         let format = plan.format();
         let documents = sessions.into_iter().map(|session| {
@@ -2118,14 +2272,90 @@ impl<'config> SourceService<'config> {
     }
 }
 
+/// Read-only SQL over the index database, shared by `aise db query`, `aise db schema`, and Rust
+/// callers.
+///
+/// Each call opens its own SQLite read-only connection with `pragma query_only` and an
+/// authorizer that refuses writes, attachments, and state-changing pragmas, so the statement
+/// cannot change the index. Raw SQL cannot enforce workspace authority, so
+/// [`query`](Self::query) is refused while `search.scope.mode` is `allowed-roots`, exactly as the
+/// command line refuses it. [`SqlService::new`] needs only a configuration; it does not open or
+/// refresh the index, so it works on an index another process is writing.
+#[derive(Clone, Copy)]
+pub struct SqlService<'config> {
+    config: &'config Config,
+}
+
+impl<'config> SqlService<'config> {
+    /// Create a SQL service reading `config.db_path()` with `config.index.busy_timeout_ms`.
+    pub const fn new(config: &'config Config) -> Self {
+        Self { config }
+    }
+
+    /// Run one read-only statement and return its rows.
+    ///
+    /// Defaults left as `None` in `query` come from `[db]` in the configuration, so a caller
+    /// and `aise db query` given the same statement return the same rows.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the scope is `allowed-roots`, the statement is not exactly one row-returning
+    /// read, the authorizer refuses it, the timeout interrupts it, or the database cannot be
+    /// opened read-only.
+    ///
+    /// # Complexity
+    ///
+    /// SQLite's own cost for the statement, plus `O(offset + limit)` rows read and
+    /// `O(limit * columns)` values retained; `limit` 0 retains every row.
+    pub fn query(
+        &self,
+        query: &crate::sql_query::SqlQuery,
+    ) -> Result<crate::sql_query::QueryResult> {
+        crate::search_scope::ensure_raw_sql_allowed(
+            &self.config.search.scope,
+            "SessionSearch::sql().query",
+        )?;
+        let args = query.resolve(&self.config.db);
+        let mut result = crate::sql_query::query_path(
+            &self.config.db_path(),
+            self.config.index.busy_timeout_ms,
+            &args,
+        )?;
+        crate::sql_query::truncate_cells(&mut result, query.max_cell_chars);
+        Ok(result)
+    }
+
+    /// List tables and views, or one table's columns with reading notes.
+    ///
+    /// Schema listing is allowed under every search scope because it reveals no session data.
+    pub fn schema(
+        &self,
+        query: &crate::sql_query::SqlSchemaQuery,
+    ) -> Result<crate::sql_query::QueryResult> {
+        crate::sql_query::schema_path(
+            &self.config.db_path(),
+            self.config.index.busy_timeout_ms,
+            &crate::sql_query::DbSchemaArgs {
+                table: query.table.clone(),
+                include_internal: query.include_internal,
+                format: crate::render::OutputFormat::Table,
+            },
+        )
+    }
+}
+
 /// Measurements from one completed compaction transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CompactOutcome {
+    /// Bytes the database and its WAL occupied before compaction.
     pub before_bytes: u64,
+    /// Bytes they occupy after it.
     pub after_bytes: u64,
 }
 
 impl CompactOutcome {
+    /// `before_bytes - after_bytes`, or 0 when the database grew.
     pub const fn reclaimed_bytes(self) -> u64 {
         self.before_bytes.saturating_sub(self.after_bytes)
     }
@@ -2139,20 +2369,28 @@ pub struct MaintenanceService<'app> {
 }
 
 impl<'app> MaintenanceService<'app> {
+    /// Create a maintenance service; [`SessionSearch::maintenance`] is the usual way.
     pub const fn new(config: &'app Config, db: &'app Db) -> Self {
         Self { config, db }
     }
 
+    /// What `aise doctor --format json` reports, apart from the config-file fields that command
+    /// adds: the database path, unknown config keys, [`IndexStatus`] (parser health, stale
+    /// sessions, readiness, repair commands), discovery warnings, and per-provider health. Reads
+    /// only; never refreshes.
     pub fn diagnostics(&self) -> Result<DiagnosticStatus> {
         crate::diagnostics::collect(self.config, self.db)
     }
 
-    /// Merge FTS segments, rebuild the database, and checkpoint the WAL while
-    /// holding the same process lock used by index writers.
+    /// Rebuild FTS postings and the database, then checkpoint the WAL while
+    /// holding the same process lock used by index writers. Scans all message bytes, regenerates
+    /// all postings (including SQLite's merge work), and rewrites all D database bytes, regardless
+    /// of rows recently refreshed. Uses SQLite's streaming buffers and up to roughly 2D temporary
+    /// disk space. Interrupted transactions recover through SQLite.
     pub fn compact(&self) -> Result<CompactOutcome> {
         indexer::with_index_update_lock(self.config, || {
             let before_bytes = self.db.storage_allocation()?.total_bytes;
-            self.db.optimize_fts()?;
+            self.db.rebuild_fts()?;
             self.db.vacuum()?;
             self.db.checkpoint_truncate()?;
             Ok(CompactOutcome {
@@ -2171,20 +2409,54 @@ pub struct IndexService<'app> {
 }
 
 impl<'app> IndexService<'app> {
+    /// Create an index service; [`SessionSearch::index`] is the usual way.
     pub const fn new(config: &'app Config, db: &'app Db) -> Self {
         Self { config, db }
     }
 
+    /// Apply the configured `index.refresh` policy before reads, as the command line does
+    /// before every query.
+    ///
+    /// - `auto` (the default): repair an unreadable schema, and index the sources synchronously
+    ///   when the index holds no sessions and is due; a populated index is returned unchanged
+    ///   (call [`IndexService::refresh`] to bring it up to date).
+    /// - `before-query`: run an incremental reindex under the update lock every call.
+    /// - `existing-only`: change nothing; fail when the schema is unreadable.
+    ///
+    /// Returns `None` when nothing ran, or what the refresh did. After `auto` meets another
+    /// writer (`SkippedBusy` or `SkippedLockUnavailable`) a never-indexed index stays empty and
+    /// typed reads keep returning [`ServiceError::IndexNotRefreshed`](crate::ServiceError::IndexNotRefreshed).
+    ///
+    /// ```no_run
+    /// let app = ai_session_search::SessionSearch::load()?;
+    /// app.index().prepare_for_read()?;
+    /// let sessions = app.catalog().list_sessions(&Default::default())?;
+    /// # Ok::<(), ai_session_search::anyhow::Error>(())
+    /// ```
+    pub fn prepare_for_read(&self) -> Result<Option<AutoReindexOutcome>> {
+        indexer::prepare_index_for_read_now(self.config, self.db)
+    }
+
+    /// Run an incremental refresh now unless one completed within
+    /// `index.auto_reindex_interval_ms` and the parser contract is unchanged.
+    ///
+    /// Does not wait for another writer: returns `SkippedBusy` or `SkippedLockUnavailable`
+    /// instead. Fails when the index needs a newer writer.
     pub fn refresh(&self) -> Result<AutoReindexOutcome> {
         self.db.require_write_compatibility()?;
         indexer::refresh_index_opportunistically(self.config, self.db, None)
     }
 
+    /// Reindex and return `(files_seen, sessions_updated)`.
+    #[deprecated(since = "1.1.0", note = "use IndexService::reindex_report")]
     pub fn reindex(&self, full: bool) -> Result<(usize, usize)> {
         let outcome = self.reindex_report(full)?;
         Ok((outcome.files_seen, outcome.sessions_updated))
     }
 
+    /// Reindex every enabled source and wait for the update lock. `full` re-reads every file
+    /// instead of only changed ones. Returns the files seen, sessions updated, discovery
+    /// warnings, and whether a full pass ran.
     pub fn reindex_report(&self, full: bool) -> Result<indexer::ExplicitReindexOutcome> {
         indexer::explicit_reindex_and_migrate(self.config, self.db, full, None)
     }
@@ -2195,15 +2467,131 @@ impl<'app> IndexService<'app> {
     }
 }
 
+/// Which end of a transcript [`CatalogService::transcript`] kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TranscriptEdge {
+    /// The first lines (`lines` > 0).
+    Head,
+    /// The last lines (`lines` < 0).
+    Tail,
+    /// The whole transcript (`lines` == 0).
+    All,
+}
+
+/// A window of one session's transcript, from [`CatalogService::transcript`].
+#[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
+pub struct TranscriptWindow {
+    /// The resolved session.
+    pub session: SessionRecord,
+    /// The selected lines joined with `\n`.
+    pub text: String,
+    /// Lines in the whole transcript.
+    pub total_lines: usize,
+    /// Lines in `text`.
+    pub lines_returned: usize,
+    /// Which end was kept.
+    pub edge: TranscriptEdge,
+    /// `true` when `text` is the whole transcript.
+    pub complete: bool,
+    /// The count as `aise show` prints it after "Transcript lines returned:", for example `12`,
+    /// `all`, or `first 40 (truncated; 0 returns the entire transcript and may be very large)`.
+    pub lines_label: String,
+}
+
+/// How to reopen one session in its provider's CLI, from [`CatalogService::resume_command`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
+pub struct ResumeCommand {
+    /// Canonical id of the resolved session.
+    pub session_id: String,
+    /// Program and arguments, for example `["claude", "--resume", "<id>"]`. `None` means this
+    /// session cannot be resumed here; see `unavailable_reason`.
+    pub argv: Option<Vec<String>>,
+    /// Directory to run `argv` in: the session's recorded working directory when it still
+    /// exists, otherwise `None`.
+    pub cwd: Option<String>,
+    /// Why `argv` is `None`, naming `aise show` and `aise export` as ways to read the session.
+    /// `None` whenever `argv` is set.
+    pub unavailable_reason: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 /// Typed session listing, search, resolution, and compact inspection operations.
 pub struct CatalogService<'db> {
     db: &'db Db,
+    config: Option<&'db Config>,
 }
 
 impl<'db> CatalogService<'db> {
+    /// Create a catalog over `db` with no configuration: [`CatalogService::search`] then ranks
+    /// with the built-in [`ScoringConfig`] and no current-repository boost.
+    /// [`SessionSearch::catalog`] supplies the application's configuration instead.
     pub const fn new(db: &'db Db) -> Self {
-        Self { db }
+        Self { db, config: None }
+    }
+
+    const fn with_config(db: &'db Db, config: &'db Config) -> Self {
+        Self {
+            db,
+            config: Some(config),
+        }
+    }
+
+    /// Rank sessions for `query` with the configured scoring, as `aise search` does.
+    ///
+    /// Uses `[search.scoring]` and, when `search.prefer_current_repo` is true, boosts sessions
+    /// in the repository containing the process's current directory. Use
+    /// [`CatalogService::search_sessions`] to pass both explicitly.
+    ///
+    /// ```no_run
+    /// # let app = ai_session_search::SessionSearch::load()?;
+    /// use ai_session_search::SearchFilters;
+    /// let hits = app
+    ///     .catalog()
+    ///     .search("flaky login test", &SearchFilters::default().with_limit(10))?;
+    /// # Ok::<(), ai_session_search::anyhow::Error>(())
+    /// ```
+    pub fn search(&self, query: &str, filters: &SearchFilters) -> Result<Vec<SearchHit>> {
+        match self.config {
+            Some(config) => self.search_sessions(
+                query,
+                filters,
+                crate::util::current_repo(config).as_deref(),
+                &config.search.scoring,
+            ),
+            None => self.search_sessions(query, filters, None, &ScoringConfig::default()),
+        }
+    }
+
+    /// List sessions with an omitted limit resolved from `[search].default_limit`.
+    /// An explicit 0 returns all matches. Clones O(F) filter bytes, then uses the exact
+    /// ordering, validation, and query/memory bounds of [`Self::list_sessions`].
+    pub fn list_query(&self, request: &crate::models::SessionQuery) -> Result<Vec<SessionRecord>> {
+        let limit = self
+            .config
+            .map_or_else(crate::config::default_limit, |config| {
+                config.search.default_limit
+            });
+        self.list_sessions(&request.resolved_filters(limit))
+    }
+
+    /// Search with an omitted limit resolved from `[search].default_limit` and configured
+    /// scoring/repository boosts. An explicit 0 returns all matches. Clones O(F) filter bytes;
+    /// retrieval, ranking, and retained-memory bounds are those of [`Self::search_sessions`].
+    pub fn search_query(
+        &self,
+        query: &str,
+        request: &crate::models::SessionQuery,
+    ) -> Result<Vec<SearchHit>> {
+        let limit = self
+            .config
+            .map_or_else(crate::config::default_limit, |config| {
+                config.search.default_limit
+            });
+        self.search(query, &request.resolved_filters(limit))
     }
 
     /// List filtered sessions in database order.
@@ -2217,6 +2605,7 @@ impl<'db> CatalogService<'db> {
     /// `O(K + D_K)` for selected row/text bytes. A zero limit intentionally returns the complete
     /// filtered corpus, so `K=N`; SQLite page-cache or temporary-sort memory is additional.
     pub fn list_sessions(&self, filters: &SearchFilters) -> Result<Vec<SessionRecord>> {
+        self.db.ensure_refreshed_for_read()?;
         filters.validate()?;
         self.db.list_recent(filters)
     }
@@ -2229,11 +2618,16 @@ impl<'db> CatalogService<'db> {
         filters: &SearchFilters,
         offset: usize,
     ) -> Result<Vec<SessionRecord>> {
+        self.db.ensure_refreshed_for_read()?;
         filters.validate()?;
         self.db.list_recent_page(filters, offset)
     }
 
-    /// Search all structurally eligible session fields with configured relevance scoring.
+    /// Search all structurally eligible session fields with the given relevance scoring.
+    ///
+    /// `current_repo` boosts sessions in that repository root; `None` applies no boost.
+    /// `scoring` is usually `&app.config().search.scoring`; [`CatalogService::search`] fills both
+    /// from the configuration.
     ///
     /// # Complexity
     ///
@@ -2255,8 +2649,37 @@ impl<'db> CatalogService<'db> {
         current_repo: Option<&str>,
         scoring: &ScoringConfig,
     ) -> Result<Vec<SearchHit>> {
+        self.db.ensure_refreshed_for_read()?;
         filters.validate()?;
         self.db.search(query, filters, current_repo, scoring)
+    }
+
+    /// Return a ranked offset page with the same order as `search_sessions`.
+    ///
+    /// Scoring still visits the eligible corpus. A positive limit retains `offset + limit`
+    /// candidates before discarding the prefix; memory is proportional to that window and its
+    /// text bytes. A zero limit returns every match after the offset.
+    pub fn search_sessions_page(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        current_repo: Option<&str>,
+        scoring: &ScoringConfig,
+        offset: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let mut window = filters.clone();
+        if window.limit > 0 {
+            window.limit = window.limit.checked_add(offset).ok_or_else(|| {
+                crate::ServiceError::invalid_argument(
+                    "session offset + limit exceeds the platform size",
+                )
+            })?;
+        }
+        Ok(self
+            .search_sessions(query, &window, current_repo, scoring)?
+            .into_iter()
+            .skip(offset)
+            .collect())
     }
 
     /// Crate-internal session-search path with cooperative cancellation between scoring batches
@@ -2276,7 +2699,79 @@ impl<'db> CatalogService<'db> {
 
     /// Resolve one canonical session ID or unique prefix; ambiguous errors list candidates.
     pub fn resolve_session(&self, id_or_prefix: &str) -> Result<SessionRecord> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.resolve_session_record(id_or_prefix)
+    }
+
+    /// The first or last lines of one session's transcript, as `aise show --transcript-lines`
+    /// and MCP `get_session` `transcript_lines` select them.
+    ///
+    /// `lines` is signed: a positive N keeps the first N lines, a negative N keeps the last
+    /// `|N|` lines, and 0 keeps the whole transcript. `id_or_prefix` resolves like
+    /// [`CatalogService::resolve_session`].
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) or
+    /// [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous).
+    ///
+    /// # Complexity
+    ///
+    /// Reads the whole stored transcript once; retained memory is the transcript plus the
+    /// selected window.
+    pub fn transcript(&self, id_or_prefix: &str, lines: i64) -> Result<TranscriptWindow> {
+        self.db.ensure_refreshed_for_read()?;
+        let full = self.db.resolve_session(id_or_prefix)?;
+        let (text, lines_label) =
+            crate::util::select_transcript_lines(&full.transcript_text, lines);
+        let total_lines = full.transcript_text.lines().count();
+        let lines_returned = text.lines().count();
+        Ok(TranscriptWindow {
+            session: full.session,
+            edge: match lines.cmp(&0) {
+                std::cmp::Ordering::Less => TranscriptEdge::Tail,
+                std::cmp::Ordering::Equal => TranscriptEdge::All,
+                std::cmp::Ordering::Greater => TranscriptEdge::Head,
+            },
+            complete: lines_returned == total_lines,
+            text,
+            total_lines,
+            lines_returned,
+            lines_label,
+        })
+    }
+
+    /// The native command that reopens a session in the provider's own CLI, without running it.
+    ///
+    /// `id_or_prefix` resolves like [`CatalogService::resolve_session`]. When the provider can
+    /// reopen the session, [`ResumeCommand::argv`] holds the program and its arguments; when it
+    /// cannot (a provider with no resume command, a Claude subagent run, or a provider CLI that
+    /// is not on `PATH`), `argv` is `None` and [`ResumeCommand::unavailable_reason`] says why
+    /// and how to read the session instead. The command carries the provider's resume verb and
+    /// the session id only, never local permission or approval flags
+    /// ([`crate::util::RESUME_COMMAND_POLICY_NOTE`]).
+    ///
+    /// # Errors
+    ///
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound) or
+    /// [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous).
+    pub fn resume_command(&self, id_or_prefix: &str) -> Result<ResumeCommand> {
+        self.db.ensure_refreshed_for_read()?;
+        let session = self.db.resolve_session_record(id_or_prefix)?;
+        Ok(match crate::util::resume_plan(&session) {
+            Ok((argv, cwd)) => ResumeCommand {
+                session_id: session.id,
+                argv: Some(argv),
+                cwd,
+                unavailable_reason: None,
+            },
+            Err(reason) => ResumeCommand {
+                session_id: session.id,
+                argv: None,
+                cwd: None,
+                unavailable_reason: Some(format!("{reason:#}")),
+            },
+        })
     }
 
     /// Build a bounded evidence summary for one resolved session without filesystem writes.
@@ -2285,6 +2780,7 @@ impl<'db> CatalogService<'db> {
         id_or_prefix: &str,
         options: crate::inspect::InspectionOptions,
     ) -> Result<crate::inspect::SessionInspection> {
+        self.db.ensure_refreshed_for_read()?;
         crate::inspect::inspect_session(self.db, id_or_prefix, options)
     }
 }
@@ -2314,6 +2810,8 @@ pub(crate) struct MessageSearchBatchVisitOutcome {
 }
 
 impl<'db> MessageService<'db> {
+    /// Create a message service whose unset limits follow `surface`'s documented defaults;
+    /// [`SessionSearch::messages`] is the usual way and uses the Rust surface.
     pub const fn new(config: &'db Config, db: &'db Db, surface: SearchSurface) -> Self {
         Self {
             config,
@@ -2393,11 +2891,17 @@ impl<'db> MessageService<'db> {
     /// batches; tool-argument fuzzy projection remains exhaustive but parallelizes JSON parsing
     /// and scoring. Peak Rust memory is `O(W + bytes(W) + batch_budget + largest_row + P*Q)`;
     /// validation rejects an unbounded fuzzy page.
+    #[deprecated(since = "1.1.0", note = "use MessageService::search")]
     pub fn search_legacy(&self, query: &str, filters: &MessageFilters) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.search_messages(query, filters)
     }
 
+    /// Resolve a request into the plan [`MessageService::search`] would run, without searching:
+    /// the effective limits, context, presentation, and where each value came from (request,
+    /// purpose, configuration, or surface default). A session prefix is resolved here.
     pub fn plan(&self, request: MessageSearchRequest) -> Result<MessageSearchPlan> {
+        self.db.ensure_refreshed_for_read()?;
         Self::plan_with_session_resolver(self.config, self.surface, request, |value| {
             self.catalog().resolve_session(value)
         })
@@ -2797,6 +3301,7 @@ impl<'db> MessageService<'db> {
     /// membership. Planning, membership, evidence, includes, and context share one SQLite read
     /// snapshot, so a concurrent WAL refresh becomes visible only to a later search.
     pub fn search(&self, request: MessageSearchRequest) -> Result<MessageSearchResponse> {
+        self.db.ensure_refreshed_for_read()?;
         self.search_cancellable(request, None)
     }
 
@@ -2953,8 +3458,10 @@ impl<'db> MessageService<'db> {
         });
         let origins =
             (exhausted && plan.receipt == ReceiptLevel::Full).then(|| plan.origins.clone());
-        let ordered_digest =
-            (exhausted && plan.receipt == ReceiptLevel::Full).then(|| digest.finish());
+        // The digest is computed for every batch anyway, so a completed traversal always reports
+        // it, matching MessageSearchResponse::ordered_digest. Receipt documents still include it
+        // only at ReceiptLevel::Full.
+        let ordered_digest = exhausted.then(|| digest.finish());
         Ok(MessageSearchBatchVisitOutcome {
             exhausted,
             page,
@@ -3052,6 +3559,8 @@ impl<'db> MessageService<'db> {
             &plan.retrieval.query,
             &plan.retrieval.target,
             plan.response.presentation.match_view,
+            self.db
+                .message_input_scope(plan.retrieval.predicates.role)?,
             hits,
             || ensure_message_search_active(cancellation),
         )?;
@@ -3142,31 +3651,39 @@ impl<'db> MessageService<'db> {
         CatalogService::new(self.db)
     }
 
-    /// Run the same search as [`MessageService::search`] and optionally return its actual planner
+    /// Run a string-and-[`MessageFilters`] search and optionally return its actual planner
     /// receipt, including corpus size and any exact/regex prefilter decision.
+    ///
+    /// [`MessageService::search`] returns the same receipt from
+    /// [`MessageSearchResponse::search_explanation`] when the request sets
+    /// [`MessageSearchRequestBuilder::receipt_level`](crate::MessageSearchRequestBuilder::receipt_level)
+    /// to summary or full.
+    #[deprecated(since = "1.1.0", note = "use MessageService::search")]
     pub fn search_with_explain(
         &self,
         query: &str,
         filters: &MessageFilters,
         include_explain: bool,
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
+        self.db.ensure_refreshed_for_read()?;
         self.db
             .search_messages_with_explain(query, filters, include_explain)
     }
 
     /// Load compact metadata for the requested canonical IDs; absent IDs are omitted.
     pub fn session_metadata(&self, session_ids: &[String]) -> Result<HashMap<String, SessionMeta>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.session_metadata(session_ids)
     }
 
-    /// Return every message whose seq lies within `before` sequence numbers before and `after`
-    /// after `seq`, ordered by `(seq, id)`.
+    /// Read context for an exact canonical session ID. Unknown, inaccessible or partial IDs
+    /// return an empty list, preserving the published behavior. Use [`Self::context_resolved`]
+    /// for prefix lookup and missing-session errors. `before` and `after` count sequence
+    /// numbers, must be nonnegative, and select an inclusive window ordered by `(seq, id)`.
+    /// Zero on both sides returns only the anchor sequence; a window past the session is empty.
     ///
-    /// # Complexity
-    ///
-    /// The `(session_id, seq)` index makes database work and memory proportional to the rows in
-    /// that window: `before + after + 1` sequence numbers times the messages each holds,
-    /// subject to messages available in the session.
+    /// Database work and memory follow the indexed `before + after + 1` sequence window and
+    /// the number of messages it contains.
     pub fn context(
         &self,
         session_id: &str,
@@ -3174,7 +3691,24 @@ impl<'db> MessageService<'db> {
         before: i64,
         after: i64,
     ) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.message_context(session_id, seq, before, after)
+    }
+
+    /// Resolve a session prefix before reading context; missing or inaccessible sessions return
+    /// [`ServiceError::SessionNotFound`](crate::ServiceError::SessionNotFound), and ambiguous
+    /// prefixes return [`ServiceError::SessionPrefixAmbiguous`](crate::ServiceError::SessionPrefixAmbiguous).
+    /// Window semantics and indexed work follow [`Self::context`].
+    pub fn context_resolved(
+        &self,
+        session_id: &str,
+        seq: i64,
+        before: i64,
+        after: i64,
+    ) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
+        let session = self.db.resolve_session_record(session_id)?;
+        self.db.message_context(&session.id, seq, before, after)
     }
 
     /// Read one session's messages, selecting the oldest or newest `filters.limit` by `order`,
@@ -3185,6 +3719,7 @@ impl<'db> MessageService<'db> {
         filters: &MessageFilters,
         order: crate::db::MessageOrder,
     ) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.read_session_messages(filters, order)
     }
 }
@@ -3207,11 +3742,13 @@ impl<'db> FileService<'db> {
     /// Work is proportional to filtered edit rows; returned memory is proportional to grouped
     /// files and is unbounded only when the query explicitly uses a zero limit.
     pub fn search(&self, query: &FileQuery) -> Result<Vec<FileEditSummary>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.file_search(query)
     }
 
     /// Return deterministic file/session edit-count pages using `query.limit` and `query.offset`.
     pub fn cross_reference(&self, query: &FileQuery) -> Result<Vec<FileCrossRef>> {
+        self.db.ensure_refreshed_for_read()?;
         self.db.file_cross_ref(query)
     }
 
@@ -3223,6 +3760,7 @@ impl<'db> FileService<'db> {
     /// returned memory is bounded by `query.limit` unless it is explicitly zero. `query.offset`
     /// skips versions after stable session/version ordering.
     pub fn history(&self, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
+        self.db.ensure_refreshed_for_read()?;
         crate::files::history(self.db, file, query)
     }
 
@@ -3238,6 +3776,7 @@ impl<'db> FileService<'db> {
         query: &FileQuery,
         version: Option<usize>,
     ) -> Result<crate::files::ReconstructedFile> {
+        self.db.ensure_refreshed_for_read()?;
         crate::files::reconstruct_query(self.db, file, query, version)
     }
 
@@ -3247,6 +3786,7 @@ impl<'db> FileService<'db> {
         file: &str,
         query: &FileQuery,
     ) -> Result<crate::files::ReconstructedFileVersions> {
+        self.db.ensure_refreshed_for_read()?;
         crate::files::reconstruct_versions_query(self.db, file, query)
     }
 
@@ -3257,6 +3797,7 @@ impl<'db> FileService<'db> {
         query: &FileQuery,
         destination: &std::path::Path,
     ) -> Result<crate::files::RecoveryPublicationReceipt> {
+        self.db.ensure_refreshed_for_read()?;
         let versions = self.reconstruct_versions(file, query)?;
         crate::files::publish_reconstructed_versions(versions, destination)
     }
@@ -3425,6 +3966,120 @@ mod message_search_service_tests {
         config.index.refresh = IndexRefresh::ExistingOnly;
         let app = SessionSearch::open(config).unwrap();
         (directory, app)
+    }
+
+    #[test]
+    fn existing_only_reads_released_schema_five_without_user_input_columns() {
+        let root = tempfile::tempdir().unwrap();
+        let db_path = root.path().join("index.db");
+        let db = Db::open(&db_path).unwrap();
+        insert_session(
+            &db,
+            Provider::Claude,
+            "released-schema",
+            "/workspace",
+            "/missing/session.jsonl",
+            &["unrestricted legacy needle", "generated legacy needle"],
+        );
+        drop(db);
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "update messages set authorship='agent', record_relation='mirror' where seq=1;
+             drop index idx_messages_session_authorship_relation_seq;
+             drop index idx_messages_authorship_relation_ts;
+             alter table messages drop column input_delivery_state;
+             alter table messages drop column input_origin;
+             create index idx_messages_session_authorship_relation_seq
+                 on messages(session_id, authorship, record_relation, seq);
+             create index idx_messages_authorship_relation_ts
+                 on messages(authorship, record_relation, ts desc, session_id, seq);
+             pragma user_version = 5;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut config = Config::default();
+        config.index.db_path = Some(db_path.to_string_lossy().into_owned());
+        config.index.refresh = IndexRefresh::ExistingOnly;
+        let app = SessionSearch::open(config).unwrap();
+        let unrestricted = app
+            .database()
+            .search_messages("legacy needle", &MessageFilters::default())
+            .unwrap();
+        assert_eq!(unrestricted.len(), 2);
+        let all_sessions = |limit| SearchFilters {
+            limit,
+            ..SearchFilters::default()
+        };
+        assert_eq!(
+            app.catalog().list_sessions(&all_sessions(0)).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            app.analysis()
+                .role_statistics(&MessageFilters::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            app.analysis()
+                .documents(&all_sessions(1), None)
+                .unwrap()
+                .documents
+                .len(),
+            1
+        );
+        let policies = crate::corrections::ResolvedCorrectionPolicySet::from_policies(vec![
+            crate::corrections::embedded_policy().unwrap(),
+        ]);
+        app.analysis()
+            .corrections_with_resolved_policies(
+                &crate::skill_run::MessageClassificationQuery::default(),
+                &policies,
+            )
+            .unwrap();
+        let policy = crate::analysis_pipeline::AnalysisPolicySpec::default()
+            .compile()
+            .unwrap();
+        let request = crate::models::AnalysisRequest::new(
+            SearchFilters::default(),
+            crate::models::AnalysisSessionSelection::AllEligible,
+        )
+        .unwrap();
+        assert_eq!(
+            app.analysis()
+                .run(&request, &policy)
+                .unwrap()
+                .result
+                .sessions
+                .len(),
+            1
+        );
+        let hits = app
+            .database()
+            .search_messages(
+                "legacy needle",
+                &MessageFilters {
+                    role: Some(Role::User),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let request = literal_request()
+            .role(Role::User)
+            .extent(RequestedExtent::all_results())
+            .build()
+            .unwrap();
+        let mut sequences = Vec::new();
+        app.messages()
+            .visit_search_batches(request, NonZeroUsize::new(1).unwrap(), |batch| {
+                sequences.extend(batch.results.iter().map(|hit| hit.message().seq));
+                Ok(MessageSearchBatchControl::Continue)
+            })
+            .unwrap();
+        assert_eq!(sequences, [0, 1]);
     }
 
     #[test]
@@ -4370,6 +5025,8 @@ mod message_search_service_tests {
     }
 
     #[test]
+    // Deliberately covers the deprecated legacy search beside the typed one.
+    #[allow(deprecated)]
     fn typed_path_domains_are_separate_while_legacy_path_remains_broad() {
         let (_directory, db) = disposable_db();
         insert_session(
@@ -4470,8 +5127,17 @@ mod tests {
 
         let config = Config::default();
         let messages = MessageService::new(&config, &db, SearchSurface::Rust)
-            .search_legacy("missing", &MessageFilters::default())
-            .unwrap();
+            .search(
+                MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal("missing").unwrap(),
+                    MessageTarget::content(),
+                )
+                .build()
+                .unwrap(),
+            )
+            .unwrap()
+            .hits()
+            .len();
         let files = FileService::new(&db).search(&FileQuery::default()).unwrap();
         let mut config = Config::default();
         config.index.db_path = Some(dir.path().join("index.db").to_string_lossy().to_string());
@@ -4479,10 +5145,58 @@ mod tests {
         app.database().mark_schema_current().unwrap();
         let status = app.index().status().unwrap();
 
-        assert!(messages.is_empty());
+        assert_eq!(messages, 0);
         assert!(files.is_empty());
         assert!(status.parser_health.schema_current);
         assert_eq!(status.parser_health.indexed_sessions, 0);
+    }
+
+    #[test]
+    fn catalog_ranked_pages_preserve_the_complete_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for n in 0..3 {
+            let mut session = SessionRecord::new(
+                format!("claude:page-{n}"),
+                crate::Provider::Claude,
+                format!("page-{n}"),
+                format!("/synthetic/{n}.jsonl"),
+                "test",
+                "fixture",
+            );
+            session.title = Some("shared needle".into());
+            db.upsert_session(&crate::models::ParsedSession::new(session, vec![]), 0, 0)
+                .unwrap();
+        }
+        let catalog = CatalogService::new(&db);
+        let scoring = ScoringConfig::default();
+        let all = catalog.search("needle", &SearchFilters::default()).unwrap();
+        let ids = |hits: Vec<SearchHit>| {
+            hits.into_iter()
+                .map(|hit| hit.session.id)
+                .collect::<Vec<_>>()
+        };
+        for offset in 0..4 {
+            let page = catalog
+                .search_sessions_page(
+                    "needle",
+                    &SearchFilters::default().with_limit(1),
+                    None,
+                    &scoring,
+                    offset,
+                )
+                .unwrap();
+            assert_eq!(
+                ids(page),
+                ids(all.iter().skip(offset).take(1).cloned().collect())
+            );
+        }
+        assert_eq!(
+            ids(catalog
+                .search_sessions_page("needle", &SearchFilters::default(), None, &scoring, 1)
+                .unwrap()),
+            ids(all.into_iter().skip(1).collect())
+        );
     }
 
     #[test]
@@ -4549,6 +5263,11 @@ mod tests {
         );
     }
 
+    fn reindex_counts(app: &SessionSearch, full: bool) -> (usize, usize) {
+        let outcome = app.index().reindex_report(full).unwrap();
+        (outcome.files_seen, outcome.sessions_updated)
+    }
+
     #[test]
     fn explicit_reindex_owns_lock_on_current_schema() {
         let dir = tempfile::tempdir().unwrap();
@@ -4568,7 +5287,7 @@ mod tests {
         let app = SessionSearch::open(config).unwrap();
         assert!(!app.database().needs_backfill().unwrap());
 
-        assert_eq!(app.index().reindex(false).unwrap(), (0, 0));
+        assert_eq!(reindex_counts(&app, false), (0, 0));
 
         assert!(!app.database().needs_backfill().unwrap());
         assert!(app.index().status().unwrap().parser_health.schema_current);
@@ -4609,7 +5328,7 @@ mod tests {
 
         let app = SessionSearch::open(config).unwrap();
 
-        assert_eq!(app.index().reindex(true).unwrap(), (0, 0));
+        assert_eq!(reindex_counts(&app, true), (0, 0));
         assert_eq!(
             app.database().schema_version().unwrap(),
             crate::db::SCHEMA_VERSION

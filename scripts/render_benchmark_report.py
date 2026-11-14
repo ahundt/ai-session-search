@@ -10,9 +10,15 @@ import argparse
 import json
 import math
 import statistics
+import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, cast
+
+if not __package__:
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
+
+from scripts.benchmark_release import result_pair_accepted
 
 BENCHMARK_JSON_PREFIX = "AISE_BENCHMARK_JSON="
 
@@ -167,6 +173,8 @@ def renderer_command(
     candidate_scale_paths: dict[str, Path],
     relevance_path: Path | None,
 ) -> str:
+    # Deprecated: illustrative template retained for callers; reports omit it because sample
+    # metadata does not record the renderer invocation or output destination.
     command = (
         "uv run python scripts/render_benchmark_report.py --baseline BASELINE_JSONL "
         "--candidate CANDIDATE_JSONL"
@@ -194,8 +202,32 @@ def renderer_command(
     if relevance_path is not None:
         command += " --relevance-log RELEVANCE_LOG"
     return command + (
-        " --output "
-        "notes/2026_07_16_1726_ai_session_search_1_0_before_after_performance_report.md"
+        " --output REPORT_MD"
+    )
+
+
+def reviewed_declaration(
+    contract: dict[str, Any], baseline: str, candidate: str
+) -> dict[str, Any] | None:
+    """Return the manifest declaration that pins this exact digest pair, if the pair is accepted."""
+    # The declaration that makes the pair accepted, not merely one naming the same digests: a
+    # second entry for the pair can lack a category or a stated difference.
+    return next(
+        (
+            cast(dict[str, Any], declaration)
+            for declaration in contract.get("accepted_results", [])
+            if result_pair_accepted({"accepted_results": [declaration]}, baseline, candidate)
+        ),
+        None,
+    )
+
+
+def digest_difference_line(case: str, declaration: dict[str, Any] | None) -> str:
+    if declaration is None:
+        return f"- `{case}` returned a result digest no manifest declaration covers."
+    return (
+        f"- `{case}` ({declaration['category']}): {declaration['difference'].rstrip('.')}. "
+        f"Changelog: {declaration['changelog'].rstrip('.')}."
     )
 
 
@@ -297,8 +329,9 @@ def render(
         contracts = {case["id"]: case for case in manifest["cases"]}
     semantic_mismatches = [
         case for case in shared
-        if contracts.get(case, {}).get("require_equal", True)
-        and summarize(baseline_rows[case])["digest"] != summarize(candidate_rows[case])["digest"]
+        if not result_pair_accepted(contracts.get(case, {}),
+                                    summarize(baseline_rows[case])["digest"],
+                                    summarize(candidate_rows[case])["digest"])
     ]
     candidate_durable_mutations = sum(
         bool(row.get("durable_fixture_mutated"))
@@ -320,16 +353,6 @@ def render(
     decision = (
         "GO" if publishable and not semantic_mismatches and candidate_durable_mutations == 0
         and candidate_failures == 0 and relevance_passed else "NO-GO"
-    )
-    exact_renderer_command = renderer_command(
-        baseline_path,
-        candidate_path,
-        overlay_paths,
-        baseline_overlay_paths,
-        candidate_overlay_paths,
-        scale_paths,
-        candidate_scale_paths,
-        relevance_path,
     )
     lines = [
         "# AI Session Search before/after benchmark report",
@@ -372,6 +395,7 @@ def render(
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     regressions: list[str] = []
+    reviewed: list[str] = []
     for case in shared:
         before = summarize(baseline_rows[case])
         after = summarize(candidate_rows[case])
@@ -390,8 +414,11 @@ def render(
             f"{before['threads_peak']} → {after['threads_peak']} | "
             f"{before['mutated_samples']} → {after['mutated_samples']} |"
         )
-        if not equal and contracts.get(case, {}).get("require_equal", True):
-            regressions.append(f"- `{case}` returned a different result digest.")
+        if not equal:
+            declaration = reviewed_declaration(contracts.get(case, {}), before["digest"], after["digest"])
+            (regressions if declaration is None else reviewed).append(
+                digest_difference_line(case, declaration)
+            )
         if after["wall_median"] > before["wall_median"] * 1.1:
             regressions.append(
                 f"- `{case}` median latency increased {percent(before['wall_median'], after['wall_median'])}."
@@ -404,6 +431,11 @@ def render(
         f"- Candidate process failures: {candidate_failures}.",
         f"- Candidate-only cases: {', '.join(f'`{case}`' for case in sorted(set(candidate_rows) - set(baseline_rows))) or 'none'}.",
         f"- Baseline-only cases: {', '.join(f'`{case}`' for case in sorted(set(baseline_rows) - set(candidate_rows))) or 'none'}.",
+        "", "## Reviewed result differences", "",
+        "Each case below returned the exact baseline and candidate digests its manifest declaration "
+        "pins; the declaration names the difference and its changelog entry.",
+        "",
+        *(reviewed or ["- None: every shared case returned equal digests or is listed below."]),
         "", "## Regressions and limitations", "",
         *(regressions or ["- No automatic digest mismatch or >10% median-latency regression in this sample set."]),
         "- The measured benchmark table is a regression signal, not proof for unmeasured "
@@ -426,14 +458,8 @@ def render(
         "uv run python scripts/benchmark_release.py --tier smoke --fixture generated --artifact-dir /private/tmp/aise-benchmark-smoke --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY --dry-run",
         "uv run python scripts/benchmark_release.py --tier smoke --fixture generated --artifact-dir /private/tmp/aise-benchmark-smoke --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY",
         "uv run python scripts/benchmark_release.py --tier release --fixture generated --artifact-dir /private/tmp/aise-benchmark-release --baseline BASELINE_BINARY --baseline-repository BASELINE_REPOSITORY --candidate CANDIDATE_BINARY",
-        "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --relevance-log RELEVANCE_LOG --output notes/aise-report.md",
-        "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --relevance-log RELEVANCE_LOG --output notes/aise-report.md --check",
-        "```",
-        "",
-        "This report's exact renderer command is:",
-        "",
-        "```sh",
-        exact_renderer_command,
+        "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --relevance-log RELEVANCE_LOG --output REPORT_MD",
+        "uv run python scripts/render_benchmark_report.py --baseline /private/tmp/aise-benchmark-release/samples.jsonl --candidate /private/tmp/aise-benchmark-release/samples.jsonl --relevance-log RELEVANCE_LOG --output REPORT_MD --check",
         "```",
         "",
         "- [SQLite WAL concurrency](https://www.sqlite.org/wal.html)",

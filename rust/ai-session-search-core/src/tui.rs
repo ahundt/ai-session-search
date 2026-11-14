@@ -2889,7 +2889,6 @@ mod tests {
 
         /// Send the startup request for a harness that seeded nothing (the digest guard's
         /// real-executor path, whose fixture lives in the factory's own database).
-        #[allow(dead_code)]
         fn start(&mut self) {
             self.app.request_search();
         }
@@ -5122,9 +5121,7 @@ mod tests {
     #[test]
     fn a_typed_burst_becomes_one_search_after_the_configured_quiet_period() {
         // Every keystroke used to start a search that the next keystroke cancelled, so typing a
-        // five-letter word began five corpus scans to answer one question. On a 36.5 GB index a
-        // session search costs 2.3 to 3.6 s, which is what the reader waits for either way, but
-        // the four abandoned scans are work nobody asked for.
+        // burst started abandoned scans. Debounce them into one request after the quiet period.
         let mut config = Config::default();
         config.ui.search_debounce_ms = 40;
         config.ui.idle_poll_interval_ms = 1;
@@ -5816,11 +5813,7 @@ mod tests {
     #[test]
     fn a_search_still_running_is_not_reported_as_an_empty_index() {
         // `AppState::new` issues the startup search and sets `searching`, so the list is empty
-        // until the first response lands. On a large index that is seconds: measured at 2.3 to
-        // 3.6 s on a 36.5 GB one. Answering an in-flight search with "No sessions are indexed
-        // yet. … run `aise reindex`" would send a reader to rebuild an index that is about to
-        // return their sessions. The list title already says a search is running; the pane says
-        // nothing until there is something to say.
+        // until the first response lands. Do not report that pending result as an empty index.
         let mut harness = TuiHarness::with_executor(idle_executor());
         harness.terminal.backend_mut().resize(120, 24);
         harness.app.searching = true;

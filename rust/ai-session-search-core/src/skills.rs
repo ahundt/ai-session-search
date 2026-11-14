@@ -11,6 +11,9 @@
 //! Capability parsing stays in its domain module; this module only adapts those shared results to
 //! the command surface and renders rows.
 
+// This module owns the deprecated CLI row compatibility paths.
+#![allow(deprecated)]
+
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -32,6 +35,7 @@ use crate::util::truncate_for_display;
 const TABLE_REGEX_CHARS: usize = 72;
 
 #[derive(Debug, Subcommand)]
+#[non_exhaustive]
 pub enum SkillsCmd {
     /// List every discovered skill — aise-managed and user-authored alike — and whether its
     /// adjacent deterministic capability loads.
@@ -60,7 +64,7 @@ pub enum SkillsCmd {
     #[command(
         after_help = "The scaffold is YOURS: it carries no managed marker, so \
                             `aise integrations install` and `aise skills update` will never \
-                            rewrite it. Add `--capability message-classification` only when Aise \
+                            rewrite it. Add `--capability message-classification` only when aise \
                             should execute deterministic categories via `aise skills <name>`."
     )]
     Create(SkillsCreateArgs),
@@ -89,7 +93,7 @@ pub enum SkillsCmd {
     #[command(
         after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
                       parsing safety ceiling. Exceeding it returns the consumed and attempted byte \
-                      counts with guidance; Aise never truncates rules or results to fit."
+                      counts with guidance; aise never truncates rules or results to fit."
     )]
     Run(SkillRunEscapeArgs),
     /// Run the named/path-selected skill's read-only deterministic capability.
@@ -122,7 +126,7 @@ pub(crate) struct SkillExecution {
     disable_help_subcommand = true,
     after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
                   parsing safety ceiling. Exceeding it returns the consumed and attempted byte \
-                  counts with guidance; Aise never truncates rules or results to fit."
+                  counts with guidance; aise never truncates rules or results to fit."
 )]
 struct MessageClassificationCommand {
     #[command(flatten)]
@@ -328,6 +332,7 @@ pub struct SkillsCreateArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[non_exhaustive]
 pub enum ScaffoldCapability {
     MessageClassification,
 }
@@ -335,6 +340,7 @@ pub enum ScaffoldCapability {
 /// Who owns a skill directory, which decides whether `aise` may ever write to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SkillOwnership {
     /// `SKILL.md` carries the managed marker: `aise` wrote it and may update it.
     Aise,
@@ -359,6 +365,7 @@ impl SkillOwnership {
 /// Whether a discovered skill can currently supply a deterministic capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SkillCapabilityStatus {
     /// `aise-capability.toml` is present and compiles.
     Ok,
@@ -378,8 +385,13 @@ impl SkillCapabilityStatus {
     }
 }
 
-/// One skill as `aise skills list` reports it.
+/// One skill as `aise skills list` reports it; rendering copies O(row text bytes).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for skill metadata or AnalysisService::run_skill for capability execution"
+)]
 pub struct SkillSummary {
     pub name: String,
     pub ownership: SkillOwnership,
@@ -424,8 +436,13 @@ impl Row for SkillSummary {
     }
 }
 
-/// One category, at the position it is evaluated.
+/// One category, at the position it is evaluated; cells copy O(category and displayed regex bytes).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for skill metadata or AnalysisService::run_skill for capability execution"
+)]
 pub struct SkillCategoryRow {
     /// 1-based evaluation position. First match wins, so this is behavior, not presentation: a
     /// message matching two categories is reported as the lower-numbered one.
@@ -451,6 +468,7 @@ impl Row for SkillCategoryRow {
 
 /// One skill as `aise skills show` explains it.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillDetail {
     pub name: String,
     pub path: String,
@@ -464,8 +482,13 @@ pub struct SkillDetail {
     pub problem: Option<String>,
 }
 
-/// One problem found by `aise skills validate`, with the fix.
+/// One problem found by `aise skills validate`, with the fix; cells scan O(diagnostic text bytes).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for skill metadata or AnalysisService::run_skill for capability execution"
+)]
 pub struct SkillDiagnostic {
     /// Which file the problem is in, relative to the skill root.
     pub file: String,
@@ -494,6 +517,7 @@ impl Row for SkillDiagnostic {
 
 /// The full result of validating one directory.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillValidation {
     pub path: String,
     pub name: Option<String>,
@@ -1027,6 +1051,7 @@ where
 
 /// One file a scaffold will create, relative to the new skill root.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ScaffoldedFile {
     pub relative_path: String,
     pub bytes: usize,
@@ -1043,6 +1068,7 @@ impl Row for ScaffoldedFile {
 
 /// What `aise skills create` did, or would do under `--dry-run`.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SkillScaffoldReceipt {
     pub name: String,
     pub root: String,
@@ -1211,21 +1237,14 @@ fn scaffold_files(name: &str, capability: Option<ScaffoldCapability>) -> Vec<(Pa
          # Categories are evaluated top to bottom and the FIRST match wins, so a catch-all\n\
          # belongs last. Patterns within one category are ORed, and each category compiles to a\n\
          # single case-insensitive regex. Check this file with `aise skills validate`, then use\n\
-         # it with `aise skills {name}`.\n\
-         schema_version = {}\n\
-         kind = \"message-classification\"\n",
-        crate::message_classification::MESSAGE_CLASSIFICATION_SCHEMA_VERSION
+         # it with `aise skills {name}`.\n"
     );
-    for (category, patterns) in crate::analytics::default_correction_patterns() {
-        policy.push_str(&format!(
-            "\n[[categories]]\nname = \"{category}\"\npatterns = [\n"
-        ));
-        for pattern in patterns {
-            // TOML multiline literal strings: no backslash doubling, so a regex stays readable.
-            policy.push_str(&format!("  \'\'\'{pattern}\'\'\',\n"));
-        }
-        policy.push_str("]\n");
-    }
+    // Keep the canonical policy body, without comments describing the immutable product default.
+    policy.extend(
+        crate::corrections::EMBEDDED_POLICY_TOML
+            .split_inclusive('\n')
+            .skip_while(|line| line.trim().is_empty() || line.trim_start().starts_with('#')),
+    );
     files.push((PathBuf::from(crate::skill_catalog::CAPABILITY_FILE), policy));
     files
 }
@@ -1289,6 +1308,10 @@ impl Row for crate::integrations::SkillWriteOutcome {
 ///
 /// Returns an error when a configured search path cannot be read, when two directories claim one
 /// skill name, when `show` names a skill that does not exist, or when output cannot be written.
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for skill management or AnalysisService::run_skill for capability execution"
+)]
 pub fn run(config: &Config, cmd: SkillsCmd, receipt_path: &Path) -> Result<()> {
     run_with_harness_home(config, cmd, receipt_path, None)
 }
@@ -1490,9 +1513,22 @@ fn report_write_outcomes(
 mod tests {
     use super::*;
 
+    #[test]
+    fn api_hygiene_scaffold_uses_the_embedded_capability_bytes() {
+        let files = scaffold_files("review", Some(ScaffoldCapability::MessageClassification));
+        let policy = files
+            .iter()
+            .find(|(path, _)| path == Path::new(crate::skill_catalog::CAPABILITY_FILE))
+            .unwrap();
+        let embedded = crate::corrections::EMBEDDED_POLICY_TOML;
+        let body = &embedded[embedded.find("schema_version =").unwrap()..];
+        assert!(policy.1.ends_with(body));
+        assert!(!policy.1.contains("THIS FILE IS THE PRODUCT DEFAULT"));
+    }
+
     /// `aise skills corrections -- --help` once printed `Usage: aise-skill-capability [OPTIONS]`,
-    /// the internal argv[0] placeholder, which names no executable; a Pi session hit exactly that
-    /// on 2026-08-14. The usage line must show the invocation a reader can actually run.
+    /// the internal argv[0] placeholder, which names no executable. The usage line must show the
+    /// invocation a reader can actually run.
     #[test]
     fn capability_help_names_the_real_invocation_not_the_internal_placeholder() {
         use clap::CommandFactory;

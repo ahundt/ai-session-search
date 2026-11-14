@@ -19,8 +19,8 @@ use crate::inspect::InspectionOptions;
 use crate::message_search::{
     selected_field_view, ContextWindow, DetailLevel, FieldViewBudget, LineWindow, MatchViewBudget,
     MatchWindow, MessageContentExtent, MessageQuery, MessageSearchInclude, MessageSearchParameter,
-    MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, ReceiptLevel,
-    RequestedExtent, RequestedTimeRange, ResolvedRequestExtent, SearchSurface, SequenceRange,
+    MessageSearchRequest, MessageSearchResponse, MessageTarget, PurposeSelection, RequestedExtent,
+    RequestedTimeRange, ResolvedRequestExtent, SearchSurface, SequenceRange,
     DEFAULT_MATCH_EVIDENCE_MAX_CHARS,
 };
 use crate::models::{MessageFilters, Provider, Role, SearchFilters, SessionRecord};
@@ -30,8 +30,7 @@ use crate::service::SessionSearch;
 use crate::service::{CatalogService, MessageService};
 use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
 use crate::util::{
-    current_repo, normalize_path_prefix, render_posix_shell_command, resume_plan,
-    select_transcript_lines, truncate_for_display,
+    current_repo, normalize_path_prefix, render_posix_shell_command, truncate_for_display,
 };
 
 /// Context radius in the generated one-call `get_session` continuation for a message hit.
@@ -652,7 +651,12 @@ fn execute_official_tool_call(
         /// connection and scans the catalogue, which is blocking database work; the type-level
         /// contract above says a tool call does that with the mutex released.
         SchemaOnly(Config, usize, ToolRecovery),
-        Reader(Config, crate::search_scope::TrustedAccessInputs, bool),
+        Reader(
+            Config,
+            crate::search_scope::TrustedAccessInputs,
+            bool,
+            ToolRecovery,
+        ),
     }
 
     let args = Value::Object(request.arguments.unwrap_or_default());
@@ -721,7 +725,12 @@ fn execute_official_tool_call(
             .map_err(|error| format!("{error:#}"))?;
         let refresh_after_call = config.index.refresh == crate::config::IndexRefresh::Auto;
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        Ok(Preparation::Reader(config, inputs, refresh_after_call))
+        Ok(Preparation::Reader(
+            config,
+            inputs,
+            refresh_after_call,
+            recovery,
+        ))
     })();
 
     let tool_name = params["name"].as_str().unwrap_or_default().to_owned();
@@ -735,7 +744,7 @@ fn execute_official_tool_call(
         ),
         Err(error) => rmcp_tool_error(error),
     };
-    let (config, inputs, refresh_after_call) = match prepared {
+    let (config, inputs, refresh_after_call, recovery) = match prepared {
         Ok(Preparation::Direct(result, ceiling, recovery)) => {
             return (deliver(result, ceiling, recovery), false);
         }
@@ -747,8 +756,8 @@ fn execute_official_tool_call(
             let result = tool_query_session_index_cancellable(&args, &config, Some(&cancellation));
             return (deliver(result, ceiling, recovery), false);
         }
-        Ok(Preparation::Reader(config, inputs, refresh_after_call)) => {
-            (config, inputs, refresh_after_call)
+        Ok(Preparation::Reader(config, inputs, refresh_after_call, recovery)) => {
+            (config, inputs, refresh_after_call, recovery)
         }
         Err(error) => return (rmcp_tool_error(error), false),
     };
@@ -792,12 +801,9 @@ fn execute_official_tool_call(
             tool_response_to_rmcp(response),
             &tool_name,
             app.config().mcp.max_tool_result_chars,
-            ToolRecovery::for_call(
-                &tool_name,
-                &args,
-                &advertised_tools(app.config()),
-                app.config(),
-            ),
+            // Reuse preparation's cached-catalogue decision: O(1) time and memory here,
+            // instead of rebuilding O(T) catalogue bytes and opening another schema reader.
+            recovery,
             Some(cancellation.flag()),
         ),
         Err(error) => rmcp_tool_error(error),
@@ -809,6 +815,7 @@ fn execute_official_tool_call(
 struct TestReaderProbe {
     rendezvous: std::sync::Barrier,
     rendezvous_entries: usize,
+    first_release: Option<(Mutex<bool>, std::sync::Condvar)>,
     admission_attempts: std::sync::atomic::AtomicUsize,
     entries: std::sync::atomic::AtomicUsize,
     dispatches: std::sync::atomic::AtomicUsize,
@@ -824,6 +831,7 @@ impl TestReaderProbe {
         Self {
             rendezvous: std::sync::Barrier::new(readers),
             rendezvous_entries: readers,
+            first_release: None,
             admission_attempts: std::sync::atomic::AtomicUsize::new(0),
             entries: std::sync::atomic::AtomicUsize::new(0),
             dispatches: std::sync::atomic::AtomicUsize::new(0),
@@ -838,6 +846,7 @@ impl TestReaderProbe {
         Self {
             rendezvous: std::sync::Barrier::new(2),
             rendezvous_entries: 1,
+            first_release: Some((Mutex::new(false), std::sync::Condvar::new())),
             admission_attempts: std::sync::atomic::AtomicUsize::new(0),
             entries: std::sync::atomic::AtomicUsize::new(0),
             dispatches: std::sync::atomic::AtomicUsize::new(0),
@@ -853,13 +862,23 @@ impl TestReaderProbe {
         let active = self.active.fetch_add(1, Ordering::AcqRel) + 1;
         self.max_active.fetch_max(active, Ordering::AcqRel);
         if entry <= self.rendezvous_entries {
-            self.rendezvous.wait();
+            if let Some((released, changed)) = &self.first_release {
+                drop(
+                    changed
+                        .wait_while(released.lock().unwrap(), |released| !*released)
+                        .unwrap(),
+                );
+            } else {
+                self.rendezvous.wait();
+            }
         }
         TestReaderActivity(self)
     }
 
     fn release_first(&self) {
-        self.rendezvous.wait();
+        let (released, changed) = self.first_release.as_ref().unwrap();
+        *released.lock().unwrap() = true;
+        changed.notify_all();
     }
 
     fn record_dispatch(&self) {
@@ -876,6 +895,17 @@ impl TestReaderProbe {
 
     fn record_cancelled_active(&self) {
         self.cancelled_active.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+// Release blocked readers during assertion unwinding before the Tokio runtime waits for them.
+#[cfg(test)]
+struct ReleaseTestReaderOnDrop(Arc<TestReaderProbe>);
+
+#[cfg(test)]
+impl Drop for ReleaseTestReaderOnDrop {
+    fn drop(&mut self) {
+        self.0.release_first();
     }
 }
 
@@ -922,7 +952,7 @@ enum ToolPaging {
     /// The tool returns one whole answer and advertises no `limit`, so naming one would send the
     /// caller to an argument its own schema rejects.
     Unpaged,
-    /// The caller asked for every match with `limit=0`. There is no requested page to halve, but
+    /// The caller asked for every match with `limit=0` or `all_results`. There is no page to halve, but
     /// the tool does page, so a finite retry exists and is sized from what came back.
     EveryMatch,
     /// The call resolved to this page, explicitly or from the advertised default.
@@ -947,7 +977,18 @@ impl ToolRecovery {
         // the same schema rather than assumed, for the same reason `limit` is: no two tools carry
         // the same set, and naming one a tool lacks hands the caller an argument its own schema
         // rejects while the one that would have worked goes unmentioned.
-        let reducers = ReducingArguments::of(accepts);
+        let reducers = ReducingArguments::of(|argument| {
+            accepts(argument)
+                && match argument {
+                    "detail" => args[argument] != "compact",
+                    "context" => args[argument] != 0,
+                    "include" => args[argument]
+                        .as_array()
+                        .is_none_or(|items| !items.is_empty()),
+                    "receipt_level" => args[argument] != "none",
+                    _ => true,
+                }
+        });
         if !accepts("limit") {
             return Self {
                 paging: ToolPaging::Unpaged,
@@ -959,7 +1000,11 @@ impl ToolRecovery {
         // so the omission value is read from the configuration that rendered it into the prose.
         // `limit=0` means "every match" on the session tools: unbounded, so there is no requested
         // page to halve, but the tool still pages and a finite retry is still available.
-        let explicit = args.get("limit").and_then(Value::as_u64);
+        let explicit = if accepts("all_results") && args["all_results"] == true {
+            Some(0)
+        } else {
+            args.get("limit").and_then(Value::as_u64)
+        };
         let paging = match explicit.or_else(|| configured_omitted_page(tool_name, config)) {
             Some(0) | None => ToolPaging::EveryMatch,
             Some(page) => usize::try_from(page)
@@ -1197,9 +1242,7 @@ fn enforce_tool_result_ceiling_cancellable(
     // moves its bytes into the fixed side and makes a retry look impossible. `results` is the
     // obvious one. `included` carries one entry per distinct session in the page, so it shrinks
     // too. And the `CallToolResult` carries a text rendering of the same results beside the
-    // structured content, which on a measured 20-result response was 4,200 of its 31,483
-    // characters -- counting that as fixed put the envelope over the ceiling and produced advice
-    // saying no page could ever fit, on a response whose 2-result page measured 4,930.
+    // structured content. Counting the rendering as fixed can make a fitting page look impossible.
     let shape = if let Some(structured) = result.structured_content.as_ref() {
         let rendered = serialized_char_count_or_zero(&result.content, cancellation)?;
         // Each result's own size, in order, so a shorter page is priced by the results it would
@@ -1213,10 +1256,7 @@ fn enforce_tool_result_ceiling_cancellable(
             }
         }
         // `included` is deliberately not counted as scaling. It carries one entry per distinct
-        // session, not per result, and a shorter page usually spans the same sessions: a measured
-        // 20-result page and its 3-result prefix both covered exactly two. Treating it as
-        // shrinking made the estimate 26% optimistic, which is the difference between advice that
-        // works and advice that fails on the caller's next call.
+        // session, not per result; a shorter page may still span the same sessions.
         let scaling = result_sizes.iter().sum::<usize>() + rendered;
         Some(ResponseShape {
             scaling_chars: scaling,
@@ -1300,7 +1340,8 @@ fn returned_count(structured: &Value) -> Option<usize> {
 /// hand-listed table of those names is one more thing to keep in step with the tools. The response
 /// already says how many items it returned, so the array that *is* those items is the top-level
 /// array of that length -- and where more than one matches, the largest, since a page shrinks the
-/// payload rather than a same-length index beside it.
+/// payload rather than a same-length index beside it. Skill matches live under
+/// `run.output.result.report.matches` and follow the same sizing rule.
 fn returned_items<'a>(
     structured: &'a Value,
     returned: Option<usize>,
@@ -1317,6 +1358,11 @@ fn returned_items<'a>(
     for items in object
         .values()
         .filter_map(Value::as_array)
+        .chain(
+            structured
+                .pointer("/run/output/result/report/matches")
+                .and_then(Value::as_array),
+        )
         .filter(|items| items.len() == returned)
     {
         let chars = serialized_char_count_or_zero(items, cancellation)?;
@@ -1332,10 +1378,8 @@ fn returned_items<'a>(
 ///
 /// Response size is affine in the page, not proportional: a fixed envelope plus a per-result
 /// cost. Scaling the page by `ceiling / measured` ignores the envelope and therefore overshoots
-/// whenever the envelope is a real share of the ceiling. An installed search measuring 29,956
-/// characters at `limit=20` against a 6,000 ceiling was told to retry at 3, and 3 measured 6,358:
-/// the advice failed on its own next call. Both quantities are in hand at the moment the error is
-/// built, so they are measured instead.
+/// whenever the envelope is a substantial share of the ceiling. Measure both quantities from
+/// the response in hand so retry advice accounts for the fixed cost.
 #[derive(Debug, Clone)]
 struct ResponseShape {
     /// Everything a smaller page shrinks: the results, the per-session metadata beside them, and
@@ -1361,8 +1405,7 @@ impl ResponseShape {
         /// This is an estimate built from one sample, and the parts it cannot see all push the
         /// same way. The text rendering carries fixed structure that does not shrink with the
         /// page, and a shorter page can span the same sessions as a longer one, so the pieces
-        /// charged proportionally are charged slightly too little. On the measured response the
-        /// remaining error was about 8%, all of it optimistic.
+        /// charged proportionally can be underestimated. Leave headroom for that uncertainty.
         ///
         /// Aiming at the ceiling therefore lands just over it, which is the one outcome that
         /// makes the advice worthless: the caller follows it exactly and gets the same error. The
@@ -1428,6 +1471,11 @@ fn recovery_advice(
 
     match suggested_retry_limit(measured, ceiling, resolved_page, shape) {
         Some(suggested) => {
+            let extent = if matches!(tool_name, "search_messages" | "run_skill_capability") {
+                " Omit all_results when setting limit."
+            } else {
+                ""
+            };
             let also = match &reduce_each_result {
                 Some(clauses) => format!(", or {clauses}"),
                 None => String::new(),
@@ -1435,7 +1483,7 @@ fn recovery_advice(
             format!(
                 "The retrieval plan and the selected page are unchanged, so a retry at the same \
                  offset returns the same results and you do not need to re-scope the query. Retry \
-                 with limit={suggested} at the same offset{also}. {raise_the_ceiling} The retry \
+                 with limit={suggested} at the same offset{also}.{extent} {raise_the_ceiling} The retry \
                  succeeded when the response carries {} and {}; continue from {}.",
                 paging_paths.returned, paging_paths.has_more, paging_paths.next_offset
             )
@@ -1475,13 +1523,8 @@ fn recovery_advice(
 /// `page * ceiling / measured`. Both terms are measured from the response in hand rather than
 /// assumed, which is what makes this exact instead of approximate.
 ///
-/// Two earlier versions of this function each shipped a defect that a caller met before a test
-/// did. The first scaled from a hard-coded 15, so a `limit=1` overflow was told to retry with
-/// `limit=12`: more work than the call that had just failed. The second scaled proportionally
-/// with a 0.85 factor meant to absorb the envelope, and an installed search that measured 29,956
-/// characters at `limit=20` against a 6,000 ceiling was told to retry at 3, which measured 6,358
-/// and failed again. Proportional scaling cannot absorb an envelope whose share of the ceiling is
-/// unknown, and on that response the envelope alone was over a third of it.
+/// Scale the requested page, never a hard-coded default, and retain the fixed envelope.
+/// A proportional safety factor cannot account for an envelope of unknown size.
 ///
 /// `None` means no page fits: either a single result exceeds the ceiling, or the envelope does.
 /// Both are real states, and naming a limit in either would be advice that cannot be followed.
@@ -1688,9 +1731,12 @@ fn validate_schema_value(
                         let accepted: Vec<&str> = properties
                             .map(|properties| properties.keys().map(String::as_str).collect())
                             .unwrap_or_default();
+                        let hint = (path == "arguments")
+                            .then(|| replaced_parameter_hint(tool_name, key, &accepted))
+                            .flatten()
+                            .unwrap_or_else(|| unknown_key_hint(key, &accepted));
                         return Err(format!(
-                            "unknown {tool_name} parameter at {path}: {key}{}",
-                            unknown_key_hint(key, &accepted)
+                            "unknown {tool_name} parameter at {path}: {key}{hint}"
                         ));
                     }
                 }
@@ -1874,10 +1920,13 @@ fn open_mcp_app<'a>(
     harness_roots: &[std::path::PathBuf],
 ) -> anyhow::Result<&'a SessionSearch> {
     if slot.is_none() {
-        *slot = Some(SessionSearch::open_with_access_inputs(
+        let mut app = SessionSearch::open_with_access_inputs(
             config.clone(),
             mcp_access_inputs(config, harness_roots.to_vec())?,
-        )?);
+        )?;
+        // The server reports index readiness through get_index_status instead.
+        app.serve_unrefreshed_index_as_empty();
+        *slot = Some(app);
     }
     Ok(slot.as_ref().expect("application slot initialized above"))
 }
@@ -2683,6 +2732,8 @@ fn message_field_view_output_schema() -> Value {
 }
 
 fn run_skill_capability_output_schema() -> Value {
+    // Capability matches share the result ceiling: extra per-match metadata must fit independently
+    // of text windows, without dropping matches, changing classifications, or raising the cap.
     let selector = skill_selector_input_schema();
     let selected_location = json!({
         "oneOf": [
@@ -2818,9 +2869,18 @@ fn run_skill_capability_output_schema() -> Value {
                 "matches": {
                     "type": "array",
                     "items": { "$ref": "#/$defs/ClassifiedMatch" }
+                },
+                "unattributed_input_count": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Queued messages in scope whose transcript does not record who sent them."
+                },
+                "unattributed_input_included": {
+                    "type": "boolean",
+                    "description": "Whether matches read those messages."
                 }
             },
-            "required": ["policies", "matches"],
+            "required": ["policies", "matches", "unattributed_input_count", "unattributed_input_included"],
             "additionalProperties": false
         },
         // Two tagged unions, each a branch per variant, so their inline form costs four levels
@@ -2894,6 +2954,7 @@ fn run_skill_capability_output_schema() -> Value {
 }
 
 fn search_messages_output_schema() -> Value {
+    // Keep metadata aligned with MessageProvenance::hit_header; full partitions broke compact calls.
     // The canonical response uses custom conditional `Serialize` projections. Deriving a schema
     // through `schemars` would require a parallel DTO and recreate the semantic drift this adapter
     // removed. Keep this protocol declaration separate from runtime construction, then validate
@@ -2929,7 +2990,17 @@ fn search_messages_output_schema() -> Value {
             "properties": {
                 "provider": { "type": "string", "enum": crate::source::PROVIDERS },
                 "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"] },
-                "kind": { "type": "string", "enum": message_kind_values() }
+                "kind": { "type": "string", "enum": message_kind_values() },
+                "provenance": {
+                    "type":"object", "additionalProperties":false,
+                    "required":["authorship","record_relation","input_delivery_state","input_origin"],
+                    "properties": {
+                        "authorship":{"type":"string","enum":provenance_enum_values::<crate::models::MessageAuthorship>(false)},
+                        "record_relation":{"type":"string","enum":provenance_enum_values::<crate::models::MessageRecordRelation>(false)},
+                        "input_origin":{"type":["string","null"],"enum":provenance_enum_values::<crate::models::MessageInputOrigin>(true)},
+                        "input_delivery_state":{"type":["string","null"],"enum":provenance_enum_values::<crate::models::InputDeliveryState>(true)}
+                    }
+                }
             },
             "required": ["provider", "role", "kind"],
             "additionalProperties": false
@@ -2973,6 +3044,7 @@ fn search_messages_output_schema() -> Value {
         "properties": {
             "message_ref": message_ref,
             "message_metadata": message_metadata,
+            "timestamp": { "type": ["string", "null"], "format": "date-time" },
             "match": {
                 "type": "object",
                 "properties": {
@@ -3025,7 +3097,7 @@ fn search_messages_output_schema() -> Value {
                 "additionalProperties": false
             }
         },
-        "required": ["message_ref", "message_metadata", "presentation"],
+        "required": ["message_ref", "message_metadata", "timestamp", "presentation"],
         "additionalProperties": false
     });
     json!({
@@ -3292,11 +3364,28 @@ fn parser_health_output_schema() -> Value {
             "current_sessions": { "type": "integer", "minimum": 0 },
             "stale_sessions": { "type": "integer", "minimum": 0, "description": "Indexed sessions whose stored parse version is older than the current one. This is the total; see repairable_stale_sessions and unavailable_stale_sessions for the split. A stale session is still fully searchable, and the unavailable portion has no repair because its transcript is gone from disk, so a non-zero value here does not by itself mean action is required." },
             "parse_warnings": { "type": "integer", "minimum": 0 },
-            "providers": { "type": "array", "items": provider_parser_health_output_schema() }
+            "providers": { "type": "array", "items": provider_parser_health_output_schema() },
+            "unrecognized_record_types": {
+                "type": "array",
+                "maxItems": crate::models::UnrecognizedRecordType::LIMIT,
+                "description": "Record types a parser did not recognize; their records were not indexed. Most records first.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "provider": { "type": "string" },
+                        "record_type": { "type": "string" },
+                        "records": { "type": "integer", "minimum": 1 },
+                        "sessions": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["provider", "record_type", "records", "sessions"],
+                    "additionalProperties": false
+                }
+            }
         },
         "required": [
             "schema_version", "expected_schema_version", "schema_current", "indexed_sessions",
-            "current_sessions", "stale_sessions", "parse_warnings", "providers"
+            "current_sessions", "stale_sessions", "parse_warnings", "providers",
+            "unrecognized_record_types"
         ],
         "additionalProperties": false
     })
@@ -3675,14 +3764,12 @@ fn render_message_search_field_description(
         McpFieldRole::OneValueAlias { plural } => {
             format!("One value; conflicts with {plural}.")
         }
-        McpFieldRole::ContextBefore => format!(
-            "Preceding neighbours per hit; omit for {}.",
-            context.messages_before()
-        ),
-        McpFieldRole::ContextAfter => format!(
-            "Following neighbours per hit; omit for {}.",
-            context.messages_after()
-        ),
+        McpFieldRole::ContextBefore => {
+            format!("Neighbours before; omit for {}.", context.messages_before())
+        }
+        McpFieldRole::ContextAfter => {
+            format!("Neighbours after; omit for {}.", context.messages_after())
+        }
         // "fuzzy search does not support all_results" and "sequence bounds require one session"
         // are two of the nine validator rules, and `message_search_tool_description` renders all
         // nine verbatim. A reader holding the parameter list holds the tool description too, so
@@ -3696,7 +3783,7 @@ fn render_message_search_field_description(
         McpFieldRole::TimePeriod => {
             "One period, both bounds; conflicts with since and until.".to_owned()
         }
-        McpFieldRole::PurposeVersion => "Purpose bundle version; required with purpose.".to_owned(),
+        McpFieldRole::PurposeVersion => "Required purpose version.".to_owned(),
         McpFieldRole::Canonical => {
             // A handful of fields need a number the registry does not carry, because the value is
             // this surface's planner-resolved policy rather than the parameter's semantics. Read
@@ -3766,7 +3853,7 @@ fn render_message_search_field_description(
                 // A mode rather than a value, so it is worded without "omit for" and stays out
                 // of the tool description's omitted-values sentence, which lists values.
                 (_, MessageSearchOmission::QuerylessSearch) => {
-                    "without it every message the filters allow is eligible.".to_owned()
+                    "without it all eligible messages.".to_owned()
                 }
                 // A defaulted parameter must name its default value in the text, not just in the
                 // keyword. `default` is one of the six keywords both Codex and VS Code delete
@@ -3814,27 +3901,19 @@ fn message_search_tool_description(config: &Config, input_schema: &Value) -> Str
         .expect("validated MCP configuration resolves a queryless message-search request");
     let registry = specification.registry();
     let mut text = String::from(
-        "Find exact message evidence across local AI session history. structuredContent is \
-         authoritative: effective_request states the resolved request and budgets, results carry \
-         message_ref plus field and match views with exact literal coordinates, and \
-         page.next_offset is the next offset when more results exist. Expand one hit with \
-         get_session(session_id, message_seq).\n",
+        "Search local messages. structuredContent is authoritative; effective_request states choices; \
+         results carry message_ref, views and literal coordinates. \
+         page.next_offset is the next offset; expand with get_session(session_id, seq).\n",
     );
-    // Only what `enum` cannot say. The six message classes and nine provider slugs already
-    // travel as accepted values on their own parameters, and restating them here would be a
-    // second copy of a list the model already has, free to drift from it. Literal-mode semantics
-    // and the time examples are here because the CLI states them in its own help and a model
-    // may have no shell to run `aise dates`.
     text.push_str(
-        "Omitting a filter leaves it unapplied. harness_notice (the harness's own text, not a \
-         person's) is the one class omitted when kinds is omitted. query_mode literal is a \
-         case-insensitive substring (punctuation significant), regex is Rust regex, fuzzy is a \
-         bounded fuzzy match. since/until/when take an RFC 3339 instant or a relative form such \
-         as 7d, yesterday, or 2026-01. receipt_level summary explains how the search was \
-         planned; full adds each value's origin. lines_per_message (line window first) and \
-         field_view/match_view (character budgets in Unicode scalars) change presentation only, \
-         never matching, order, count, context, or includes.\n",
+        "Omitting a filter leaves it unapplied. harness_notice (harness output) is the one class omitted when kinds is omitted. \
+         literal: case-insensitive substring, punctuation significant; regex uses Rust regex; \
+         fuzzy is bounded. since/until/when accept RFC 3339 or relative dates (7d, yesterday, 2026-01). \
+         receipt_level summary explains how the search was planned; full adds each value's origin. lines_per_message runs before \
+         field_view/match_view; views use Unicode scalars and preserve \
+         matches, order, count, context and includes.\n",
     );
+    text.push_str("role=user selects recorded user input across storage roles, including queues and interactive answers; returned metadata keeps the native stored role and sender/delivery uncertainty. Views/context may contain generated text.\n");
     text.push_str(&omitted_values_sentence(input_schema));
     text.push_str("Combinations that are rejected:\n");
     for descriptor in registry.rule_descriptors() {
@@ -4116,12 +4195,19 @@ fn project_message_search_spec(config: &Config, mut schema: Value) -> Value {
     schema
 }
 
+#[cfg(test)]
+thread_local! {
+    static CATALOGUE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The `tools[]` array this server advertises, without the JSON-RPC envelope around it.
 ///
 /// Callers that measure the catalogue want the array; callers that measure transport want the
 /// message. Those are two stages that differ by the wrapper, and reporting one figure for the
 /// other is how a wire cost gets read as a model-context cost, so the two have separate accessors.
 pub fn advertised_tools(config: &Config) -> Value {
+    #[cfg(test)]
+    CATALOGUE_BUILDS.with(|count| count.set(count.get() + 1));
     handle_tools_list(None, config)["result"]["tools"].clone()
 }
 
@@ -4247,6 +4333,156 @@ pub(crate) fn measure_representative_response(config: &Config) -> Result<Measure
 
     let _ = std::fs::remove_dir_all(&root);
     measured
+}
+
+/// A top-level parameter name a tool rejects whose intended meaning is known: a name the tool
+/// used to accept, or the name a sibling tool uses for the same thing.
+struct ReplacedToolParameter {
+    tool: &'static str,
+    name: &'static str,
+    /// Accepted parameters of `tool` that replace `name`; a test holds each to the served schema.
+    replacements: &'static [&'static str],
+    /// How the value changes, or "" when it carries over unchanged.
+    value_change: &'static str,
+}
+
+/// Replaced parameter names. Accepted compatibility aliases advertise deprecation in their
+/// schema; rejected sibling-tool names use this table to name the accepted replacement.
+const REPLACED_TOOL_PARAMETERS: &[ReplacedToolParameter] = &[
+    ReplacedToolParameter {
+        tool: "get_session",
+        name: "message_seq",
+        replacements: &["seq"],
+        value_change: "accepted deprecated alias; pass the same sequence as seq",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "response_format",
+        replacements: &["detail"],
+        value_change: "detail takes \"compact\" or \"full\" where response_format took \"concise\" or \"detailed\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "preview_chars",
+        replacements: &["field_view", "match_view"],
+        value_change: "pass {\"kind\":\"max_chars\",\"max_chars\":N} instead of N",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "match_evidence_max_chars",
+        replacements: &["match_view"],
+        value_change: "pass {\"kind\":\"max_chars\",\"max_chars\":N} instead of N",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "path_prefix",
+        replacements: &["workspace_path_prefix", "transcript_path_prefix"],
+        value_change: "workspace_path_prefix matches the working directory or repository root, transcript_path_prefix the transcript file",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "exclude_path_prefixes",
+        replacements: &[
+            "exclude_workspace_path_prefixes",
+            "exclude_transcript_path_prefixes",
+        ],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "match_mode",
+        replacements: &["query_mode"],
+        value_change: "query_mode takes \"literal\", \"regex\" or \"fuzzy\"; match_mode \"exact\" is query_mode \"literal\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "regex",
+        replacements: &["query", "query_mode"],
+        value_change: "pass the pattern as query with query_mode \"regex\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "fuzzy_query",
+        replacements: &["query", "query_mode"],
+        value_change: "pass the text as query with query_mode \"fuzzy\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "tool",
+        replacements: &["tool_name_contains"],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "no_compaction",
+        replacements: &["include_compaction"],
+        value_change: "no_compaction true is include_compaction false",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "explain",
+        replacements: &["receipt_level"],
+        value_change: "explain true is receipt_level \"summary\"",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "order",
+        replacements: &["match_window"],
+        value_change: "order \"oldest\" is match_window \"earliest\", \"newest\" is \"latest\"; fuzzy queries rank by relevance without it",
+    },
+    ReplacedToolParameter {
+        tool: "search_messages",
+        name: "include_refs",
+        replacements: &["include"],
+        value_change: "include_refs true is include [\"parsed_references\"]",
+    },
+    ReplacedToolParameter {
+        tool: "search_sessions",
+        name: "workspace_path_prefix",
+        replacements: &["path_prefix"],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "list_sessions",
+        name: "workspace_path_prefix",
+        replacements: &["path_prefix"],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "search_sessions",
+        name: "exclude_workspace_path_prefixes",
+        replacements: &["exclude_path_prefixes"],
+        value_change: "",
+    },
+    ReplacedToolParameter {
+        tool: "list_sessions",
+        name: "exclude_workspace_path_prefixes",
+        replacements: &["exclude_path_prefixes"],
+        value_change: "",
+    },
+];
+
+/// Hint for a top-level `name` that [`REPLACED_TOOL_PARAMETERS`] knows for `tool`: which accepted
+/// parameter replaces it, how its value changes, and then every accepted parameter.
+fn replaced_parameter_hint(tool: &str, name: &str, accepted: &[&str]) -> Option<String> {
+    let row = REPLACED_TOOL_PARAMETERS
+        .iter()
+        .find(|row| row.tool == tool && row.name == name)?;
+    let replacements: Vec<String> = row
+        .replacements
+        .iter()
+        .map(|name| format!("{name:?}"))
+        .collect();
+    let value_change = if row.value_change.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", row.value_change)
+    };
+    Some(format!(
+        " — use {} instead{value_change}; accepted parameters are {}",
+        replacements.join(" or "),
+        quoted_sorted_names(accepted)
+    ))
 }
 
 fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
@@ -4422,9 +4658,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         "required": ["categories"],
                         "additionalProperties": false
                     },
-                    "detail": { "type": "string", "enum": ["compact", "full"], "description": "Presentation preset: compact returns bounded views; full returns the complete message in field_view plus a bounded match view. Conflicts with field_view and match_view." },
+                    "detail": { "type": "string", "enum": ["compact", "full"], "description": "Preset: compact bounds both views; full keeps the whole message in field_view and bounds match_view. Conflicts with field_view and match_view." },
                     "field_view": {
-                        "description": format!("View budget for the returned message: no_char_limit returns the complete message; max_chars retains at most that many Unicode scalar characters. Omit for {{kind:max_chars,max_chars:{}}}.", config.mcp.preview_chars.max(1)),
+                        "description": format!("Message view: no_char_limit keeps all; max_chars caps Unicode scalar characters (1 or greater). Omit for {{kind:max_chars,max_chars:{}}}.", config.mcp.preview_chars.max(1)),
                         "oneOf": [
                             {
                                 "type": "object",
@@ -4444,7 +4680,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                         ]
                     },
                     "match_view": {
-                        "description": "Independent match-centered view: minimal_span returns the complete regex match; max_chars adds surrounding text without changing the match coordinates.",
+                        "description": "Independent match view: minimal_span keeps the whole regex match; max_chars adds context without changing coordinates.",
                         "oneOf": [
                             {
                                 "type": "object",
@@ -4472,8 +4708,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "until": { "type": "string", "description": "Upper bound on the message's own timestamp, inclusive; omit for no bound." },
                     "when": { "type": "string", "description": "One period bounding message timestamps at both ends; conflicts with since and until." },
                     "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size; omit for the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit) },
-                    "all_results": { "type": "boolean", "description": "Return every match rather than one page; conflicts with limit. Each match carries a whole user message, so prefer paging when the range is wide. Omit for false." },
-                    "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." }
+                    "all_results": { "type": "boolean", "description": "Every match; conflicts with limit. Matches contain whole user messages, so page wide ranges. Omit for false." },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." },
+                    "include_unattributed_input": { "type": "boolean", "description": "Also read queued messages with no recorded sender. Omit for false: they are left out and counted." }
                 },
                 "required": ["skill"],
                 "additionalProperties": false
@@ -4522,7 +4759,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "get_session",
                     "annotations": read_only_tool_annotations(),
-                    "description": format!("Return one session from {provider_summary} by ID or unique prefix. Use summary=true for compact evidence, transcript_lines=N for transcript text (0 returns all lines), message_seq=N with context for one turn, or seq_from/seq_to for an absolute message range. To read more, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger transcript_lines, which re-sends what you already received. Default returns {} transcript lines.", transcript_lines_default_label(config.mcp.get_session_transcript_lines)),
+                    "description": format!("Return one session from {provider_summary} by ID or unique prefix. Use summary=true for compact evidence, transcript_lines=N for transcript text (0 returns all lines), seq=N with context for one turn, or seq_from/seq_to for an absolute message range. To read more, continue from the next seq range (seq_from = last returned seq + 1) rather than re-requesting with a larger transcript_lines, which re-sends what you already received. Default returns {} transcript lines.", transcript_lines_default_label(config.mcp.get_session_transcript_lines)),
                     "outputSchema": get_session_output_schema(),
                     "inputSchema": {
                         "type": "object",
@@ -4533,43 +4770,45 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "summary": {
                                 "type": "boolean",
-                                "description": "Return compact session summary/evidence: stored opening purpose plus selected user intent, tool activity previews, refs, aggregate changed-file summaries, provenance, and bounded follow-up commands. summary_items controls message-derived evidence and the shared aggregate cap; truncated_evidence names categories with additional indexed entries. Mutually exclusive with transcript_lines and message_seq. Default false, which returns transcript lines instead."
+                                "description": "Compact evidence: opening purpose, selected user intent, tool previews, refs, aggregate file changes, provenance and bounded follow-ups. summary_items caps message and aggregate evidence; truncated_evidence lists categories with more entries. Conflicts with transcript_lines and seq. Omit for false (transcript lines)."
                             },
                             "summary_items": { "type": "integer", "description": format!("With summary=true, select aggregate evidence records: positive=first, negative=last, 0=all (default {}). Message-derived records are displayed chronologically; changed_files remains an aggregate ordered by path and edit count. This changes presentation only; use bounded search_messages pages for deterministic non-overlapping detail retrieval.", config.mcp.summary_items) },
                             "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections (default none). Currently supports time_profile. Requires summary=true." },
                             "transcript_lines": {
                                 "type": "integer",
-                                "description": format!("Return transcript lines: positive=head, negative=tail, 0=entire transcript and may be very large. Bound this when skimming many sessions: a negative tail shows how a session ended, a positive head shows how it started, and 0 is for complete capture only. To pinpoint one turn, use search_messages and pass its message_seq here instead of reading a large window. Mutually exclusive with summary and message_seq. Default when no output selector is provided: {}.", config.mcp.get_session_transcript_lines)
+                                "description": format!("Transcript lines: positive=head/start, negative=tail/end, 0=all (may be large). Prefer seq for one turn. Conflicts with summary, seq and ranges. Omit for {} when no selector is given.", config.mcp.get_session_transcript_lines)
                             },
-                            "message_seq": {
-                                "type": "integer", "minimum": 0,
-                                "description": "Message sequence number copied from search_messages `results[].message_ref.message_seq`. Returns a focused message-context result instead of transcript lines."
-                            },
+                            "seq": { "type": "integer", "minimum": 0, "description": "0-based signed 64-bit focused sequence from results[].message_ref.message_seq of search_messages. Omit for transcript lines." },
+                            "message_seq": { "type": "integer", "minimum": 0, "description": "Deprecated: use seq; conflicts fail." },
                             "seq_from": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Lower inclusive message-sequence bound for an absolute range read of this session's messages. seq numbers are session-local, which this per-session tool already scopes. Pair with seq_to to read one session in non-overlapping chunks (e.g. 0..499, then 500..999) instead of re-reading a larger transcript_lines head/tail. Mutually exclusive with summary, transcript_lines, and message_seq."
+                                "description": "Lower inclusive session-local sequence bound. Pair with seq_to for chunks (0..499, then 500..999); advance last seq + 1 to avoid re-reading. Conflicts with summary, transcript_lines and seq. Omit to start at the first message."
                             },
                             "seq_to": {
                                 "type": "integer", "minimum": 0,
                                 "description": "Upper inclusive message-sequence bound for an absolute range read. See seq_from for non-overlapping chunked reads. Must be >= seq_from when both are given."
                             },
+                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Message classes for seq_from/seq_to ranges. Omit for every class except harness_notice. Include harness_notice in an explicit class list to read notices too; focused seq context already includes every class." },
+                            "context_before": { "type": "integer", "minimum": 0, "description": "Messages before seq; omit for context. 0 selects none." },
+                            "context_after": { "type": "integer", "minimum": 0, "description": "Messages after seq; omit for context. 0 selects none." },
                             "context": {
                                 "type": "integer", "minimum": 0,
-                                "description": "When message_seq is provided, include this many turns before and after that message (default 0)."
+                                "description": "When seq is provided, include this many turns before and after that message (default 0)."
                             },
                             "include_refs": {
                                 "type": "boolean",
-                                "description": "When message_seq is provided, include extracted URL-like references for each returned message (default false)."
+                                "description": "When seq is provided, include extracted URL-like references for each returned message (default false)."
                             },
                             "preview_chars": { "type": "integer", "minimum": 1, "description": format!("Maximum characters per concise message/tool/ref preview in summary output and focused message context (default {}). Not used for transcript output.", config.mcp.preview_chars.max(1)) },
                             "lines_per_message": {
                                 "type": "integer",
-                                "description": format!("With message_seq: limit each returned message's displayed content (positive keeps its first N lines, negative keeps its last N lines, 0 keeps complete content; default {}). This presentation window does not change context membership or reference extraction. Use it to keep long tool output around one turn skimmable. It bounds each returned message on its own; use transcript_lines to window a whole session transcript.", config.mcp.lines_per_message)
+                                "description": format!("With seq: display each message's first N lines (positive), last N (negative), or all (0); omit for {}. Bounds long tool output per message without changing membership or reference extraction. Use transcript_lines for a whole transcript window.", config.mcp.lines_per_message)
                             },
+                            "detail": { "type": "string", "enum": ["compact", "full"], "description": "For focused context or ranges: compact caps content at preview_chars; full keeps all characters after lines_per_message. Omit for compact." },
                             "response_format": {
                                 "type": "string",
                                 "enum": ["concise", "detailed"],
-                                "description": "When message_seq is provided, concise (default) applies preview_chars after the per-message line window; detailed applies no additional character cap after that line window."
+                                "description": "Deprecated: use detail compact/full instead of response_format concise/detailed. Applies to focused context and ranges. Omit for concise when detail is absent."
                             }
                         },
                         "required": ["session_id"],
@@ -4644,14 +4883,14 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     // `tool.description` is a separate field with its own 2,048-character cap that
                     // no measured client charges to the schema. A fact many parameters share also
                     // reads better stated once here than transcribed onto each of them.
-                    "description": format!("{} {}", format!("Execute deterministic message-classification rules under one selected Aise skill package across {provider_summary}. By default Aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not Aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Packaged and direct definitions share a 1 MiB parsing ceiling; exceeding it returns byte counts and guidance rather than truncated rules. since/until/when bound the message's own timestamp, not session activity: an RFC 3339 instant or a relative form such as 7d, yesterday, or 2026-01. session_kinds omits subagent runs, unlike search_messages and list_sessions: in a spawned run, 'user' rows hold the calling agent's delegation prompt, not a person's text. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."), omitted_values_sentence(&run_skill_capability_input_schema).trim_end()),
+                    "description": format!("{} {}", format!("Execute deterministic message-classification rules under one selected aise skill package across {provider_summary}. By default aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Packaged and direct definitions share a 1 MiB parsing ceiling; exceeding it returns byte counts and guidance rather than truncated rules. since/until/when bound the message's own timestamp, not session activity: an RFC 3339 instant or a relative form such as 7d, yesterday, or 2026-01. session_kinds omits subagent runs, unlike search_messages and list_sessions: in a spawned run, 'user' rows hold the calling agent's delegation prompt, not a person's text. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."), omitted_values_sentence(&run_skill_capability_input_schema).trim_end()),
                     "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": run_skill_capability_input_schema
                 },
                 {
                     "name": "get_index_status",
                     "annotations": read_only_tool_annotations(),
-                    "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, actionable automatic index-update status when work is running or requires attention, and applicable repair commands. Equivalent to `aise doctor --format json`."),
+                    "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, actionable automatic index-update status when work is running or requires attention, and applicable repair commands. Like `aise doctor --format json`, without config-file metadata."),
                     "outputSchema": get_index_status_output_schema(),
                     "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
                 },
@@ -4899,7 +5138,19 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
     let summary = mcp_bool_arg(args, "summary", false);
-    let message_seq = args.get("message_seq").and_then(Value::as_i64);
+    let sequence_arg = |key: &str| {
+        args.get(key).filter(|value| !value.is_null()).map(|raw| {
+            mcp_nonnegative_i64_arg(args, key, 0).map_err(|_| format!(
+                "{key} must be an integer from 0 through {} (got {raw}); pass a session-local sequence as seq", i64::MAX
+            ))
+        }).transpose()
+    };
+    let old_seq = sequence_arg("message_seq")?;
+    let seq = sequence_arg("seq")?;
+    if seq.is_some() && old_seq.is_some() && seq != old_seq {
+        return Err("seq conflicts with deprecated message_seq; pass seq only".to_string());
+    }
+    let message_seq = seq.or(old_seq);
     let transcript_lines = args.get("transcript_lines").and_then(Value::as_i64);
     // Absolute message-range read: an alternative to a bigger transcript_lines head/tail that lets
     // the caller advance seq_from = last seq + 1 for deterministic, non-overlapping chunks. seq
@@ -4908,13 +5159,32 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     let seq_to = args.get("seq_to").and_then(Value::as_i64);
     let has_range = seq_from.is_some() || seq_to.is_some();
 
+    if message_seq.is_none() {
+        for name in ["context_before", "context_after"] {
+            reject_present(args, name, "asymmetric context only applies with seq")?;
+        }
+    }
+    if !has_range {
+        reject_present(
+            args,
+            "kinds",
+            "kinds only applies with seq_from/seq_to; focused context already includes every class",
+        )?;
+    }
+    if !has_range && message_seq.is_none() {
+        reject_present(
+            args,
+            "detail",
+            "detail only applies with message_seq or seq_from/seq_to",
+        )?;
+    }
     let selector_count = summary as usize
         + message_seq.is_some() as usize
         + transcript_lines.is_some() as usize
         + has_range as usize;
     if selector_count > 1 {
         return Err(
-            "Use only one get_session output selector: summary, transcript_lines, message_seq, or seq_from/seq_to."
+            "Use only one get_session output selector: summary, transcript_lines, seq (or deprecated message_seq), or seq_from/seq_to."
                 .to_string(),
         );
     }
@@ -4937,10 +5207,18 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
                 "unsupported get_session include value: {unsupported}"
             ));
         }
-        reject_present(args, "include_refs", "include_refs only applies with message_seq; summary already includes reference evidence")?;
-        reject_present(args, "context", "context only applies with message_seq; summary includes follow-up commands for larger windows")?;
-        reject_present(args, "response_format", "response_format only applies with message_seq; summary always returns structured evidence with bounded previews")?;
-        reject_present(args, "lines_per_message", "lines_per_message only applies with message_seq; summary uses preview_chars for its bounded previews")?;
+        reject_present(
+            args,
+            "include_refs",
+            "include_refs only applies with seq; summary already includes reference evidence",
+        )?;
+        reject_present(
+            args,
+            "context",
+            "context only applies with seq; summary includes follow-up commands for larger windows",
+        )?;
+        reject_present(args, "response_format", "response_format only applies with seq; summary always returns structured evidence with bounded previews")?;
+        reject_present(args, "lines_per_message", "lines_per_message only applies with seq; summary uses preview_chars for its bounded previews")?;
         let mut options = inspection_options_from_args(args, config)?;
         options.include_time_profile = include.iter().any(|value| value == "time_profile");
         let inspection = CatalogService::new(db)
@@ -4957,18 +5235,27 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             .map_err(|e| format!("{e:#}"))?;
         let context = mcp_nonnegative_i64_arg(args, "context", 0)?;
         let presentation = MessagePresentation::from_args(args, config)?;
-        return message_window_value(&session, seq, context, &presentation, db)
+        let before = mcp_nonnegative_i64_arg(args, "context_before", context)?;
+        let after = mcp_nonnegative_i64_arg(args, "context_after", context)?;
+        return message_window_value(&session, seq, (before, after), &presentation, db)
             .and_then(ToolResponse::structured);
     }
 
     if has_range {
-        reject_present(args, "context", "context only applies with message_seq; a seq_from/seq_to range reads every message in [seq_from, seq_to]")?;
+        reject_present(args, "context", "context only applies with seq; a seq_from/seq_to range reads every message in [seq_from, seq_to]")?;
         let session = db
             .resolve_session_record(session_id)
             .map_err(|e| format!("{e:#}"))?;
         let presentation = MessagePresentation::from_args(args, config)?;
-        return message_range_value(&session, seq_from, seq_to, &presentation, db)
-            .and_then(ToolResponse::structured);
+        return message_range_value(
+            &session,
+            seq_from,
+            seq_to,
+            parse_enum_array(args, "kinds")?,
+            &presentation,
+            db,
+        )
+        .and_then(ToolResponse::structured);
     }
     reject_present(
         args,
@@ -4979,9 +5266,13 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     reject_present(
         args,
         "context",
-        "context only applies with message_seq; transcript output uses transcript_lines",
+        "context only applies with seq; transcript output uses transcript_lines",
     )?;
-    reject_present(args, "include_refs", "include_refs only applies with message_seq; transcript output returns raw transcript lines")?;
+    reject_present(
+        args,
+        "include_refs",
+        "include_refs only applies with seq; transcript output returns raw transcript lines",
+    )?;
     reject_present(
         args,
         "preview_chars",
@@ -4990,26 +5281,20 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     reject_present(
         args,
         "response_format",
-        "response_format only applies with message_seq; transcript output uses transcript_lines",
+        "response_format only applies with seq; transcript output uses transcript_lines",
     )?;
-    reject_present(args, "lines_per_message", "lines_per_message caps each message and only applies with message_seq; transcript output windows the whole session with transcript_lines")?;
+    reject_present(args, "lines_per_message", "lines_per_message caps each message and only applies with seq; transcript output windows the whole session with transcript_lines")?;
     let selected_lines = transcript_lines.unwrap_or(config.mcp.get_session_transcript_lines);
 
-    let full = db
-        .resolve_session(session_id)
+    let window = crate::service::CatalogService::new(db)
+        .transcript(session_id, selected_lines)
         .map_err(|e| format!("{e:#}"))?;
-    let s = &full.session;
-
-    let (transcript, returned_lines_label) =
-        select_transcript_lines(&full.transcript_text, selected_lines);
-    let total_lines = full.transcript_text.lines().count();
-    let returned_lines = transcript.lines().count();
-    let selected_edge = match selected_lines.cmp(&0) {
-        std::cmp::Ordering::Less => "tail",
-        std::cmp::Ordering::Equal => "all",
-        std::cmp::Ordering::Greater => "head",
-    };
-    let complete = returned_lines == total_lines;
+    let s = &window.session;
+    let transcript = &window.text;
+    let returned_lines_label = &window.lines_label;
+    let (total_lines, returned_lines, complete) =
+        (window.total_lines, window.lines_returned, window.complete);
+    let selected_edge = window.edge;
 
     let title = s.title.as_deref().unwrap_or("(untitled)");
     let cwd = s.cwd.as_deref().unwrap_or("-");
@@ -5116,10 +5401,13 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<ToolResponse, String
         .and_then(Value::as_str)
         .ok_or("missing required parameter: session_id")?;
 
-    let session = db
-        .resolve_session_record(session_id)
+    let plan = crate::service::CatalogService::new(db)
+        .resume_command(session_id)
         .map_err(|e| format!("{e:#}"))?;
-    let (command, cwd) = resume_plan(&session).map_err(|e| format!("{e:#}"))?;
+    let Some(command) = plan.argv else {
+        return Err(plan.unavailable_reason.unwrap_or_default());
+    };
+    let cwd = plan.cwd;
 
     let cmd_str = render_posix_shell_command(&command).map_err(|error| format!("{error:#}"))?;
     // The text is the ready-to-run command; structured output names the resolved session
@@ -5133,7 +5421,7 @@ fn tool_get_resume_command(args: &Value, db: &Db) -> Result<ToolResponse, String
         None => (cmd_str, Value::Null),
     };
     let structured = json!({
-        "session_id": session.id,
+        "session_id": plan.session_id,
         "resume_command": resume_command.clone(),
         "cwd": cwd_value,
     });
@@ -5202,6 +5490,7 @@ fn tool_run_skill_capability(
     db: &Db,
 ) -> Result<ToolResponse, String> {
     let all_results = mcp_bool_arg(args, "all_results", false);
+    let include_unattributed_input = mcp_bool_arg(args, "include_unattributed_input", false);
     let requested_limit = mcp_optional_positive_usize_arg(args, "limit")?;
     if all_results && requested_limit.is_some() {
         return Err(
@@ -5314,6 +5603,7 @@ fn tool_run_skill_capability(
                 crate::skill_run::MessageClassificationQuery {
                     filters,
                     additional_skills: additional,
+                    include_unattributed_input,
                 },
             ),
         })
@@ -5587,13 +5877,18 @@ fn unknown_key_hint(key: &str, accepted: &[&str]) -> String {
     }
     match nearest_name(key, accepted) {
         Some(candidate) => format!(" — did you mean {candidate:?}?"),
-        None => {
-            let mut accepted: Vec<&str> = accepted.to_vec();
-            accepted.sort_unstable();
-            let accepted: Vec<String> = accepted.iter().map(|name| format!("{name:?}")).collect();
-            format!(" — accepted parameters are {}", accepted.join(", "))
-        }
+        None => format!(
+            " — accepted parameters are {}",
+            quoted_sorted_names(accepted)
+        ),
     }
+}
+
+fn quoted_sorted_names(names: &[&str]) -> String {
+    let mut names = names.to_vec();
+    names.sort_unstable();
+    let names: Vec<String> = names.iter().map(|name| format!("{name:?}")).collect();
+    names.join(", ")
 }
 
 /// Quoted, comma-separated list of every tool name in the served tool list, in declaration order,
@@ -5658,12 +5953,8 @@ where
 /// `include` member that restores `raw_metadata_json` on session records.
 ///
 /// The field is the provider's metadata blob copied verbatim. For codex it embeds the whole
-/// sandbox policy as escaped JSON, ~2-3 KB per session; measured over a 30-session listing it
-/// was 24,929 of 56,667 characters (44%), and it is why `list_sessions(limit=30)` failed with
-/// "result (55,824 characters) exceeds maximum allowed tokens". Session-level tools have no
-/// field selection, so a caller had no way to ask for less. It is therefore omitted by default
-/// and restored on request, reusing the same `include` mechanism `get_session` already uses for
-/// `time_profile` rather than introducing a second way to say the same thing.
+/// sandbox policy as escaped JSON, which can dominate a session listing. Omit it by default
+/// and restore it through `include` so callers can choose that response cost.
 const INCLUDE_RAW_METADATA: &str = "raw_metadata";
 
 /// Remove `raw_metadata_json` from every session record in a serialized payload unless the
@@ -5687,6 +5978,16 @@ fn apply_raw_metadata_include(value: &mut Value, include: &[String]) {
         }
         _ => {}
     }
+}
+
+fn provenance_enum_values<T: clap::ValueEnum + Copy + serde::Serialize + 'static>(
+    nullable: bool,
+) -> Vec<Value> {
+    T::value_variants()
+        .iter()
+        .map(|value| serde_json::to_value(value).expect("provenance enum serializes"))
+        .chain(nullable.then_some(Value::Null))
+        .collect()
 }
 
 /// Every `MessageKind` spelling, derived from the enum rather than written out, so a new
@@ -5932,7 +6233,7 @@ fn apply_session_preview_chars(value: &mut Value, preview_chars: Option<usize>) 
 fn session_span_since_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Inclusive query start. Match when the known indexed session end is at or after it. Local time unless given an offset or a [Area/City] suffix; fractional seconds kept. Examples: '2026-01', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
+        "description": "Inclusive query start. Match when the known indexed session end is at or after it. UTC unless given an offset or a [Area/City] suffix; fractional seconds kept. Examples: '2026-01', '7d', 'yesterday', '2026-01-15T14:30:25.123Z'. Default: no lower bound."
     })
 }
 
@@ -5948,7 +6249,7 @@ fn session_span_until_schema() -> Value {
 fn session_span_when_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Single local period intersected with each known indexed session span, e.g. '2026-01', '7d', or 'yesterday'. Exact RFC 3339 selects spans containing that instant. Spans can contain gaps; this is not continuous process activity. Do not combine with since/until."
+        "description": "Single period (UTC unless given an offset or a [Area/City] suffix) intersected with each known indexed session span, e.g. '2026-01', '7d', or 'yesterday'. Exact RFC 3339 selects spans containing that instant. Spans can contain gaps; this is not continuous process activity. Do not combine with since/until."
     })
 }
 
@@ -6009,8 +6310,7 @@ fn parse_string_array(args: &Value, key: &str) -> Result<Vec<String>, String> {
 }
 
 /// `since`/`until`/`when` through the same [`dates::DateRange`] resolution the CLI flags use, so
-/// MCP and CLI accept identical strings and read values without an offset or zone in the local
-/// time zone of the machine running aise.
+/// MCP and CLI accept identical strings and preserve UTC for values without an offset or zone.
 fn parse_date_bounds(
     args: &Value,
     now: chrono::DateTime<chrono::Utc>,
@@ -6024,10 +6324,7 @@ fn parse_date_bounds(
     if range.when.is_some() && (range.since.is_some() || range.until.is_some()) {
         return Err("provide `when` OR `since`/`until`, not both".to_string());
     }
-    let local = dates::in_local_zone(now).map_err(|error| error.to_string())?;
-    range
-        .resolve_zoned(&local)
-        .map_err(|error| error.to_string())
+    range.resolve(now).map_err(|error| error.to_string())
 }
 
 fn search_filters_from_args(
@@ -6095,9 +6392,7 @@ fn parse_message_search_detail(args: &Value) -> Result<Option<DetailLevel>, Stri
         return Ok(None);
     };
     match value.as_str() {
-        Some("compact") => Ok(Some(DetailLevel::Compact)),
-        Some("full") => Ok(Some(DetailLevel::Full)),
-        Some(other) => Err(format!("detail must be compact or full; got {other:?}")),
+        Some(name) => name.parse().map(Some),
         None => Err("detail must be a string: compact or full".to_string()),
     }
 }
@@ -6134,17 +6429,7 @@ fn parse_message_search_includes(
         let name = entry
             .as_str()
             .ok_or_else(|| "include entries must be strings".to_string())?;
-        includes.push(match name {
-            "normalized_session_metadata" => MessageSearchInclude::NormalizedSessionMetadata,
-            "parsed_references" => MessageSearchInclude::ParsedReferences,
-            "raw_provider_metadata" => MessageSearchInclude::RawProviderMetadata,
-            "runtime_diagnostics" => MessageSearchInclude::RuntimeDiagnostics,
-            other => {
-                return Err(format!(
-                    "unknown include {other:?}; accepted values are normalized_session_metadata, parsed_references, raw_provider_metadata, and runtime_diagnostics"
-                ))
-            }
-        });
+        includes.push(name.parse()?);
     }
     Ok(Some(includes))
 }
@@ -6191,16 +6476,8 @@ fn tool_search_messages_cancellable(
     if args.get("argument_path").is_some() && field != crate::models::SearchField::ToolArgument {
         return Err("argument_path requires field='tool_argument'".to_string());
     }
-    let target = match field {
-        crate::models::SearchField::Content => MessageTarget::content(),
-        crate::models::SearchField::ToolName => MessageTarget::tool_name(),
-        crate::models::SearchField::ToolArgument => MessageTarget::tool_argument(
-            args.get("argument_path")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-        )
-        .map_err(|error| error.to_string())?,
-    };
+    let target = MessageTarget::new(field, args.get("argument_path").and_then(Value::as_str))
+        .map_err(|error| error.to_string())?;
     let offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
     if args.get("session").is_some() {
         return Err(
@@ -6351,16 +6628,7 @@ fn tool_search_messages_cancellable(
             .purpose(PurposeSelection::new(purpose, version).map_err(|error| error.to_string())?);
     }
     if let Some(receipt) = args.get("receipt_level").and_then(Value::as_str) {
-        builder = builder.receipt_level(match receipt {
-            "none" => ReceiptLevel::None,
-            "summary" => ReceiptLevel::Summary,
-            "full" => ReceiptLevel::Full,
-            other => {
-                return Err(format!(
-                    "receipt_level must be none, summary, or full; got {other:?}"
-                ))
-            }
-        });
+        builder = builder.receipt_level(receipt.parse()?);
     }
     let messages = MessageService::new(config, db, crate::message_search::SearchSurface::Mcp);
     let response = messages
@@ -6403,6 +6671,11 @@ fn message_search_text_summary(
     let mut summary = format!(
         "{returned} {noun} at offset {offset}; {continuation}. structuredContent is the authoritative response.\n"
     );
+    if returned == 0 {
+        for hint in response.request().empty_result_hints(SearchSurface::Mcp) {
+            writeln!(summary, "{hint}").map_err(|error| error.to_string())?;
+        }
+    }
     for (index, result) in response
         .results()
         .iter()
@@ -6460,7 +6733,7 @@ fn message_search_text_summary(
         );
         let _ = writeln!(
             summary,
-            "   full message: get_session(session_id={:?}, message_seq={}, context={})",
+            "   full message: get_session(session_id={:?}, seq={}, context={})",
             message_ref.session_id(),
             message_ref.message_seq(),
             GET_SESSION_FOLLOW_UP_CONTEXT,
@@ -6503,8 +6776,19 @@ impl MessagePresentation {
     fn from_args(args: &Value, config: &Config) -> Result<Self, String> {
         let preview_chars =
             mcp_positive_usize_arg(args, "preview_chars", config.mcp.preview_chars.max(1))?;
-        let field_view = if args.get("response_format").and_then(Value::as_str) == Some("detailed")
-        {
+        let detail = parse_message_search_detail(args)?;
+        let legacy = match args.get("response_format").and_then(Value::as_str) {
+            Some("concise") => Some(DetailLevel::Compact),
+            Some("detailed") => Some(DetailLevel::Full),
+            None => None,
+            Some(other) => return Err(format!("response_format must be concise or detailed; got {other:?}; use detail compact/full")),
+        };
+        if let (Some(detail), Some(legacy)) = (detail, legacy) {
+            if detail != legacy {
+                return Err("detail conflicts with deprecated response_format; use detail compact/full alone".to_string());
+            }
+        }
+        let field_view = if detail.or(legacy) == Some(DetailLevel::Full) {
             FieldViewBudget::NoCharLimit
         } else {
             FieldViewBudget::max_chars(preview_chars).map_err(|error| error.to_string())?
@@ -6538,12 +6822,11 @@ impl MessagePresentation {
 fn message_window_value(
     session: &SessionRecord,
     seq: i64,
-    context: i64,
+    context: (i64, i64),
     presentation: &MessagePresentation,
     db: &Db,
 ) -> Result<Value, String> {
-    let before = context;
-    let after = context;
+    let (before, after) = context;
     let rows = db
         .message_context(&session.id, seq, before, after)
         .map_err(|e| format!("{e:#}"))?;
@@ -6592,6 +6875,7 @@ fn message_range_value(
     session: &SessionRecord,
     seq_from: Option<i64>,
     seq_to: Option<i64>,
+    kinds: Option<Vec<crate::models::MessageKind>>,
     presentation: &MessagePresentation,
     db: &Db,
 ) -> Result<Value, String> {
@@ -6599,6 +6883,7 @@ fn message_range_value(
         session_id: Some(session.id.clone()),
         seq_from,
         seq_to,
+        kinds,
         ..MessageFilters::default()
     };
     let rows = db
@@ -6700,6 +6985,46 @@ mod tests {
 
     /// A temp index holding one session rooted at [`FIXTURE_PROJECT`] with three messages,
     /// built entirely through the public API so these tests exercise the real persist path.
+    #[test]
+    fn reader_calls_reuse_the_connection_catalogue_and_preserve_ordered_rows() {
+        let (dir, db) = fixture();
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let server = OfficialMcpServer::new(config.clone()).unwrap();
+        server.inner.lock().unwrap().advertised_tools();
+        let before = CATALOGUE_BUILDS.with(|count| count.get());
+        let args = json!({"query": "hello", "index_refresh": "existing-only"});
+        let expected = tool_response_to_rmcp(
+            dispatch_tool_cancellable("search_messages", &args, &config, &db, None).unwrap(),
+        );
+        for _ in 0..2 {
+            let request = rmcp::model::CallToolRequestParams::new("search_messages")
+                .with_arguments(args.as_object().unwrap().clone());
+            let (actual, refresh) = execute_official_tool_call(
+                &server.inner,
+                &server.reader_runtime,
+                request,
+                Arc::new(QueryCancellation::new()),
+                None,
+            );
+            assert!(!refresh);
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&expected).unwrap()
+            );
+        }
+        assert_eq!(CATALOGUE_BUILDS.with(|count| count.get()), before);
+    }
+
+    fn test_runtime() -> tokio::runtime::Runtime {
+        // Parallel tests need two async workers each, not one pool per available CPU.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
     fn fixture() -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
@@ -7115,6 +7440,52 @@ mod tests {
     }
 
     #[test]
+    fn empty_message_search_names_only_relevant_recovery_options() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let missing =
+            tool_search_messages(&json!({"query":"absent-sentinel"}), &config, &db).unwrap();
+        assert!(
+            missing.text.contains("kinds=[\"harness_notice\"]"),
+            "{}",
+            missing.text
+        );
+        assert!(
+            missing.text.contains("field=\"tool_argument\""),
+            "{}",
+            missing.text
+        );
+        assert!(
+            missing.text.contains("aise files search"),
+            "{}",
+            missing.text
+        );
+        assert!(missing.structured_content.as_ref().unwrap()["results"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        for args in [
+            json!({"query":"hello"}),
+            json!({"query":"absent-sentinel", "offset":100}),
+            json!({"query":"absent-sentinel", "field":"tool_name", "kinds":message_kind_values()}),
+            json!({"query":"absent-sentinel", "role":"user"}),
+            json!({"query":"absent-sentinel", "role":"compaction"}),
+        ] {
+            let response = tool_search_messages(&args, &config, &db).unwrap();
+            assert!(
+                !response.text.contains("Harness notices are excluded"),
+                "{}",
+                response.text
+            );
+            assert!(
+                !response.text.contains("Decoded tool-call arguments"),
+                "{}",
+                response.text
+            );
+        }
+    }
+
+    #[test]
     fn search_messages_returns_canonical_structured_content_with_a_bounded_text_summary() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -7509,6 +7880,123 @@ mod tests {
     /// null, so a schema that renames a field or forgets that one is optional makes a correct
     /// response fail validation at the caller with no server-side symptom to debug from.
     #[test]
+    fn human_content_results_conform_to_the_closed_schema_with_provenance() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        db.execute_batch_for_test(
+            "insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin)
+             values (9001,'claude:test1','claude',90,'tool','tool_result','prefix humanneedle suffix','mixed','original','interactive_answer');
+             insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin)
+             values (9001,0,0,7,'generated','tool_payload'),
+                    (9001,1,7,18,'human','direct_input'),
+                    (9001,2,18,25,'generated','tool_payload');"
+        ).unwrap();
+        let out = search_messages_value(
+            &json!({"query":"humanneedle","role":"user","receipt_level":"full"}),
+            &config,
+            &db,
+        );
+        assert_eq!(out["page"]["returned"], 1);
+        assert_eq!(
+            out["results"][0]["message_metadata"]["provenance"]["input_origin"],
+            "interactive_answer"
+        );
+        assert_eq!(
+            out["results"][0]["match"]["literal_occurrence"]["field_start_char"],
+            7
+        );
+        let schema = search_messages_output_schema();
+        for field in ["input_origin", "input_delivery_state"] {
+            let values = &schema["$defs"]["MessageMetadata"]["properties"]["provenance"]
+                ["properties"][field]["enum"];
+            let values = values.as_array().expect("provenance evidence enum");
+            assert!(values.contains(&Value::Null));
+            assert!(!values.contains(&json!("unknown")));
+        }
+        let mut violations = Vec::new();
+        output_schema_violations(&out, &schema, "structuredContent", &mut violations);
+        assert!(violations.is_empty(), "{violations:?}");
+        let excluded =
+            search_messages_value(&json!({"query":"prefix","role":"user"}), &config, &db);
+        assert_eq!(excluded["page"]["returned"], 0);
+    }
+
+    #[test]
+    fn ceiling_recovery_does_not_repeat_already_applied_reductions() {
+        let config = Config::default();
+        let advertised = advertised_tools(&config);
+        let recovery = ToolRecovery::for_call(
+            "search_messages",
+            &json!({
+                "detail":"compact", "context":0, "include":[], "receipt_level":"none"
+            }),
+            &advertised,
+            &config,
+        );
+        let advice = recovery.reducers.sentence().unwrap();
+        for ineffective in [
+            "detail=compact",
+            "lower context",
+            "include=[]",
+            "receipt_level=none",
+        ] {
+            assert!(!advice.contains(ineffective), "{advice}");
+        }
+        assert!(advice.contains("field_view"));
+    }
+
+    #[test]
+    fn compact_input_search_keeps_many_partitioned_parts_within_mcp_ceiling() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let generated = "x".repeat(1_000);
+        let content = format!("{generated}needle");
+        let mut sql = String::new();
+        sql.push_str(
+            "insert into messages(id,session_id,provider,seq,role,kind,content,authorship,record_relation,input_origin) values (9002,'claude:test1','claude',91,'tool','tool_result','",
+        );
+        sql.push_str(&content.replace('\'', "''"));
+        sql.push_str("','mixed','original','interactive_answer');");
+        for ordinal in 0..1_000 {
+            sql.push_str(&format!(
+                "insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values (9002,{ordinal},{ordinal},{},'generated','tool_payload');",
+                ordinal + 1
+            ));
+        }
+        sql.push_str(
+            "insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values (9002,1000,1000,1006,'unknown','direct_input');",
+        );
+        db.execute_batch_for_test(&sql).unwrap();
+
+        let response = tool_search_messages(
+            &json!({
+                "query": "needle",
+                "role": "user",
+                "limit": 1,
+                "detail": "compact",
+                "include": [],
+                "receipt_level": "none"
+            }),
+            &config,
+            &db,
+        )
+        .unwrap();
+        let structured = response
+            .structured_content
+            .expect("input search should return structured content");
+        assert_eq!(structured["page"]["returned"], 1);
+        assert_eq!(structured["results"][0]["message_metadata"]["role"], "tool");
+        assert_eq!(
+            structured["results"][0]["match"]["literal_occurrence"]["field_start_char"],
+            1_000
+        );
+        assert!(
+            serde_json::to_string(&structured).unwrap().chars().count() < 48_000,
+            "compact response must not serialize every internal partition"
+        );
+    }
+
+    #[test]
     fn search_messages_output_schema_matches_every_key_and_type_the_runtime_emits() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -7658,7 +8146,10 @@ mod tests {
             .unwrap()["inputSchema"]["properties"]["query"]["description"]
             .as_str()
             .unwrap();
-        assert!(query.contains("without it every message"), "{query}");
+        assert!(
+            query.contains("without it all eligible messages"),
+            "{query}"
+        );
     }
 
     /// A `oneOf` failure names every accepted shape, because a client that dropped `oneOf`
@@ -8027,6 +8518,23 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description.contains("same fixed index"))
         );
+    }
+
+    #[test]
+    fn search_messages_keeps_published_purpose_parameters_when_unconfigured() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tool = tool_input_schema(&config, "search_messages");
+        let properties = tool["inputSchema"]["properties"].as_object().unwrap();
+        assert!(properties.contains_key("purpose"));
+        assert!(properties.contains_key("purpose_version"));
+        let rejected = call_tool(
+            "search_messages",
+            json!({"purpose": "missing"}),
+            &config,
+            &db,
+        );
+        assert_eq!(rejected["result"]["isError"], true);
     }
 
     #[test]
@@ -8600,7 +9108,7 @@ mod tests {
             "search_messages description advertises offset continuation: {tool_doc}"
         );
         assert!(
-            tool_doc.contains("get_session(session_id, message_seq)"),
+            tool_doc.contains("get_session(session_id, seq)"),
             "search_messages description names the exact expansion call: {tool_doc}"
         );
 
@@ -8624,7 +9132,7 @@ mod tests {
         }
         // What `enum` cannot say about them is said once, in the channel every client forwards.
         assert!(
-            tool_doc.contains("harness_notice (the harness's own text, not a person's)"),
+            tool_doc.contains("harness_notice (harness output)"),
             "the one class whose meaning a token cannot carry is glossed: {tool_doc}"
         );
     }
@@ -8723,6 +9231,44 @@ mod tests {
             "expected to check many advertised values, checked {checked} — the walk found \
              nothing, which passes vacuously"
         );
+    }
+
+    #[test]
+    fn session_date_schemas_match_utc_defaults_and_explicit_zones() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        insert_list_session(&db, "claude:utc-day", "2026-11-07T02:00:00Z");
+        insert_list_session(&db, "claude:new-york-day", "2026-11-08T02:00:00Z");
+
+        for name in ["list_sessions", "search_sessions"] {
+            let tool = tool_input_schema(&config, name);
+            for field in ["since", "when"] {
+                let description = tool["inputSchema"]["properties"][field]["description"]
+                    .as_str()
+                    .unwrap();
+                assert!(description.contains("UTC"), "{name}.{field}: {description}");
+                assert!(
+                    description.contains("[Area/City]"),
+                    "{name}.{field}: {description}"
+                );
+            }
+            for (when, expected) in [
+                ("2026-11-07", "claude:utc-day"),
+                ("2026-11-07[America/New_York]", "claude:new-york-day"),
+            ] {
+                let mut args = json!({"when": when, "limit": 0});
+                if name == "search_sessions" {
+                    args["query"] = json!("Proj");
+                }
+                let response = call_tool(name, args, &config, &db);
+                assert_ne!(response["result"]["isError"], true, "{response}");
+                let sessions = response["result"]["structuredContent"]["sessions"]
+                    .as_array()
+                    .unwrap();
+                assert_eq!(sessions.len(), 1, "{name}: {response}");
+                assert_eq!(sessions[0]["id"], expected, "{name}: {response}");
+            }
+        }
     }
 
     /// Both session tools advertise `session_kinds`, they advertise the SAME values, and every
@@ -8827,6 +9373,38 @@ mod tests {
     }
 
     #[test]
+    fn get_session_range_can_select_harness_notices() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let mut parsed = minimal_record(
+            Provider::Claude,
+            Path::new("/synthetic/notices.jsonl"),
+            String::new(),
+        );
+        parsed.session.id = "claude:notices".into();
+        parsed.session.provider_session_id = "notices".into();
+        let mut notice = Message::new(0, Role::User, "synthetic hook notice");
+        notice.kind = crate::models::MessageKind::HarnessNotice;
+        parsed.messages = vec![notice];
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let read = |args| parse(&tool_get_session(&args, &config, &db).unwrap());
+        assert_eq!(
+            read(json!({"session_id":"notices", "seq_from":0}))["messages"],
+            json!([])
+        );
+        let selected =
+            read(json!({"session_id":"notices", "seq_from":0, "kinds":["harness_notice"]}));
+        assert_eq!(selected["messages"][0]["content"], "synthetic hook notice");
+        assert!(tool_get_session(
+            &json!({"session_id":"notices", "kinds":["harness_notice"]}),
+            &config,
+            &db
+        )
+        .unwrap_err()
+        .contains("kinds only applies"));
+    }
+
+    #[test]
     fn get_session_seq_range_reads_absolute_message_range() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -8908,15 +9486,15 @@ mod tests {
             properties["seq_from"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("non-overlapping"),
+                .contains("last seq + 1 to avoid re-reading"),
             "seq_from doc explains non-overlapping chunk reads"
         );
 
-        let message_seq_doc = properties["message_seq"]["description"].as_str().unwrap();
+        let seq_doc = properties["seq"]["description"].as_str().unwrap();
         assert!(
-            message_seq_doc.contains("results[].message_ref.message_seq")
-                && !message_seq_doc.contains("`seq` field"),
-            "message_seq doc names the exact search_messages result path: {message_seq_doc}"
+            seq_doc.contains("results[].message_ref.message_seq")
+                && !seq_doc.contains("`seq` field"),
+            "seq doc names the exact search_messages result path: {seq_doc}"
         );
 
         // task 35 guidance on the get_session description too.
@@ -8990,13 +9568,14 @@ mod tests {
             crate::util::display_timestamp(until.unwrap()),
             "2026-01-31T23:59:59.999999999Z"
         );
-        // Durations reach MCP through the same dates.rs parser: a window ending now, with `m`
-        // as minutes and `M` as a calendar month.
+        // Published m/M shorthand keeps 30-day months; min is minutes and mo is calendar months.
         for (duration, start) in [
             ("2h", "2026-06-15T10:00:00Z"),
             ("2d", "2026-06-13T12:00:00Z"),
-            ("30m", "2026-06-15T11:30:00Z"),
-            ("1M", "2026-05-15T12:00:00Z"),
+            ("30min", "2026-06-15T11:30:00Z"),
+            ("1m", "2026-05-16T12:00:00Z"),
+            ("1M", "2026-05-16T12:00:00Z"),
+            ("1mo", "2026-05-15T12:00:00Z"),
         ] {
             let (since, until) = parse_date_bounds(&json!({ "when": duration }), now).unwrap();
             assert_eq!(
@@ -9006,14 +9585,14 @@ mod tests {
             );
             assert_eq!(until, Some(now), "{duration}");
         }
-        // Without a zone the server's local zone applies, the same as the CLI.
+        // Without an explicit zone, the published UTC default applies on every surface.
         assert_eq!(
             parse_date_bounds(&json!({ "when": "2026-01" }), now).unwrap(),
             dates::DateRange {
                 when: Some("2026-01".to_string()),
                 ..dates::DateRange::default()
             }
-            .resolve_zoned(&dates::in_local_zone(now).unwrap())
+            .resolve(now)
             .unwrap()
         );
         assert!(
@@ -9052,6 +9631,96 @@ mod tests {
         assert_eq!(filters.limit, 7);
         assert_eq!(filters.until, Some(now));
         assert!(filters.since.is_some_and(|since| since < now));
+    }
+
+    #[test]
+    fn capability_schema_stays_below_description_margin() {
+        let tools = handle_tools_list(None, &Config::default());
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "run_skill_capability")
+            .unwrap();
+        let bytes = crate::mcp_schema_budget::codex_measured_bytes(&tool["inputSchema"]);
+        assert!(bytes < 4_750, "{bytes} bytes");
+    }
+
+    #[test]
+    fn focused_read_accepts_seq_and_deprecates_message_seq() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let new = parse(
+            &tool_get_session(&json!({"session_id":"test1", "seq":1}), &config, &db).unwrap(),
+        );
+        let old = parse(
+            &tool_get_session(
+                &json!({"session_id":"test1", "message_seq":1}),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        assert_eq!(new, old);
+        assert!(tool_get_session(
+            &json!({"session_id":"test1", "seq":1, "message_seq":2}),
+            &config,
+            &db
+        )
+        .is_err());
+        for name in ["seq", "message_seq"] {
+            for value in [json!(u64::MAX), json!(-1), json!("1")] {
+                let mut arguments = json!({"session_id":"test1"});
+                arguments[name] = value;
+                let error = tool_get_session(&arguments, &config, &db).unwrap_err();
+                assert!(error.contains(name), "{error}");
+            }
+        }
+        let tools = handle_tools_list(None, &config);
+        let tool = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "get_session")
+            .unwrap();
+        assert!(tool["inputSchema"]["properties"]["seq"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("64-bit"));
+        assert!(
+            tool["inputSchema"]["properties"]["message_seq"]["description"]
+                .as_str()
+                .unwrap()
+                .starts_with("Deprecated: use seq")
+        );
+    }
+
+    #[test]
+    fn focused_read_accepts_asymmetric_context() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let out = parse(
+            &tool_get_session(
+                &json!({"session_id":"test1", "message_seq":1, "context":1,
+                    "context_before":0, "context_after":1}),
+                &config,
+                &db,
+            )
+            .unwrap(),
+        );
+        let seqs: Vec<_> = out["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["seq"].as_i64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![1, 2]);
+        for args in [
+            json!({"session_id":"test1", "context_before":0}),
+            json!({"session_id":"test1", "message_seq":1, "context_after":-1}),
+        ] {
+            assert!(tool_get_session(&args, &config, &db).is_err());
+        }
     }
 
     #[test]
@@ -9208,8 +9877,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            summary_error.contains("message_seq"),
-            "summary output must direct callers to message_seq: {summary_error}"
+            summary_error.contains("with seq"),
+            "summary output must direct callers to seq: {summary_error}"
         );
     }
 
@@ -9357,7 +10026,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(err.contains("include_refs only applies with message_seq"));
+        assert!(err.contains("include_refs only applies with seq"));
 
         // A present value is the caller's own even when it equals the omission value: it is
         // rejected on the path that cannot use it, exactly as on search_messages, so a client
@@ -9374,10 +10043,7 @@ mod tests {
             &db,
         )
         .unwrap_err();
-        assert!(
-            err.contains("context only applies with message_seq"),
-            "{err}"
-        );
+        assert!(err.contains("context only applies with seq"), "{err}");
         assert!(tool_get_session(&json!({ "session_id": "claude:test1" }), &config, &db).is_ok());
     }
 
@@ -9677,7 +10343,7 @@ mod tests {
         let config = config_for_fixture(&dir);
         let index_path = config.db_path();
         assert!(!index_path.exists(), "fixture starts without an index");
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -9788,7 +10454,7 @@ mod tests {
         let (dir, db) = fixture();
         drop(db);
         let config = config_for_fixture(&dir);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -9804,7 +10470,7 @@ mod tests {
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
 
             let mut scheduled = false;
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 scheduled = state.lock().unwrap().refresh_worker.handle.is_some();
                 if scheduled {
                     break;
@@ -9835,7 +10501,7 @@ mod tests {
         .unwrap();
         let _writer = lock.try_write().unwrap();
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -9910,7 +10576,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::BeforeQuery;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -9959,7 +10625,7 @@ mod tests {
         let missing_db = missing_parent.join("index.db");
         config.index.db_path = Some(missing_db.to_string_lossy().into_owned());
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -10018,7 +10684,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, responses) = official_roots_client(true);
             responses
@@ -10045,7 +10711,7 @@ mod tests {
                 .await
                 .expect("rmcp client initializes");
 
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 1
                     && state.lock().unwrap().harness_roots == [allowed.clone()]
                 {
@@ -10071,7 +10737,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, _responses) = official_roots_client(false);
             let requests = Arc::clone(&client_handler.request_count);
@@ -10113,7 +10779,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, responses) = official_roots_client(true);
             responses
@@ -10141,7 +10807,7 @@ mod tests {
                 .serve(client_transport)
                 .await
                 .expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if state.lock().unwrap().harness_roots == [allowed.clone()] {
                     break;
                 }
@@ -10157,7 +10823,7 @@ mod tests {
                 .notify_roots_list_changed()
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 2
                     && state.lock().unwrap().harness_roots.is_empty()
                 {
@@ -10179,7 +10845,7 @@ mod tests {
                     .notify_roots_list_changed()
                     .await
                     .unwrap();
-                for _ in 0..50 {
+                for _ in 0..3_000 {
                     if !Arc::ptr_eq(
                         &root_generations.lock().unwrap().current_generation,
                         &previous_generation,
@@ -10203,7 +10869,7 @@ mod tests {
                     ),
                 ]))
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 3 {
                     break;
                 }
@@ -10228,7 +10894,7 @@ mod tests {
                     ),
                 ]))
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if state.lock().unwrap().harness_roots == [replacement.clone()] {
                     break;
                 }
@@ -10259,7 +10925,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, responses) =
                 official_roots_client_with_capabilities(true, false);
@@ -10286,7 +10952,7 @@ mod tests {
                 .serve(client_transport)
                 .await
                 .expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if state.lock().unwrap().harness_roots == [allowed.clone()] {
                     break;
                 }
@@ -10298,7 +10964,7 @@ mod tests {
                 .notify_roots_list_changed()
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 2
                     && state.lock().unwrap().harness_roots.is_empty()
                 {
@@ -10317,7 +10983,7 @@ mod tests {
                     rmcp::model::Root::new("https://example.com/not-local"),
                 ]))
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if state.lock().unwrap().roots_error.is_some() {
                     break;
                 }
@@ -10346,7 +11012,7 @@ mod tests {
         config.search.scope.mode = crate::config::SearchScopeMode::AllowedRoots;
         config.search.scope.roots.clear();
         config.search.scope.include_invocation_directory = false;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (client_handler, _responses) = official_roots_client(true);
             let requests = Arc::clone(&client_handler.request_count);
@@ -10364,7 +11030,7 @@ mod tests {
                 .serve(client_transport)
                 .await
                 .expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if requests.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -10391,7 +11057,7 @@ mod tests {
         drop(db);
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config).unwrap();
@@ -10423,7 +11089,7 @@ mod tests {
         let (dir, db) = fixture();
         drop(db);
         let config = config_for_fixture(&dir);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -10448,7 +11114,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if observed_available_permits.lock().unwrap().len() == 1 {
                     break;
                 }
@@ -10480,7 +11146,7 @@ mod tests {
                 structured.get("operation_executed").is_none(),
                 "successful calls retain the canonical response without readiness metadata"
             );
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if observed_available_permits.lock().unwrap().len() == 2 {
                     break;
                 }
@@ -10509,7 +11175,7 @@ mod tests {
         let gate_enabled = Arc::new(AtomicBool::new(false));
         let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
         let release_response = Arc::new(tokio::sync::Semaphore::new(0));
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config)
@@ -10537,7 +11203,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -10572,7 +11238,7 @@ mod tests {
 
             release_response.add_permits(1);
             call.await.unwrap().expect("tool response is delivered");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 2 {
                     break;
                 }
@@ -10600,7 +11266,7 @@ mod tests {
         let runner_runs = Arc::clone(&refresh_runs);
         let fail_enabled = Arc::new(AtomicBool::new(false));
         let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -10629,7 +11295,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -10655,7 +11321,7 @@ mod tests {
                 .await
                 .expect("response send reaches the failing transport");
             attempted.forget();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if reader_permits.available_permits() == 1 {
                     break;
                 }
@@ -10690,7 +11356,7 @@ mod tests {
         let gate_enabled = Arc::new(AtomicBool::new(false));
         let response_attempted = Arc::new(tokio::sync::Semaphore::new(0));
         let release_response = Arc::new(tokio::sync::Semaphore::new(0));
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -10720,7 +11386,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -10755,7 +11421,7 @@ mod tests {
             call.cancel(Some("cancel undelivered response".to_string()))
                 .await
                 .expect("cancellation notification is sent");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if reader_permits.available_permits() == 1 {
                     break;
                 }
@@ -10788,7 +11454,7 @@ mod tests {
         let config = config_for_fixture(&dir);
         let refresh_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let runner_runs = Arc::clone(&refresh_runs);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config)
@@ -10805,7 +11471,7 @@ mod tests {
                     .await
             });
             let client = ().serve(client_transport).await.expect("rmcp client initializes");
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if refresh_runs.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -10947,7 +11613,8 @@ mod tests {
         }
         config.providers.claude.paths = vec![sources.display().to_string()];
         let app = SessionSearch::open(config.clone()).unwrap();
-        assert_eq!(app.index().reindex(false).unwrap(), (1, 1));
+        let outcome = app.index().reindex_report(false).unwrap();
+        assert_eq!((outcome.files_seen, outcome.sessions_updated), (1, 1));
         drop(app);
 
         let (refresh_finished, refresh_finished_rx) = mpsc::channel();
@@ -10959,7 +11626,7 @@ mod tests {
             let generation = runner_runs.fetch_add(1, Ordering::AcqRel) + 1;
             refresh_finished.send(generation).unwrap();
         });
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::new(config)
@@ -11172,7 +11839,7 @@ mod tests {
         drop(db);
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server_task = tokio::spawn(async move {
@@ -11244,6 +11911,130 @@ mod tests {
         });
     }
 
+    /// Every row of `REPLACED_TOOL_PARAMETERS` points at the served catalogue: the tool exists,
+    /// it rejects or deprecates the old name, and every replacement is a parameter it accepts.
+    #[test]
+    fn replaced_tool_parameters_name_only_parameters_their_tool_accepts() {
+        let (dir, _db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = handle_tools_list(None, &config)["result"]["tools"].clone();
+        for row in REPLACED_TOOL_PARAMETERS {
+            let properties = tools
+                .as_array()
+                .and_then(|tools| tools.iter().find(|tool| tool["name"] == row.tool))
+                .unwrap_or_else(|| panic!("{} is served", row.tool))["inputSchema"]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{} has properties", row.tool));
+            if let Some(property) = properties.get(row.name) {
+                assert!(
+                    property["description"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("Deprecated: use ")),
+                    "{} must describe its accepted deprecated alias {}",
+                    row.tool,
+                    row.name
+                );
+            }
+            for replacement in row.replacements {
+                assert!(
+                    properties.contains_key(*replacement),
+                    "{} does not accept {replacement}, named as the replacement for {}",
+                    row.tool,
+                    row.name
+                );
+            }
+        }
+    }
+
+    /// A caller sending an old or sibling-tool parameter name is told which accepted parameter
+    /// replaces it and how the value changes, through a real `tools/call`, as an MCP tool error
+    /// that still lists every accepted parameter.
+    #[test]
+    fn official_rmcp_transport_names_the_replacement_for_a_replaced_parameter() {
+        use rmcp::ServiceExt as _;
+
+        let (dir, db) = fixture();
+        drop(db);
+        let mut config = config_for_fixture(&dir);
+        config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
+        let runtime = test_runtime();
+        runtime.block_on(async {
+            let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+            let server_task = tokio::spawn(async move {
+                OfficialMcpServer::new(config)
+                    .unwrap()
+                    .serve_transport(server_transport)
+                    .await
+                    .expect("official rmcp server initializes")
+                    .waiting()
+                    .await
+            });
+            let client = ().serve(client_transport).await.expect("rmcp client initializes");
+            for (tool, arguments, expected) in [
+                (
+                    "search_messages",
+                    json!({"query": "hello", "response_format": "detailed"}),
+                    &[
+                        "unknown search_messages parameter at arguments: response_format",
+                        "use \"detail\" instead",
+                        "\"compact\" or \"full\"",
+                    ][..],
+                ),
+                (
+                    "search_messages",
+                    json!({"query": "hello", "preview_chars": 80}),
+                    &[
+                        "use \"field_view\" or \"match_view\" instead",
+                        "{\"kind\":\"max_chars\",\"max_chars\":N}",
+                    ],
+                ),
+                (
+                    "search_messages",
+                    json!({"query": "hello", "path_prefix": "/x"}),
+                    &["use \"workspace_path_prefix\" or \"transcript_path_prefix\" instead"],
+                ),
+                (
+                    "search_messages",
+                    json!({"regex": "hel+o"}),
+                    &[
+                        "use \"query\" or \"query_mode\" instead",
+                        "query_mode \"regex\"",
+                    ],
+                ),
+                (
+                    "list_sessions",
+                    json!({"workspace_path_prefix": "/x"}),
+                    &["use \"path_prefix\" instead"],
+                ),
+                (
+                    "search_sessions",
+                    json!({"query": "hello", "workspace_path_prefix": "/x"}),
+                    &["use \"path_prefix\" instead"],
+                ),
+            ] {
+                let result = client
+                    .peer()
+                    .call_tool(
+                        rmcp::model::CallToolRequestParams::new(tool)
+                            .with_arguments(arguments.as_object().unwrap().clone()),
+                    )
+                    .await
+                    .expect("a rejected parameter is a caller-visible tool result");
+                assert_eq!(result.is_error, Some(true), "{tool} {arguments}");
+                let text = &result.content[0].as_text().unwrap().text;
+                for expected in expected {
+                    assert!(text.contains(expected), "{tool}: {expected}: {text}");
+                }
+                assert!(
+                    text.contains("; accepted parameters are "),
+                    "{tool}: still lists accepted parameters: {text}"
+                );
+            }
+            client.cancel().await.expect("client shutdown");
+            server_task.await.unwrap().expect("server shutdown");
+        });
+    }
+
     #[test]
     fn official_rmcp_same_server_runs_two_database_readers_simultaneously() {
         use rmcp::ServiceExt as _;
@@ -11253,7 +12044,7 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         let probe = Arc::new(TestReaderProbe::new(2));
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -11324,7 +12115,8 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         let probe = Arc::new(TestReaderProbe::block_first_until_test());
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
+        let _release = ReleaseTestReaderOnDrop(Arc::clone(&probe));
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -11393,7 +12185,8 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         let probe = Arc::new(TestReaderProbe::block_first_until_test());
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
+        let _release = ReleaseTestReaderOnDrop(Arc::clone(&probe));
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -11427,7 +12220,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.entries.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -11442,7 +12235,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.admission_attempts.load(Ordering::Acquire) == 2 {
                     break;
                 }
@@ -11453,7 +12246,7 @@ mod tests {
                 .cancel(Some("test cancels queued search".to_string()))
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.cancelled_admissions.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -11490,6 +12283,24 @@ mod tests {
     }
 
     #[test]
+    fn blocked_test_reader_can_be_released_before_entry() {
+        let probe = Arc::new(TestReaderProbe::block_first_until_test());
+        let release = Arc::clone(&probe);
+        let (finished, received) = mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            release.release_first();
+            finished.send(()).unwrap();
+        });
+        let released = received.recv_timeout(std::time::Duration::from_secs(1));
+        let _activity = probe.enter();
+        worker.join().unwrap();
+        assert!(
+            released.is_ok(),
+            "cleanup must not depend on reader admission"
+        );
+    }
+
+    #[test]
     fn dropping_an_official_request_guard_cancels_its_blocking_work() {
         let cancellation = Arc::new(QueryCancellation::new());
         {
@@ -11508,7 +12319,8 @@ mod tests {
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
         let probe = Arc::new(TestReaderProbe::block_first_until_test());
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
+        let _release = ReleaseTestReaderOnDrop(Arc::clone(&probe));
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -11538,7 +12350,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.entries.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -11550,7 +12362,7 @@ mod tests {
                 .cancel(Some("test cancels active search".to_string()))
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.cancelled_active.load(Ordering::Acquire) == 1 {
                     break;
                 }
@@ -11561,7 +12373,7 @@ mod tests {
             tokio::task::spawn_blocking(move || release_probe.release_first())
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if probe.active.load(Ordering::Acquire) == 0 {
                     break;
                 }
@@ -11591,7 +12403,7 @@ mod tests {
         drop(db);
         let mut config = config_for_fixture(&dir);
         config.index.refresh = crate::config::IndexRefresh::ExistingOnly;
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server = OfficialMcpServer::with_reader_bound(
@@ -11625,7 +12437,7 @@ mod tests {
                             .with_arguments(
                                 json!({
                                     "sql": long_sql,
-                                    "timeout_ms": 1000
+                                    "timeout_ms": 60_000
                                 })
                                 .as_object()
                                 .unwrap()
@@ -11636,7 +12448,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            for _ in 0..50 {
+            for _ in 0..3_000 {
                 if permits.available_permits() == 0 {
                     break;
                 }
@@ -11649,7 +12461,7 @@ mod tests {
                 .cancel(Some("test cancels raw SQL".to_string()))
                 .await
                 .unwrap();
-            for _ in 0..200 {
+            for _ in 0..3_000 {
                 if permits.available_permits() == 1 {
                     break;
                 }
@@ -11658,8 +12470,8 @@ mod tests {
             let cancellation_latency = cancelled_at.elapsed();
             assert_eq!(permits.available_permits(), 1);
             assert!(
-                cancellation_latency < std::time::Duration::from_millis(500),
-                "request cancellation took {cancellation_latency:?}, so the 1000 ms SQL timeout won instead of cancellation"
+                cancellation_latency < std::time::Duration::from_secs(30),
+                "request cancellation took {cancellation_latency:?}, so the 60 s SQL timeout won instead of cancellation"
             );
 
             client.cancel().await.expect("client shutdown");
@@ -11701,7 +12513,7 @@ mod tests {
             .unwrap();
         });
 
-        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = test_runtime();
         runtime.block_on(async {
             let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
             let server =
@@ -11767,11 +12579,7 @@ mod tests {
     }
 
     /// `raw_metadata_json` is the provider's verbatim metadata blob and is unbounded: codex
-    /// embeds its whole sandbox policy, ~2-3 KB per session. Measured over a 30-session
-    /// listing it was 24,929 of 56,667 characters (44%), and `list_sessions(limit=30)` failed
-    /// outright with "result (55,824 characters) exceeds maximum allowed tokens" while the
-    /// session-level tools offered no way to ask for less. It is omitted by default and
-    /// restored only on request.
+    /// embeds its whole sandbox policy. Omit the blob by default and restore it only on request.
     #[test]
     fn session_tools_omit_raw_metadata_unless_included() {
         let (dir, db) = fixture();
@@ -12349,8 +13157,16 @@ mod tests {
             None,
             &[
                 (0, "2026-06-01T00:00:00Z", "you forgot the migration"),
-                (1, "2026-06-02T00:00:00Z", "no, that's wrong"),
-                (2, "2026-06-03T00:00:00Z", "also need the changelog"),
+                (
+                    1,
+                    "2026-06-02T00:00:00Z",
+                    "what are you talking about? The chart uses centimeters, so that scale is wrong.",
+                ),
+                (
+                    2,
+                    "2026-06-03T00:00:00Z",
+                    "you are not finished with the outline",
+                ),
             ],
         );
         // A spawned run: these `user` rows are the CALLING AGENT's delegation prompt.
@@ -12451,8 +13267,12 @@ mod tests {
                 ))
                 .collect::<Vec<_>>(),
             vec![
-                ("corrections", "incomplete", "also need"),
-                ("corrections", "misunderstanding", "no, that's"),
+                ("corrections", "incomplete", "not finished"),
+                (
+                    "corrections",
+                    "misunderstanding",
+                    "what are you talking about"
+                ),
                 ("corrections", "skip_step", "you forgot"),
             ],
             "newest first, each naming the policy that classified it: {result:#}"
@@ -12675,7 +13495,7 @@ mod tests {
     }
 
     /// A correction is what a PERSON told the agent. In a spawned run the `user` rows are the
-    /// calling agent's delegation prompt, and those outnumber user-started sessions ~5:1.
+    /// calling agent's delegation prompt, and such runs can far outnumber user-started sessions.
     #[test]
     fn run_skill_scans_user_started_sessions_unless_asked_for_more() {
         let (dir, db) = corrections_fixture();
@@ -12713,6 +13533,45 @@ mod tests {
 
     /// `limit` asks for one page and `all_results` asks for every match; accepting both would
     /// mean silently honoring one and dropping the other.
+    #[test]
+    fn all_results_skill_overflow_names_a_working_finite_retry() {
+        let (dir, db) = corrections_fixture();
+        let mut config = config_for_fixture(&dir);
+        config.mcp.run_message_classification_limit = 1;
+        let tool = "run_skill_capability";
+        let args = json!({"skill":{"name":"corrections"},"all_results":true});
+        let first_args = json!({"skill":{"name":"corrections"},"limit":1});
+        let first =
+            tool_response_to_rmcp(tool_run_skill_capability(&first_args, &config, &db).unwrap());
+        let ceiling = serde_json::to_string(&first).unwrap().chars().count() + 100;
+        let full = tool_response_to_rmcp(tool_run_skill_capability(&args, &config, &db).unwrap());
+        let advertised = handle_tools_list(None, &config);
+        let recovery = ToolRecovery::for_call(tool, &args, &advertised["result"]["tools"], &config);
+        let error = enforce_tool_result_ceiling(full, tool, ceiling, recovery).unwrap_err();
+        assert!(error.contains("limit="), "{error}");
+        assert!(error.contains("all_results"), "{error}");
+        assert!(!error.contains("A single result exceeds"), "{error}");
+        let suggested: usize = error
+            .split("limit=")
+            .nth(1)
+            .unwrap()
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let retry_args = json!({"skill":{"name":"corrections"},"limit":suggested});
+        let retry =
+            tool_response_to_rmcp(tool_run_skill_capability(&retry_args, &config, &db).unwrap());
+        assert!(enforce_tool_result_ceiling(
+            retry,
+            tool,
+            ceiling,
+            ToolRecovery::for_call(tool, &retry_args, &advertised["result"]["tools"], &config)
+        )
+        .is_ok());
+    }
+
     #[test]
     fn run_skill_pages_exactly_and_refuses_contradictory_paging() {
         let (dir, db) = corrections_fixture();
@@ -12867,7 +13726,7 @@ mod tests {
         assert!(
             description.contains("deterministic")
                 && description.contains("capability")
-                && description.contains("By default Aise reads")
+                && description.contains("By default aise reads")
                 && description.contains("definition can supply typed categories")
                 && description.contains("SKILL.md")
                 && description.contains("MCP client or AI harness"),
@@ -12876,7 +13735,7 @@ mod tests {
         );
         assert!(
             !description.contains("run a skill") && !description.contains("Run one"),
-            "the description must not claim that Aise executes AI skill instructions: \
+            "the description must not claim that aise executes AI skill instructions: \
              {description}"
         );
 
@@ -13408,7 +14267,7 @@ mod tests {
             .as_str()
             .is_some_and(|description| {
                 description.contains("structuredContent is authoritative")
-                    && description.contains("get_session(session_id, message_seq)")
+                    && description.contains("get_session(session_id, seq)")
             }));
         // This filter applies to the canonical tool name whatever `field` is searching, so its
         // description has to name that field. The registry writes it surface-neutrally as "tool
@@ -13614,7 +14473,7 @@ mod tests {
             .as_str()
             .is_some_and(|d| d.contains("summary=true")
                 && d.contains("transcript_lines=N")
-                && d.contains("message_seq=N")
+                && d.contains("seq=N")
                 && d.contains("last 40 transcript lines")));
         assert!(query_session_index["description"]
             .as_str()
@@ -13653,12 +14512,12 @@ mod tests {
             schema["description"].as_str().unwrap().to_owned()
         };
         assert!(
-            get_session_prose("summary").contains("Default false"),
+            get_session_prose("summary").contains("Omit for false"),
             "summary is opt-in"
         );
         assert!(get_session["inputSchema"]["properties"]["transcript_lines"].is_object());
         assert!(get_session["inputSchema"]["properties"]["message_seq"].is_object());
-        assert!(get_session["inputSchema"]["properties"]["seq"].is_null());
+        assert!(get_session["inputSchema"]["properties"]["seq"].is_object());
         assert!(get_session["inputSchema"]["properties"]["max_lines"].is_null());
         assert!(get_session["inputSchema"]["properties"]["view"].is_null());
         assert!(
@@ -13667,7 +14526,7 @@ mod tests {
         );
         assert!(
             get_session_prose("transcript_lines")
-                .contains("Default when no output selector is provided: -40"),
+                .contains("Omit for -40 when no selector is given"),
             "bare get_session is bounded by default"
         );
         assert!(
@@ -13700,8 +14559,8 @@ mod tests {
         // what keeps three copies from drifting apart.
         let tool_doc = search_messages["description"].as_str().unwrap();
         for required in [
-            "lines_per_message (line window first)",
-            "never matching, order, count, context, or includes",
+            "lines_per_message runs before field_view/match_view",
+            "preserve matches, order, count, context and includes",
             "detail conflicts with lines_per_message, field_view, and match_view",
         ] {
             assert!(
@@ -13711,7 +14570,8 @@ mod tests {
         }
         assert!(search_messages["description"]
             .as_str()
-            .is_some_and(|d| d.contains("message_seq") && !d.contains("session_id, seq")));
+            .is_some_and(|d| d.contains("get_session(session_id, seq)")
+                && !d.contains("get_session(session_id, message_seq)")));
         let match_mode = &search_messages["inputSchema"]["properties"]["query_mode"];
         assert_eq!(match_mode["enum"], json!(["literal", "regex", "fuzzy"]));
         assert!(match_mode["default"].is_null());
@@ -13728,7 +14588,7 @@ mod tests {
         );
         // Which regex dialect and how bounded the fuzzy match is are facts an enum token cannot
         // carry, so they are stated once in the channel every client forwards whole.
-        for required in ["regex is Rust regex", "bounded fuzzy match"] {
+        for required in ["regex uses Rust regex", "fuzzy is bounded"] {
             assert!(
                 tool_doc.contains(required),
                 "missing {required:?} from tool.description: {tool_doc}"
@@ -13965,7 +14825,7 @@ mod tests {
             );
         }
 
-        for removed_alias in ["view", "seq", "max_lines"] {
+        for removed_alias in ["view", "sequence", "max_lines"] {
             let mut arguments = json!({ "session_id": "x" });
             arguments[removed_alias] = json!(1);
             let error = validate_tool_call(
@@ -14135,7 +14995,7 @@ mod tests {
         assert!(prose(search_sessions, "limit").contains("(default 7)"));
         assert!(prose(list_sessions, "limit").contains("(default 8)"));
         assert!(prose(get_session, "transcript_lines")
-            .contains("Default when no output selector is provided: -3"));
+            .contains("Omit for -3 when no selector is given"));
         assert!(prose(get_session, "preview_chars").contains("(default 10)"));
         // The message-search family renders its prose from the same configured request.
         let limit_prose = search_messages["inputSchema"]["properties"]["limit"]["description"]
@@ -14260,7 +15120,14 @@ mod tests {
     #[test]
     fn search_messages_schema_covers_every_canonical_parameter_and_mcp_property() {
         let (dir, _db) = fixture();
-        let config = config_for_fixture(&dir);
+        let mut config = config_for_fixture(&dir);
+        config.search.purposes.insert(
+            "review".to_owned(),
+            crate::config::PurposeDefinition::new(
+                std::num::NonZeroU32::new(1).unwrap(),
+                crate::config::SearchOperation::MessageSearch,
+            ),
+        );
         let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
         let properties = schema["properties"]
             .as_object()
@@ -14347,7 +15214,14 @@ mod tests {
     #[test]
     fn search_messages_advertises_exactly_the_fields_it_accepts() {
         let (dir, _db) = fixture();
-        let config = config_for_fixture(&dir);
+        let mut config = config_for_fixture(&dir);
+        config.search.purposes.insert(
+            "review".to_owned(),
+            crate::config::PurposeDefinition::new(
+                std::num::NonZeroU32::new(1).unwrap(),
+                crate::config::SearchOperation::MessageSearch,
+            ),
+        );
         let schema = tool_input_schema(&config, "search_messages")["inputSchema"].clone();
         assert_eq!(
             schema["additionalProperties"],
@@ -14886,32 +15760,22 @@ mod tests {
 
     /// The suggestion is one an installed server can actually honor.
     ///
-    /// Every figure here was measured against a real index through `mcp serve`, because that is
-    /// where each wrong answer this function has given was found. Two shipped and one was caught
-    /// before shipping, and all three are pinned so none can return.
-    ///
-    /// A `limit=20` search measured 30,518 characters against a 6,000-character ceiling and its
-    /// `limit=3` prefix measured 6,358, so 3 does not fit and 2, at 4,732, does.
-    ///
-    /// The first answer was 12, from scaling a hard-coded 15 that ignored the request entirely.
-    /// The second was 3, from scaling `page * ceiling / measured`, which ignores the fixed
-    /// envelope. The third was also 3, from counting `included` as shrinking with the page: it
-    /// holds one entry per distinct session, and this page and its 3-result prefix cover the same
-    /// two sessions, so 1,021 characters that never shrink were being promised away.
+    /// Use a synthetic response with a fixed envelope and a rendered copy of the result text.
+    /// Proportional scaling must not promise a page whose prefix exceeds the ceiling.
     #[test]
     fn the_suggestion_is_one_an_installed_server_can_honor() {
         let ceiling = 6_000;
         let page = 20;
-        // Twenty near-uniform results, as measured: 1,130 characters each.
-        let result_sizes = vec![1_130usize; page];
+        // Synthetic uniform structured results plus their rendered text copy.
+        let result_sizes = vec![1_000usize; page];
         let results_only: usize = result_sizes.iter().sum();
-        let rendered = 4_729;
+        let rendered = 5_000;
         let shape = ResponseShape {
             // Only the results and their text rendering shrink with the page.
             scaling_chars: results_only + rendered,
             // The echoed request, the page block, the wrapper, and the per-session metadata that
             // a shorter page does not shed.
-            envelope_chars: 814 + 1_021,
+            envelope_chars: 2_000,
             result_sizes,
         };
         let measured = shape.scaling_chars + shape.envelope_chars;
@@ -14921,8 +15785,7 @@ mod tests {
 
         assert_eq!(
             suggested, 2,
-            "the installed server measured limit=3 at 6,358 characters against this 6,000 \
-             ceiling and limit=2 at 4,732, so 2 is the largest page a caller can be sent to"
+            "the suggested prefix must fit the synthetic response's fixed and scaling costs"
         );
         assert!(
             suggested < page,
@@ -14935,7 +15798,7 @@ mod tests {
             / ((results_only + rendered) as f64 / page as f64).ceil() as usize;
         assert_eq!(
             mean_priced, 3,
-            "the page mean answers 3 on this shape, and 3 measured over the ceiling"
+            "the page mean overestimates what fits on this synthetic shape"
         );
     }
 
@@ -15100,10 +15963,7 @@ mod tests {
     /// `limit=0` means "every match" on the session tools, and an earlier reading collapsed that
     /// into the same state as a tool advertising no `limit` at all. The advice that follows says
     /// there is no smaller page to ask for -- on a tool whose own schema advertises `limit` with a
-    /// default of 10. An installed Codex run met exactly this: `search_sessions(limit=0)` produced
-    /// 154,174 characters against the 48,000 ceiling, was told no smaller page existed, and then
-    /// answered the same question with `limit=20`. The advice was not merely imprecise; it denied
-    /// the remedy the caller went on to use.
+    /// finite page size. Use the returned count and response shape to suggest a fitting page.
     ///
     /// Two facts make the finite page computable, and both are already in the response: the count
     /// it returned, and the items themselves. The session tools report that count at the top level

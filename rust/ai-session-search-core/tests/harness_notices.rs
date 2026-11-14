@@ -5,9 +5,8 @@
 //!
 //! Claude Code injects records the user did not write: Stop-hook feedback, PreToolUse blocks,
 //! local-command caveats, task notifications. They were dropped at index time, which also
-//! removed the only evidence of what a hook told an agent and what it did next. Measured on
-//! real data: 82 of 82 records containing "CANNOT STOP" in one session carried `isMeta`, and
-//! search returned none of them while reporting a healthy index.
+//! removed the evidence of what a hook told an agent and what it did next. `isMeta`
+//! identifies injected feedback, which must remain searchable as harness notices.
 //!
 //! These tests pin both halves of the fix: the records exist after indexing, and they stay out
 //! of results unless asked for, so user prose and the analytics over it are unchanged.
@@ -57,10 +56,11 @@ fn count_matching(db: &Db, filters: &MessageFilters, needle: &str) -> usize {
 #[test]
 fn hook_feedback_is_indexed_rather_than_discarded() {
     let (_dir, db) = indexed_fixture();
-    let notices = MessageFilters {
-        kinds: Some(vec![MessageKind::HarnessNotice]),
-        limit: 0,
-        ..Default::default()
+    let notices = {
+        let mut value = MessageFilters::default();
+        value.kinds = Some(vec![MessageKind::HarnessNotice]);
+        value.limit = 0;
+        value
     };
     let hits = db.search_messages("CANNOT STOP", &notices).unwrap();
     assert_eq!(
@@ -79,9 +79,10 @@ fn hook_feedback_is_indexed_rather_than_discarded() {
 #[test]
 fn ordinary_search_excludes_harness_notices_but_keeps_prose() {
     let (_dir, db) = indexed_fixture();
-    let default = MessageFilters {
-        limit: 0,
-        ..Default::default()
+    let default = {
+        let mut value = MessageFilters::default();
+        value.limit = 0;
+        value
     };
     assert_eq!(
         count_matching(&db, &default, "CANNOT STOP"),
@@ -100,16 +101,18 @@ fn a_task_notification_without_the_meta_flag_is_still_a_harness_notice() {
     // These arrive as role:user with userType "external" and no isMeta, so they are matched on
     // their leading tag. Missing this case is how they previously reached user analytics.
     let (_dir, db) = indexed_fixture();
-    let notices = MessageFilters {
-        kinds: Some(vec![MessageKind::HarnessNotice]),
-        limit: 0,
-        ..Default::default()
+    let notices = {
+        let mut value = MessageFilters::default();
+        value.kinds = Some(vec![MessageKind::HarnessNotice]);
+        value.limit = 0;
+        value
     };
     assert_eq!(count_matching(&db, &notices, "agent done"), 1);
 
-    let default = MessageFilters {
-        limit: 0,
-        ..Default::default()
+    let default = {
+        let mut value = MessageFilters::default();
+        value.limit = 0;
+        value
     };
     assert_eq!(count_matching(&db, &default, "agent done"), 0);
 }
@@ -146,16 +149,18 @@ fn harness_notices_stay_out_of_correction_analytics() {
     // Through the public service, so this exercises the same path the CLI and MCP use.
     let config = ai_session_search::config::Config::default();
     let run = ai_session_search::service::AnalysisService::new(&config, &db)
-        .run_skill(&ai_session_search::SkillRunQuery {
-            skill: ai_session_search::SkillSelector::name("corrections").unwrap(),
-            definition: None,
-            input: ai_session_search::SkillCapabilityInput::MessageClassification(
+        .run_skill(&ai_session_search::SkillRunQuery::new(
+            ai_session_search::SkillSelector::name("corrections").unwrap(),
+            ai_session_search::SkillCapabilityInput::MessageClassification(
                 ai_session_search::MessageClassificationQuery::default(),
             ),
-        })
+        ))
         .unwrap();
     let ai_session_search::SkillCapabilityOutput::MessageClassification(classification) =
-        run.output;
+        run.output
+    else {
+        panic!("message-classification query returned another capability output");
+    };
     let found = classification.report.matches;
     assert!(
         found
@@ -239,3 +244,72 @@ fn unindexed_files_are_explained_by_naming_the_file_that_took_their_id() {
 // pinned directly by `models::tests::default_class_selection_excludes_rather_than_enumerates`.
 // Neither is duplicated here, and no test-only database accessor is added to the public API
 // to repeat them.
+
+#[test]
+fn antigravity_notices_upgrade_to_the_same_rows_as_a_fresh_parse() {
+    use ai_session_search::models::{Provider, Role};
+    use ai_session_search::providers::antigravity::AntigravityAdapter;
+    use ai_session_search::util::provider_parse_version;
+    use std::io::Cursor;
+
+    let dir = tempdir().unwrap();
+    let path = dir
+        .path()
+        .join("brain/example/.system_generated/logs/transcript.jsonl");
+    let source = concat!(
+        r#"{"type":"USER_INPUT","source":"USER_EXPLICIT","content":"please check the database"}"#,
+        "\n",
+        r#"{"type":"SYSTEM_MESSAGE","content":"runtime sentinel system"}"#,
+        "\n",
+        r#"{"type":"ERROR_MESSAGE","content":"runtime sentinel error"}"#,
+        "\n",
+    );
+    let adapter = AntigravityAdapter::new(vec![]);
+    let parsed = adapter.parse_reader(Cursor::new(source), &path).unwrap();
+    assert_ne!(
+        provider_parse_version(Provider::Antigravity),
+        "antigravity-v5"
+    );
+    for message in &parsed.messages[1..] {
+        assert_eq!(message.role, Role::User);
+        assert_eq!(message.kind, MessageKind::HarnessNotice);
+        assert_eq!(message.tool_name, None);
+    }
+    assert!(!parsed.transcript_text.contains("runtime sentinel"));
+    let upgraded = Db::open(&dir.path().join("upgraded.db")).unwrap();
+    let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+    let mut old = parsed.clone();
+    old.session.parse_version = "antigravity-v5".into();
+    for (message, name) in old.messages[1..]
+        .iter_mut()
+        .zip(["system_message", "error_message"])
+    {
+        message.role = Role::Tool;
+        message.kind = MessageKind::ToolResult;
+        message.tool_name = Some(name.into());
+    }
+    upgraded
+        .upsert_session(&old, 1, source.len() as i64)
+        .unwrap();
+    upgraded
+        .upsert_session(&parsed, 1, source.len() as i64)
+        .unwrap();
+    fresh
+        .upsert_session(&parsed, 1, source.len() as i64)
+        .unwrap();
+    let mut filters = MessageFilters::default();
+    assert!(fresh
+        .search_messages("runtime sentinel", &filters)
+        .unwrap()
+        .is_empty());
+    filters.kinds = Some(vec![MessageKind::HarnessNotice]);
+    let rows = |db: &Db| {
+        db.search_messages("runtime sentinel", &filters)
+            .unwrap()
+            .into_iter()
+            .map(|m| (m.seq, m.role, m.kind, m.tool_name, m.content))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&upgraded), rows(&fresh));
+    assert_eq!(rows(&fresh).len(), 2);
+}

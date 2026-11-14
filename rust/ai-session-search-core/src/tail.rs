@@ -18,7 +18,8 @@
 //! is within the overlap is still tagged correctly. The new rows are the SUFFIX of the
 //! overlap+tail parse after the rows the overlap alone produces — which, because parsing is a
 //! left-to-right per-line fold over identical leading bytes, is exactly the messages from the
-//! newly appended lines.
+//! newly appended lines. The indexer validates the exact overlap bytes against the checkpoint
+//! digest; parser context and archive row order cannot establish source-byte equality.
 
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -140,8 +141,26 @@ fn complete_prefix_offset_inner_until(
     Ok(Some(0))
 }
 
+/// Digest the exact bounded window a later tail parse will reread. O(window) I/O/time,
+/// 64 KiB temporary memory; the tail path hashes its existing buffer instead.
+pub(crate) fn overlap_digest(path: &Path, offset: i64) -> Result<String> {
+    let start = (offset - OVERLAP_BYTES).max(0);
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(start as u64))?;
+    let mut window = file.take((offset - start) as u64);
+    let digest = crate::hashing::sha256_reader(&mut window)?;
+    anyhow::ensure!(
+        window.limit() == 0,
+        "source truncated while hashing overlap"
+    );
+    Ok(digest)
+}
+
 /// New rows discovered by an incremental tail parse (to be appended by `Db::append_tail`).
+#[non_exhaustive]
 pub struct TailParse {
+    pub(crate) overlap_digest: String,
+    pub(crate) new_overlap_digest: String,
     pub new_messages: Vec<Message>,
     pub new_file_edits: Vec<FileEdit>,
     /// Session metadata re-derived over the [overlap, EOF) window. Used to advance the volatile
@@ -158,8 +177,17 @@ pub struct TailParse {
     pub new_fingerprint: String,
 }
 
+/// The boundary is relative to the parser slice, before any UTF-8 decoding.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TailContext {
+    pub new_bytes_start: usize,
+    pub prefix_truncated: bool,
+    pub pending_direct_delivery: bool,
+}
+
 pub(crate) enum TailParseRun {
     Complete(Option<Box<TailParse>>),
+    ChangedOverlap,
     Cancelled,
 }
 
@@ -169,6 +197,11 @@ pub(crate) enum TailParseRun {
 /// Returns `Ok(None)` when no new COMPLETE line has been appended yet (only a partial, still-
 /// being-written line) — the caller should skip the file, there is nothing new to index. The
 /// caller is responsible for the truncation / fingerprint preconditions BEFORE calling this.
+/// Compatibility tail parser; reads O(appended bytes) plus fixed overlap, retaining the parsed tail.
+#[deprecated(
+    since = "1.1.0",
+    note = "use IndexService::reindex_report for guarded incremental parsing"
+)]
 pub fn tail_parse<F>(
     path: &Path,
     checkpoint_offset: i64,
@@ -177,8 +210,13 @@ pub fn tail_parse<F>(
 where
     F: Fn(Cursor<Vec<u8>>, &Path) -> Result<ParsedSession>,
 {
-    match tail_parse_until(path, checkpoint_offset, &|| false, parse_slice)? {
+    match tail_parse_until(path, checkpoint_offset, None, &|| false, |r, p, _| {
+        parse_slice(r, p)
+    })? {
         TailParseRun::Complete(parsed) => Ok(parsed.map(|parsed| *parsed)),
+        TailParseRun::ChangedOverlap => {
+            anyhow::bail!("appended records changed earlier rows; use guarded reindex")
+        }
         TailParseRun::Cancelled => unreachable!("the default tail-parse token never cancels"),
     }
 }
@@ -186,11 +224,12 @@ where
 pub(crate) fn tail_parse_until<F>(
     path: &Path,
     checkpoint_offset: i64,
+    expected_overlap: Option<&str>,
     should_cancel: &dyn Fn() -> bool,
     parse_slice: F,
 ) -> Result<TailParseRun>
 where
-    F: Fn(Cursor<Vec<u8>>, &Path) -> Result<ParsedSession>,
+    F: Fn(Cursor<Vec<u8>>, &Path, TailContext) -> Result<ParsedSession>,
 {
     if should_cancel() {
         return Ok(TailParseRun::Cancelled);
@@ -231,12 +270,46 @@ where
     if should_cancel() {
         return Ok(TailParseRun::Cancelled);
     }
-    let parsed_all = parse_slice(Cursor::new(buf.clone()), path)?;
+    let overlap_digest = crate::hashing::sha256_reader(&buf[..prefix_len])?;
+    if expected_overlap.is_some_and(|hash| overlap_digest != hash) {
+        return Ok(TailParseRun::ChangedOverlap);
+    }
+    let next_window_start = (new_offset - OVERLAP_BYTES).max(0) - overlap_start;
+    let new_overlap_digest = crate::hashing::sha256_reader(&buf[next_window_start as usize..])?;
+    let parsed_all = parse_slice(
+        Cursor::new(buf.clone()),
+        path,
+        TailContext {
+            new_bytes_start: prefix_len,
+            prefix_truncated: overlap_start > 0,
+            ..Default::default()
+        },
+    )?;
     if should_cancel() {
         return Ok(TailParseRun::Cancelled);
     }
-    let parsed_overlap = parse_slice(Cursor::new(buf[..prefix_len].to_vec()), path)?;
+    let parsed_overlap = parse_slice(
+        Cursor::new(buf[..prefix_len].to_vec()),
+        path,
+        TailContext {
+            new_bytes_start: usize::MAX,
+            prefix_truncated: overlap_start > 0,
+            ..Default::default()
+        },
+    )?;
 
+    // A new record may replace or re-attribute an overlap row (including an attachment's
+    // immediately following delivery copy). Such a change needs reconciliation, not append.
+    if !parsed_all.messages.starts_with(&parsed_overlap.messages)
+        || !parsed_all
+            .file_edits
+            .starts_with(&parsed_overlap.file_edits)
+        || !parsed_all
+            .transcript_text
+            .starts_with(&parsed_overlap.transcript_text)
+    {
+        return Ok(TailParseRun::ChangedOverlap);
+    }
     let m0 = parsed_overlap.messages.len();
     let e0 = parsed_overlap.file_edits.len();
     let new_messages = parsed_all.messages.get(m0..).unwrap_or(&[]).to_vec();
@@ -253,6 +326,8 @@ where
         .to_string();
 
     Ok(TailParseRun::Complete(Some(Box::new(TailParse {
+        overlap_digest,
+        new_overlap_digest,
         new_messages,
         new_file_edits,
         session: parsed_all.session,
@@ -305,17 +380,45 @@ mod tests {
         let run = tail_parse_until(
             &path,
             prefix.len() as i64,
+            None,
             &|| {
                 let next = checks.get() + 1;
                 checks.set(next);
                 next >= 4
             },
-            |_, _| unreachable!("the parser must not receive a cancelled tail"),
+            |_, _, _| unreachable!("the parser must not receive a cancelled tail"),
         )
         .unwrap();
 
         assert!(matches!(run, TailParseRun::Cancelled));
         assert!(checks.get() >= 4);
+    }
+
+    #[test]
+    fn overlap_digest_rejects_rewrites_beyond_the_head() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let initial = format!("header\n{}\n", "x".repeat(8192));
+        write(&path, initial.as_bytes());
+        let offset = initial.len() as i64;
+        let fingerprint = prefix_fingerprint(&path).unwrap();
+        let expected = overlap_digest(&path, offset).unwrap();
+        let mut changed = initial.into_bytes();
+        changed[6000] = b'y';
+        changed.extend_from_slice(b"new line\n");
+        write(&path, &changed);
+        assert!(fingerprint_matches(&path, &fingerprint).unwrap());
+        assert!(matches!(
+            tail_parse_until(
+                &path,
+                offset,
+                Some(&expected),
+                &|| false,
+                |_, _, _| unreachable!("rewritten overlap must not reach the parser")
+            )
+            .unwrap(),
+            TailParseRun::ChangedOverlap
+        ));
     }
 
     #[test]

@@ -9,18 +9,45 @@
   "cases": [
     {
       "id": "cli-exact-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "b4d603134485507ad844d8d6bc2fd25aa511c00e1217694e88ee69e975004a09",
+          "candidate_sha256": "ce20eb1e5f7dcb22cd0484d9f9e6cb09f88af7052a67a68420781f70d4ba085b",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "smoke",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "database", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-regex-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "1c9886aa3e47f982bedf6c9eca73688cdbe8690ffec5d00fd1d6bd74aceed870",
+          "candidate_sha256": "d4187932f3b45e7a6327e206028ad15d4ea48263265adba5296d29b5258780f8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "smoke",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "database|sqlite", "--query-mode", "regex", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-fuzzy-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "9de013589541aed80f410caf3b8a2f65d95427205a7f4d172d608329b6d57992",
+          "candidate_sha256": "683137cc9406d60eccec67bea3f2654df58ad907d5afc028fe93ce5e2e3e4307",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "smoke",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "databse", "--query-mode", "fuzzy", "--limit", "10", "--format", "json"]
@@ -100,6 +127,15 @@
     },
     {
       "id": "cli-schema",
+      "accepted_results": [
+        {
+          "baseline_sha256": "6806752a3be58bfaca7acd61a1b6b386e0fcd68503ffb268a9d0dc94f3eb8240",
+          "candidate_sha256": "d291a0853fff5ec931650bbb3ce87839722b4d6dacb89bed298b921deecd872c",
+          "category": "field_added",
+          "difference": "messages CREATE TABLE SQL adds input_delivery_state and input_origin, each TEXT DEFAULT unknown; all other schema output is equal.",
+          "changelog": "1.1.0 Added 2 (input provenance)"
+        }
+      ],
       "tier": "smoke",
       "surface": "cli",
       "require_equal": false,
@@ -107,18 +143,45 @@
     },
     {
       "id": "python-fuzzy-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "184cd8e1b2172c3509558c66e17cc9b7b4faa336c4ec0d2d5aca3fee8a113d91",
+          "candidate_sha256": "48b3ab8efa07ddb4accff311272ec00dd316db128dd5876b825bafd2e0c0fa98",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "smoke",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "databse", "--mode", "fuzzy", "--limit", "10"]
     },
     {
       "id": "mcp-fuzzy-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "db3b7886bc7c94afc116eb4e48a0117e160e81448a15daf2298350fa38a30ed6",
+          "candidate_sha256": "0789aff2e8b73cdc6d4f4d5cb4ac6a3047dd9a4076235adfbdd0f89ce1a6aea8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "smoke",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "databse", "--mode", "fuzzy", "--limit", "10"]
     },
     {
       "id": "rust-core-fuzzy-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "0e919c9261f3272de77321b6362e94cdeba56b17b12ff37486e3cd3982b68e55",
+          "candidate_sha256": "0039945a234875022105d00566d37191cb3dfb2d99c9d1e54103b21a1cb63632",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "databse", "fuzzy", "content"]
@@ -145,114 +208,285 @@
     },
     {
       "id": "cli-exact-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "ed2bfbd2cb28f8005f09615196ac5e87a356da2e5a7a2cdd6a852e46943ebf9e",
+          "candidate_sha256": "72dda539694bad25002ee7fe428062fd1a3632fe55c3e3c4fbf3a779f4e1630c",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "exec", "--field", "tool-name", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-regex-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "c5ba38541853cdba93aa05134316f42c0a38887e087434894e7eaf3e2fd011f6",
+          "candidate_sha256": "1a56099e3d4c910196e0e6cda0a1e7636457df03d12b207d2afaa8ee37cfcbb5",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "^exec", "--field", "tool-name", "--query-mode", "regex", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-fuzzy-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "ea81ea4d96b6c190f7ea36960c654291d95a5e6ef9080ca06c991b5944ca7ec8",
+          "candidate_sha256": "992978f9671a35286ebd568877f1da3c4b81b1185a212e470cd6a28ebe8abcca",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "excmd", "--field", "tool-name", "--query-mode", "fuzzy", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-exact-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "d677d3a983fa8d8f25b2d8325d5d8ecc808d85af1d95fcc5fcac92bebf7a2620",
+          "candidate_sha256": "d816b0a33dfa1329a86f73e9c0ae3ab9cf4f48e66626f977cda6056fd25d2c6e",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migration lock", "--field", "tool-argument", "--argument-path", "/cmd", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-regex-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "6fbe216f935ee92df544a46f77fd329329dd0471bed2e27eabc30abbbe84b6e4",
+          "candidate_sha256": "9b77059c35648118be86a68c3f7e3a2d18b7053f3e8b3dd44d18fad091ae0144",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migration\\s+lock", "--field", "tool-argument", "--argument-path", "/cmd", "--query-mode", "regex", "--limit", "10", "--format", "json"]
     },
     {
       "id": "cli-fuzzy-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "022bf801857990029840ab63ff3701e70316266615bdcfdc55b357bdd6bb79f9",
+          "candidate_sha256": "ee6e53d1b3c1c99de98981cc5b2d65542d1fa074524a635ba33b8ee9d811b0bd",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli",
       "argv": ["{binary}", "--database", "{fixture}", "--index-refresh", "existing-only", "messages", "search", "migraton lok", "--field", "tool-argument", "--argument-path", "/cmd", "--query-mode", "fuzzy", "--limit", "10", "--format", "json"]
     },
     {
       "id": "python-exact-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "b8d21d75af919f50ecae927a2c4696d5e5896ba429979ed8b6a01fddc31a2d7c",
+          "candidate_sha256": "6d94cbc6c51a4d8169c5c354551546291a68ca70a92b7b7ef97e1668d380f642",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "database", "--mode", "literal", "--limit", "10"]
     },
     {
       "id": "python-regex-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "0f6631e5e3307353d0575a235a32a75d576882beedb4592ba4ec13d993b32774",
+          "candidate_sha256": "2b241f201d3bc0e0af23408621762196d6d9f174c1ef8570f31498f176aa3968",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "database|sqlite", "--mode", "regex", "--limit", "10"]
     },
     {
       "id": "mcp-exact-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "87b13c87b2f0c86fb29aba5e259f8e1b27abca2b5b4dc20eed5f824abaf2e3af",
+          "candidate_sha256": "1c3d48846868509a7140bc6b562bacf36aad4ab5351c19b748a72c0cefc45744",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "database", "--mode", "literal", "--limit", "10"]
     },
     {
       "id": "mcp-regex-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "10055914a051c604e5fbe22706320789b65abda553afc128d82fb10e0692f2fb",
+          "candidate_sha256": "0bb6946e7a7228dd1d914f188eddd5d1eaa7cef0197a87df9425a52273917723",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "database|sqlite", "--mode", "regex", "--limit", "10"]
     },
     {
       "id": "python-fuzzy-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "61b4c0d18a5223ae9dc41a67d9a8a4cfb7e35087080e5979ba538e607446abff",
+          "candidate_sha256": "e3d53242d01a2f31180149256620ddc73f3cd650b548416dd983b5c26d35d07b",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "excmd", "--mode", "fuzzy", "--field", "tool_name", "--limit", "10"]
     },
     {
       "id": "python-fuzzy-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "51db95ab0ae74ded66c96bf73691983398feac46a98d6a6c1f20989095687d36",
+          "candidate_sha256": "ed2069d0dce708eaeefdd540af00592e8ca0f83c07d090dc49e77a59ea951cfd",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "migraton lok", "--mode", "fuzzy", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
     },
     {
       "id": "mcp-fuzzy-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "61b4c0d18a5223ae9dc41a67d9a8a4cfb7e35087080e5979ba538e607446abff",
+          "candidate_sha256": "e3d53242d01a2f31180149256620ddc73f3cd650b548416dd983b5c26d35d07b",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "excmd", "--mode", "fuzzy", "--field", "tool_name", "--limit", "10"]
     },
     {
       "id": "mcp-fuzzy-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "604da6cefd25133c2faa4b920adfd1c7693499b741b7e923c4cfe84b8f65355b",
+          "candidate_sha256": "a9f97eda6aedd5fdd5c87156d123b817a31134ca8ad04b6b4f6b9b02a0878d1d",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "migraton lok", "--mode", "fuzzy", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
     },
     {
       "id": "rust-core-exact-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "1ab1662b7e9e1afa62f359fb37d59139045080b7bea8b279694a6b1fa9e4376c",
+          "candidate_sha256": "d35c23300138d13ba37f41c596ca9902f79b022cea9a75bc2cbce2cb79462ba1",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "database", "literal", "content"]
     },
     {
       "id": "rust-core-regex-content",
+      "accepted_results": [
+        {
+          "baseline_sha256": "5b68aaa7d3b0cdfc0a9442c293a361088f99e56d23423206ef3bbdb712a3422d",
+          "candidate_sha256": "38b19abbbc129a8e830fe2ed1e814e2c16ee0db39e680b9666257d1b8e7717d0",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "database|sqlite", "regex", "content"]
     },
     {
       "id": "rust-core-fuzzy-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "b2bf6b88f56b3073be5a3740ca6d950e8d754c23d8aa7d137a0d6b1f9f849ff3",
+          "candidate_sha256": "7c64201920c5ac1101b3243ec8de337f2227e3ead84aae56991f75b5d1496af8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "excmd", "fuzzy", "tool-name"]
     },
     {
       "id": "rust-core-fuzzy-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "845db2e42dc5e71eb4f36517e2a494ad2e830b1ac62f77089634445cb8892d7f",
+          "candidate_sha256": "954a5c6904e9990f2c3e9aae186d82c8ee8046e8ea4be65855014b8dd6fa2011",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "migraton lok", "fuzzy", "tool-argument"]
     },
     {
       "id": "cli-burst-1",
+      "accepted_results": [
+        {
+          "baseline_sha256": "29a5cd977678d2361a035b12ba80b31970ecf226b36054ac6c1bd73841881084",
+          "candidate_sha256": "63fd6e62c7a1ccbebc7cc8f0367007f3ee8735ae213d928782b0ca26a2112802",
+          "category": "field_added",
+          "difference": "result_sha256 changes because each child returns the same fuzzy-content hits plus timestamp; clients is unchanged.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli-concurrency",
       "require_equal": false,
@@ -261,6 +495,15 @@
     },
     {
       "id": "cli-burst-2",
+      "accepted_results": [
+        {
+          "baseline_sha256": "e6874fd65ff7e70bf4a3e57d164410f41c65b1d751fef7c5edfddb5eeed1a9f8",
+          "candidate_sha256": "d85159d87cac833245eaaf0c3b2f64f5b5bf351a65b194ecaff7dbe5168068de",
+          "category": "field_added",
+          "difference": "result_sha256 changes because each child returns the same fuzzy-content hits plus timestamp; clients is unchanged.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli-concurrency",
       "require_equal": false,
@@ -269,6 +512,15 @@
     },
     {
       "id": "cli-burst-4",
+      "accepted_results": [
+        {
+          "baseline_sha256": "c075fc53988dd49ba07732089ed90c203a92ebbfbc82d0c3bde76575f500343e",
+          "candidate_sha256": "d705cce970f654e211d703fdb6415fbda066d1590011f202d38ddcb4375c51cd",
+          "category": "field_added",
+          "difference": "result_sha256 changes because each child returns the same fuzzy-content hits plus timestamp; clients is unchanged.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli-concurrency",
       "require_equal": false,
@@ -277,6 +529,15 @@
     },
     {
       "id": "cli-burst-8",
+      "accepted_results": [
+        {
+          "baseline_sha256": "7a37c19d00c23c98580f17b6b6174b8229a855b25e033da30cdc3ed3a5ba932f",
+          "candidate_sha256": "c9838f997a871bd0384745d1d97e2f4c30620b8e54b24d3ee1dc85dd87b78f35",
+          "category": "field_added",
+          "difference": "result_sha256 changes because each child returns the same fuzzy-content hits plus timestamp; clients is unchanged.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "cli-concurrency",
       "require_equal": false,
@@ -285,6 +546,15 @@
     },
     {
       "id": "cli-doctor",
+      "accepted_results": [
+        {
+          "baseline_sha256": "96ec506abe243101e70b6a6e83e0396220044f4b0244b94dd3d022436262c43e",
+          "candidate_sha256": "28ad268b30c029ea4ea0fa4fd32c8af66626feab50e12c779dd35897186ad960",
+          "category": "documented_change",
+          "difference": "Schema and expected schema 5\u21926; expected parser versions: Claude/desktop v4\u2192v19, Codex v5\u2192v12, Cursor v4\u2192v5, Antigravity v3\u2192v6, Pi v3\u2192v5, Prime v1\u2192v3, AI Studio v3\u2192v4, Gemini v4\u2192v6 (in both provider lists); added parser_health.unrecognized_record_types=[], unknown_config_keys=[], config_file {path, origin, exists} and config_files_not_read=[].",
+          "changelog": "1.1.0 Upgrade notes 1; Added 1 and 7; Changed 5"
+        }
+      ],
       "tier": "subsystem",
       "surface": "lifecycle",
       "require_equal": false,
@@ -304,54 +574,135 @@
     },
     {
       "id": "python-exact-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "1d9d3e78770b3d2e30a8d9530396902bace67d6e07da42f8de4a62c66bf57482",
+          "candidate_sha256": "ec4a6de5ef8ca8b56f763e2011c0325679ceb13b829cbb5b34fb7a30fa222ef9",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "exec", "--mode", "literal", "--field", "tool_name", "--limit", "10"]
     },
     {
       "id": "python-regex-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "804eaee5ea1e9a675ae11b5db3c9aa36496804591dda3b823bf06c351ba631a2",
+          "candidate_sha256": "825ac5b8bbef65051d1dc57163a0272a49e054c47da8086062b7fccb7fbd95db",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "^exec", "--mode", "regex", "--field", "tool_name", "--limit", "10"]
     },
     {
       "id": "python-exact-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "c1b9f58dbd96a660c1447e88142acbdf6c08483dbd679a2ec8fa470d6d4477f2",
+          "candidate_sha256": "5e8cb5f7720f54396d352466b114e39acf9eceb773eb457b1e1de5b6ba49c802",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "migration lock", "--mode", "literal", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
     },
     {
       "id": "python-regex-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "342c9ccc82dd2b4acf1c946c53e9ef4a7755af61efe6bd39b6cceb1781190eb0",
+          "candidate_sha256": "2bec4b128e38f5531862009fe0b70849530e96321e3375a67fb947a5de1271fa",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "python",
       "argv": ["{python}", "{client_root}/python_client.py", "--fixture", "{fixture}", "--query", "migration\\s+lock", "--mode", "regex", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
     },
     {
       "id": "mcp-exact-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "74bb561964109509b48f5e595e6317dfe80b8e6ec58aa42b407b386a175a48f6",
+          "candidate_sha256": "b7f47dad9a07345643627b7da52963de1bf20567e4356b0c889ae50be81d5a51",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "exec", "--mode", "literal", "--field", "tool_name", "--limit", "10"]
     },
     {
       "id": "mcp-regex-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "68e516575fe9b2a8447c3e6879d690cc22e19317a75e73ba6006a9efd1034330",
+          "candidate_sha256": "59b39397c2d8a918d41c64058350164badb14cfb5c2b3cea1b91bcab83426912",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "^exec", "--mode", "regex", "--field", "tool_name", "--limit", "10"]
     },
     {
       "id": "mcp-exact-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "8c4c1cb392bccf92ee0861228270e3fa73077560f92215ca65c44636148c9f3d",
+          "candidate_sha256": "6b250127c83543bbedb95e37d5dfb8abe0de93c43c869661f8f35bf1f4088851",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "migration lock", "--mode", "literal", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
     },
     {
       "id": "mcp-regex-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "59147e82f2bccae5259d3289f587804cad56b9b1ef5a3b878194ec2671faad89",
+          "candidate_sha256": "bee36a1804eb06be7d1f7267eeca5d7902361147a02e4439433b1002ed753f6a",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "mcp",
       "argv": ["{python}", "{client_root}/mcp_client.py", "--binary", "{binary}", "--fixture", "{fixture}", "--query", "migration\\s+lock", "--mode", "regex", "--field", "tool_argument", "--argument-path", "/cmd", "--limit", "10"]
     },
     {
       "id": "mcp-reader-bound-auto",
+      "accepted_results": [
+        {
+          "baseline_sha256": "db3b7886bc7c94afc116eb4e48a0117e160e81448a15daf2298350fa38a30ed6",
+          "candidate_sha256": "0789aff2e8b73cdc6d4f4d5cb4ac6a3047dd9a4076235adfbdd0f89ce1a6aea8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "release",
       "surface": "mcp-concurrency",
       "workload": "same-server-mcp-fuzzy-readers",
@@ -361,6 +712,15 @@
     },
     {
       "id": "mcp-reader-bound-host",
+      "accepted_results": [
+        {
+          "baseline_sha256": "db3b7886bc7c94afc116eb4e48a0117e160e81448a15daf2298350fa38a30ed6",
+          "candidate_sha256": "0789aff2e8b73cdc6d4f4d5cb4ac6a3047dd9a4076235adfbdd0f89ce1a6aea8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "release",
       "surface": "mcp-concurrency",
       "workload": "same-server-mcp-fuzzy-readers",
@@ -370,6 +730,15 @@
     },
     {
       "id": "mcp-reader-bound-1",
+      "accepted_results": [
+        {
+          "baseline_sha256": "db3b7886bc7c94afc116eb4e48a0117e160e81448a15daf2298350fa38a30ed6",
+          "candidate_sha256": "0789aff2e8b73cdc6d4f4d5cb4ac6a3047dd9a4076235adfbdd0f89ce1a6aea8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "release",
       "surface": "mcp-concurrency",
       "workload": "same-server-mcp-fuzzy-readers",
@@ -379,6 +748,15 @@
     },
     {
       "id": "mcp-reader-bound-2",
+      "accepted_results": [
+        {
+          "baseline_sha256": "db3b7886bc7c94afc116eb4e48a0117e160e81448a15daf2298350fa38a30ed6",
+          "candidate_sha256": "0789aff2e8b73cdc6d4f4d5cb4ac6a3047dd9a4076235adfbdd0f89ce1a6aea8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "release",
       "surface": "mcp-concurrency",
       "workload": "same-server-mcp-fuzzy-readers",
@@ -388,6 +766,15 @@
     },
     {
       "id": "mcp-reader-bound-4",
+      "accepted_results": [
+        {
+          "baseline_sha256": "db3b7886bc7c94afc116eb4e48a0117e160e81448a15daf2298350fa38a30ed6",
+          "candidate_sha256": "0789aff2e8b73cdc6d4f4d5cb4ac6a3047dd9a4076235adfbdd0f89ce1a6aea8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "release",
       "surface": "mcp-concurrency",
       "workload": "same-server-mcp-fuzzy-readers",
@@ -397,6 +784,15 @@
     },
     {
       "id": "mcp-reader-bound-8",
+      "accepted_results": [
+        {
+          "baseline_sha256": "db3b7886bc7c94afc116eb4e48a0117e160e81448a15daf2298350fa38a30ed6",
+          "candidate_sha256": "0789aff2e8b73cdc6d4f4d5cb4ac6a3047dd9a4076235adfbdd0f89ce1a6aea8",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "release",
       "surface": "mcp-concurrency",
       "workload": "same-server-mcp-fuzzy-readers",
@@ -406,24 +802,60 @@
     },
     {
       "id": "rust-core-exact-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "9ae481ad3b5c2f9143b67b246e0dd60ba49792efa68f734140ed2dbd90dd50b3",
+          "candidate_sha256": "82c9f578e40c13d89d298298496e20155a27e022ef53a158064f61652098ade2",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "exec", "literal", "tool-name"]
     },
     {
       "id": "rust-core-regex-tool-name",
+      "accepted_results": [
+        {
+          "baseline_sha256": "6b1f04578d6a6a4fd1c3684041baefa9e501866f662f3b03ee8f4deb0a7a89a0",
+          "candidate_sha256": "94a61b6f7b1c0a9bea77021f1a76298b3f0bebfbe6546f0b91d70c4260a91cd6",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "^exec", "regex", "tool-name"]
     },
     {
       "id": "rust-core-exact-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "4a6d6e5d6fc4c3fde842b4142b78ba0b4b328faef70070a3c621c32779ed741a",
+          "candidate_sha256": "3b7c9960ae7c33007bffbe241e9d5e83cb88611e95ae884a6e099e29fc8f0ff2",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "migration lock", "literal", "tool-argument"]
     },
     {
       "id": "rust-core-regex-tool-argument",
+      "accepted_results": [
+        {
+          "baseline_sha256": "0f95bcc943534410447a5689515d8f36e5a0d4042c263a650c9e73bab3c52580",
+          "candidate_sha256": "3bbe404ab8c67c1bd4f72cde4f90b1bb45aac05bf0281d293e3d758155cea373",
+          "category": "field_added",
+          "difference": "Each hit adds timestamp=2026-01-01T12:00:00Z; removing only timestamp leaves identical ordered JSON.",
+          "changelog": "1.1.0 Added 5 (nullable hit timestamps)"
+        }
+      ],
       "tier": "subsystem",
       "surface": "rust",
       "argv": ["{core}", "{fixture}", "migration\\s+lock", "regex", "tool-argument"]

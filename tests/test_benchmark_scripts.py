@@ -316,11 +316,8 @@ def test_generated_fixture_reindex_cannot_reach_the_running_user_s_transcripts()
     # The generated fixture disables every provider by name, which only works for the provider
     # names the config text happens to list. `generate_fixture` deliberately omits the
     # `prime-agent` stanza for the baseline build, so that provider kept its default
-    # `~/.prime/agent/sessions` root: measured here, the baseline config indexed 119 real
-    # transcripts while the all-disabled config indexed none. That put real session content into
-    # an artifact the classifier calls `portable_generated` and `publishable`, and it made the
-    # two builds measure different corpora — 22,546 messages against 512 — so every before/after
-    # comparison and the `require_equal` digest check compared unlike things.
+    # `~/.prime/agent/sessions` root, which could put private content in a generated fixture.
+    # Isolating HOME prevents that regardless of which provider names a build recognizes.
     #
     # Naming providers cannot fix that, because the omission exists precisely for binaries that
     # do not know a name. Pointing HOME at the fixture directory makes the default roots resolve
@@ -603,21 +600,17 @@ def test_tui_browse_wait_ignores_preview_content_that_looks_like_the_title() -> 
 
 
 def test_tui_screen_tracker_rejoins_a_session_id_wrapped_across_preview_rows() -> None:
-    """A subagent id is 67 characters and wraps in the preview pane at 100 columns.
+    """Rejoin a synthetic subagent ID that wraps across preview rows.
 
-    Reading only the row that carries the `Session: ` label returned the first fragment, which
-    never equalled the canonical id, so the semantic traversal waited out its timeout and
-    reported `could not collect TUI session ID at position 13` — a parser limit stated as a TUI
-    failure. Measured against the maintainer's own index, position 13 of a `rust worker` search
-    was exactly such a row.
+    Reading only the label row loses the rest of the canonical ID and makes traversal time out.
     """
     client = load_python_file(ROOT / "benchmarks" / "tui_client.py")
-    identifier = "claude:08a88453-1d07-48fd-8166-a00f1ca70115/agent-a2b498896d3f06295"
+    identifier = "claude:00000000-0000-4000-8000-000000000001/agent-a0000000000000000"
     pane_width = 44
     # Two renderings of the same header. The first is what a mid-value wrap looks like; the
     # second is what the pane actually produced, because an id longer than the pane does not fit
     # after its label at all, so the wrapper puts `Session:` on a row by itself. The second form
-    # is the one the maintainer's own index hit, and matching `"Session: "` returned None for it.
+    # requires accepting the label without a trailing space.
     split_after_label = [
         client.SESSION_FIELD_LABEL,
         *[identifier[start : start + pane_width] for start in range(0, len(identifier), pane_width)],
@@ -1456,6 +1449,7 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
         None,
     )
 
+    assert "This report's exact renderer command is:" not in report
     assert "**NO-GO" in report
     assert "publishable generated fixture: no" in report
     assert "held-out relevance gate: not supplied" in report
@@ -1466,6 +1460,62 @@ def test_renderer_refuses_a_release_go_decision_for_private_fixture_artifacts(
     assert "nine-repetition" not in report
     assert "The measured benchmark table is a regression signal" in report
     assert "private_local_fixture" in report
+
+
+def test_renderer_separates_reviewed_result_differences_from_regressions(tmp_path: Path) -> None:
+    # A digest pair the manifest declares as reviewed is not a regression; an undeclared one is.
+    renderer = load_script("render_benchmark_report.py")
+    evidence = tmp_path / "samples.jsonl"
+    metadata = {
+        "commit": "b" * 40, "dirty": False, "source_state_sha256": "c" * 64,
+        "binary_sha256": "d" * 64, "manifest_sha256": "e" * 64, "os": "TestOS 1",
+        "machine": "test-machine", "python": "3.12", "sqlite": "3.47",
+    }
+    fixture = {"sha256": "a" * 64, "bytes": 4096, "schema_version": 5,
+               "counts": {"sessions": 1, "messages": 2, "file_edits": 0}}
+    digests = {"baseline": "1" * 64, "candidate": "2" * 64}
+    contracts = {
+        "timestamp-case": {"accepted_results": [{
+            "baseline_sha256": digests["baseline"], "candidate_sha256": digests["candidate"],
+            "category": "field_added", "difference": "hits add timestamp",
+            "changelog": "Added: structured message hits include timestamps",
+        }]},
+        "drifted-case": {},
+        # An unreviewed entry for the same digests must not be the one the report prints.
+        "twice-declared-case": {"accepted_results": [
+            {"baseline_sha256": digests["baseline"], "candidate_sha256": digests["candidate"],
+             "category": "unexplained"},
+            {"baseline_sha256": digests["baseline"], "candidate_sha256": digests["candidate"],
+             "category": "documented_change", "difference": "rows are ordered by sequence",
+             "changelog": "Fixed: stable tie-breaker"},
+        ]},
+    }
+    rows = []
+    for build in ("baseline", "candidate"):
+        rows.append({"kind": "run", "build": build, "metadata": metadata, "fixture": fixture,
+                     "contracts": contracts, "selected_cases": sorted(contracts), "repetitions": 1,
+                     "artifact_privacy": {"classification": "portable_generated",
+                                          "publishable": True}})
+        rows.extend({"kind": "sample", "build": build, "case": case, "surface": "cli",
+                     "exit_code": 0, "result_sha256": digests[build], "wall_ms": 1,
+                     "cpu_seconds": 0, "peak_rss_kib": 1, "peak_threads": 1,
+                     "peak_processes": 1, "repetition": 0} for case in sorted(contracts))
+    evidence.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    report = renderer.render(evidence, evidence, "baseline", "candidate", [], {}, [], [], [], None)
+
+    reviewed, regressions = report.split("## Regressions and limitations")
+    regressions = regressions.split("\n## ")[0]
+    assert "- `drifted-case` returned a result digest no manifest declaration covers." in regressions
+    assert "timestamp-case" not in regressions
+    reviewed = reviewed.split("## Reviewed result differences")[1]
+    assert ("- `timestamp-case` (field_added): hits add timestamp. Changelog: Added: structured "
+            "message hits include timestamps.") in reviewed
+    assert "drifted-case" not in reviewed
+    assert ("- `twice-declared-case` (documented_change): rows are ordered by sequence. Changelog: "
+            "Fixed: stable tie-breaker.") in reviewed
+    assert "twice-declared-case" not in regressions
+    assert "Required-equal result-digest mismatches: 1." in report
 
 
 def test_tracked_docs_contain_no_personal_install_paths() -> None:
@@ -1489,3 +1539,44 @@ def test_every_measured_case_runs_with_an_owned_config_and_home(tmp_path: Path) 
     assert "enabled = false" in (tmp_path / "sandbox" / "config.toml").read_text(encoding="utf-8")
     source = (ROOT / "scripts" / "benchmark_release.py").read_text(encoding="utf-8")
     assert "environment=hermetic_environment(sandbox)" in source
+
+
+def test_cross_version_comparison_requires_an_exact_reviewed_case_declaration() -> None:
+    benchmark = load_script("benchmark_release.py")
+    case: dict[str, Any] = {"id": "search"}
+    assert benchmark.result_pair_accepted(case, "same", "same")
+    assert not benchmark.result_pair_accepted(case, "old", "new")
+    assert not benchmark.result_pair_accepted({**case, "require_equal": False}, "old", "new")
+    declaration = {"baseline_sha256": "old", "candidate_sha256": "new",
+                   "category": "field_added", "difference": "hits add timestamp",
+                   "changelog": "Added: structured message hits include timestamps"}
+    case["accepted_results"] = [declaration]
+    assert benchmark.result_pair_accepted(case, "old", "new")
+    assert not benchmark.result_pair_accepted(case, "old", "unreviewed")
+    assert not benchmark.result_pair_accepted(case, "unreviewed", "new")
+    declaration["category"] = "unexplained"
+    assert not benchmark.result_pair_accepted(case, "old", "new")
+
+
+def test_generated_fixture_refresh_time_is_independent_of_build_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark = load_script("benchmark_release.py")
+    schema = (ROOT / "rust/ai-session-search-core/tests/fixtures/v1_0_0_populated.sql").read_text()
+    clock = 0
+
+    def seed_empty_index(*_args: Any, **kwargs: Any) -> None:
+        nonlocal clock
+        clock += 1
+        with sqlite3.connect(kwargs["cwd"] / "generated.db") as connection:
+            connection.executescript(schema)
+            connection.execute("update index_metadata set value=? where key like 'auto_reindex_completed_%'", (clock,))
+
+    monkeypatch.setattr(benchmark.subprocess, "run", seed_empty_index)
+    monkeypatch.setattr(benchmark, "OVERSIZED_TRANSCRIPT_BYTES", 128)
+    timestamps = []
+    for label in ("baseline", "candidate"):
+        path = benchmark.generate_fixture(tmp_path / label, Path("aise"), 1, 1, 1)
+        with sqlite3.connect(path) as connection:
+            timestamps.append(connection.execute("select key,value from index_metadata where key like 'auto_reindex_completed_%' order by key").fetchall())
+    assert timestamps[0] == timestamps[1]

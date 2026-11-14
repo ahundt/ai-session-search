@@ -18,20 +18,22 @@ The repository [README](../README.md) covers what `aise` does and a quick start.
 | Run a release, start to finish | [RELEASING.md](../RELEASING.md) |
 | Change how packaging, publishing, or the supported target matrix works | [Releasing: design decisions](development/releasing-design-decisions.md) |
 | Preserve cumulative product contracts while changing the repository | [Maintainer requirements and design decisions](development/maintainer-requirements-and-design-decisions.md) |
+| Change the integration installer, configuration resolution, or their acceptance tests | [Installer and configuration maintainer contracts](development/maintainer-contracts-for-install-and-config.md) |
 | Re-check client-imposed MCP limits when a harness or schema changes | [MCP client limits and measured evidence](development/mcp-client-limits-and-measured-evidence.md) |
 
 A release starts at `RELEASING.md`'s "Before tagging, confirm" list, not at the tag.
 
 ## Architecture and migration records
 
-Completed design decisions and migration evidence, not checklists.
+Architecture records describe ownership and provenance; use the guides above for current workflows.
 
 | Record | Purpose |
 | --- | --- |
-| [Major migration](migration/ai-session-search-major-migration.md) | Ordered migration ledger, checkpoints, and remaining gates |
-| [Capability parity](migration/capability-parity.md) | Legacy capability disposition and semantic-duplication decisions |
+| [Major migration](migration/ai-session-search-major-migration.md) | Completed Rust migration and current reference links |
+| [Capability parity](migration/capability-parity.md) | Supported capability routes |
 | [Rust/Python API architecture](migration/rust-python-api-architecture.md) | Public API boundaries and distribution contract |
 | [Provenance](migration/provenance.md) | Source histories, transformation, licensing, and credit |
+| [1.0.0 release candidates](history/changelog-1.0.0-release-candidates.md) | Changelog entries for 1.0.0rc1 to 1.0.0rc4, moved out of CHANGELOG.md |
 
 <!-- aise-message-search-contract:start -->
 ## Generated message-search caller contract
@@ -46,6 +48,8 @@ Search indexed AI-session messages while separating result selection, context, p
 | cli | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
 | mcp | page of 15; offset 0 | 0 before / 0 after | 0 | `{"kind":"max_chars","max_chars":220}` | `{"kind":"max_chars","max_chars":220}` | `["normalized_session_metadata"]` / `none` |
 | python | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
+
+These are shipped defaults from an empty configuration. Positive `limit` counts result rows; signed `lines_per_message` keeps the first N lines, the last N for a negative value, or all lines for 0.
 
 ### Closed vocabularies
 

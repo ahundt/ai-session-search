@@ -169,16 +169,21 @@ pub(crate) fn load_manifest(path: &Path) -> Result<ManifestState> {
             })
         }
     };
-    match serde_json::from_str::<SkillInstallManifest>(&text) {
+    Ok(parse_manifest(&text))
+}
+
+/// Interpret the same manifest snapshot used by a mutation plan.
+pub(crate) fn parse_manifest(text: &str) -> ManifestState {
+    match serde_json::from_str::<SkillInstallManifest>(text) {
         Ok(manifest) if manifest.schema_version == SKILL_MANIFEST_SCHEMA_VERSION => {
-            Ok(ManifestState::Loaded(manifest))
+            ManifestState::Loaded(manifest)
         }
-        Ok(manifest) => Ok(ManifestState::Unreadable(format!(
+        Ok(manifest) => ManifestState::Unreadable(format!(
             "manifest schema_version {} is not the {} this build understands; it was probably \
              written by a newer aise",
             manifest.schema_version, SKILL_MANIFEST_SCHEMA_VERSION
-        ))),
-        Err(error) => Ok(ManifestState::Unreadable(format!("{error}"))),
+        )),
+        Err(error) => ManifestState::Unreadable(format!("{error}")),
     }
 }
 

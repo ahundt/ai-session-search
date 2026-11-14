@@ -23,12 +23,8 @@ pub const DEFAULT_MCP_SEARCH_SESSIONS_LIMIT: usize = 10;
 pub const DEFAULT_MCP_LIST_SESSIONS_LIMIT: usize = 20;
 /// Default MCP page size for `search_messages`.
 ///
-/// WHY 15. The result ceiling below is a backstop, not the mechanism: a response that errors is
-///   a worse outcome than one that never grew. At the measured marginal cost of about 1,583
-///   characters per result, 15 results land near 25,000 characters, roughly 53% of the ceiling,
-///   leaving about 2x headroom for a long matched message. At 20 the figure was 69%, which the
-///   multiplicative levers consume immediately: `detail=full` measured 4.8x and
-///   `include=[...,"parsed_references"]` 2.7x, and they compose.
+/// Leave room for long messages, full detail, references, and the protocol envelope.
+/// The result ceiling is a backstop; paging keeps ordinary responses below it.
 /// PLATFORM: this repository's MCP surface only. CLI, Rust and Python return all results by
 ///   design and are untouched.
 /// RAISE IT WHEN: `max_tool_result_chars` is raised for this deployment, or the per-result cost
@@ -56,8 +52,7 @@ pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 15;
 /// RAISE IT WHEN: the deployment talks only to clients that announce truncation, or Codex raises
 ///   its own cap. Codex's schema budget already moved 4,000 -> 5,000, so its constants do move.
 /// LOWER IT WHEN: a client is found that truncates silently below this. Antigravity is the live
-///   risk: it superseded Gemini CLI, holds three of the thirteen registrations here, and its
-///   truncation behaviour is unverified.
+///   risk: its truncation behaviour is unverified.
 /// Measured over the serialized `CallToolResult`, not the JSON-RPC envelope around it: the
 /// dispatcher owns the former and not the latter, and they differ by 34 characters.
 pub const DEFAULT_MCP_MAX_TOOL_RESULT_CHARS: usize = 48_000;
@@ -123,18 +118,85 @@ pub struct Config {
     pub unknown_config_keys: Vec<UnknownConfigKey>,
 }
 
-/// Per-invocation configuration overrides. `None` preserves lower-precedence sources.
+/// Per-invocation configuration overrides passed to [`Config::resolve`].
+///
+/// Each field is the highest-precedence source for its setting: it wins over the matching
+/// `AI_SESSION_SEARCH_*` environment variable, which wins over the config file, which wins over
+/// the built-in default. `None` (every field's default) leaves the setting to those lower sources.
+///
+/// ```no_run
+/// use ai_session_search::{Config, ConfigOverrides, SessionSearch};
+/// let resolved = Config::resolve(
+///     ConfigOverrides::default()
+///         .with_config_path("/tmp/aise/config.toml")
+///         .with_database_path("/tmp/aise/index.db"),
+/// )?;
+/// let app = SessionSearch::open(resolved.config)?;
+/// # Ok::<(), ai_session_search::anyhow::Error>(())
+/// ```
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ConfigOverrides {
+    /// Config file to read instead of `AI_SESSION_SEARCH_CONFIG` or the platform default. The
+    /// file must exist when set.
     pub config_path: Option<PathBuf>,
+    /// Index database path, over `AI_SESSION_SEARCH_DATABASE` and `[index].db_path`.
     pub database_path: Option<PathBuf>,
+    /// Cache directory, over `AI_SESSION_SEARCH_CACHE_DIR` and `[index].cache_dir`.
     pub cache_dir: Option<PathBuf>,
+    /// Worker threads for parallel scoring and indexing, over `AI_SESSION_SEARCH_THREADS` and
+    /// `[performance].threads`. Must be at least 1.
     pub threads: Option<usize>,
+    /// Refresh policy, over `AI_SESSION_SEARCH_INDEX_REFRESH` and `[index].refresh`.
     pub index_refresh: Option<IndexRefresh>,
+    /// Who set these overrides, which names them in [`ConfigOrigins`]: a library caller
+    /// (`ConfigOverrides.database_path`) or the command line (`cli --database`).
+    pub(crate) source: OverrideSource,
 }
+
+/// Where a [`ConfigOverrides`] value came from, for [`ConfigOrigins`] labels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum OverrideSource {
+    #[default]
+    Caller,
+    CommandLine,
+}
+
+impl ConfigOverrides {
+    /// Mark these overrides as command-line flags, so origins read `cli --database` and so on.
+    pub(crate) fn set_by_command_line(mut self) -> Self {
+        self.source = OverrideSource::CommandLine;
+        self
+    }
+
+    /// Relabel a `cli --flag` origin for overrides a library caller set.
+    fn origin(&self, cli_origin: String) -> String {
+        if self.source == OverrideSource::CommandLine {
+            return cli_origin;
+        }
+        let field = match cli_origin.as_str() {
+            "cli --config" => "config_path",
+            "cli --database" => "database_path",
+            "cli --cache-dir" => "cache_dir",
+            "cli --threads" => "threads",
+            "cli --index-refresh" => "index_refresh",
+            _ => return cli_origin,
+        };
+        format!("ConfigOverrides.{field}")
+    }
+}
+
+chainable_setters!(ConfigOverrides {
+    with_config_path(config_path: impl Into<PathBuf>) some;
+    with_database_path(database_path: impl Into<PathBuf>) some;
+    with_cache_dir(cache_dir: impl Into<PathBuf>) some;
+    with_threads(threads: usize) some;
+    with_index_refresh(index_refresh: IndexRefresh) some;
+});
 
 /// Process environment captured once so precedence can be tested without mutating global state.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ConfigEnvironment {
     pub config_path: Option<PathBuf>,
     pub database_path: Option<PathBuf>,
@@ -171,6 +233,7 @@ impl ConfigEnvironment {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ConfigOrigins {
     pub config: String,
     pub database: String,
@@ -196,6 +259,7 @@ pub struct ConfigOrigins {
 
 /// Validated effective configuration plus provenance.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ResolvedConfig {
     pub config: Config,
     pub config_path: PathBuf,
@@ -204,6 +268,7 @@ pub struct ResolvedConfig {
 
 /// An ordinary key ignored by this binary, with a nearby spelling when one is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct UnknownConfigKey {
     pub path: String,
     pub suggestion: Option<String>,
@@ -526,6 +591,7 @@ pub struct ProviderConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum IndexRefresh {
     #[default]
     Auto,
@@ -686,6 +752,7 @@ pub struct SearchBudgetConfig {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SearchScopeMode {
     #[default]
     All,
@@ -714,10 +781,12 @@ impl Default for SearchScopeConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SearchOperation {
     MessageSearch,
 }
 
+/// Versioned defaults for one search operation, stored in `[search.purposes]`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 // Strict: versioned purpose/policy bundles must not silently lose a future restriction.
 #[serde(deny_unknown_fields)]
@@ -727,6 +796,18 @@ pub struct PurposeDefinition {
     pub operation: SearchOperation,
     #[serde(default)]
     pub preferences: MessagePurposePreferences,
+}
+
+impl PurposeDefinition {
+    /// Define an operation's purpose with no preference overrides. Construction is O(1);
+    /// set the public `preferences` fields before adding it to `Config::search.purposes`.
+    pub fn new(version: NonZeroU32, operation: SearchOperation) -> Self {
+        Self {
+            version,
+            operation,
+            preferences: MessagePurposePreferences::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -823,8 +904,10 @@ pub struct SkillsConfig {
     /// skill directories. `~` is expanded. Empty = only capabilities embedded in the executable.
     ///
     /// These are DISCOVERY roots and are deliberately not the install destinations from
-    /// `aise integrations install`: install writes the same bundled skill to three client roots,
-    /// so scanning those would find three copies of one name. Discovery is also not activation --
+    /// `aise integrations install`: install writes one package under
+    /// `~/.ai-session-search/skills/` and links to it from each detected harness's skill
+    /// directory, so scanning those would find one name several times. Discovery is also not
+    /// activation --
     /// a file appearing here never changes results until it is selected by name.
     #[serde(default)]
     pub search_paths: Vec<String>,
@@ -871,6 +954,7 @@ pub struct PerformanceConfig {
 /// `Fixed` is an explicit positive cap. Neither value changes the separate single-writer election
 /// used by index refresh.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum McpReadConcurrency {
     #[default]
     Auto,
@@ -1310,7 +1394,7 @@ fn default_true() -> bool {
     true
 }
 
-fn default_limit() -> usize {
+pub(crate) fn default_limit() -> usize {
     50
 }
 
@@ -1327,9 +1411,7 @@ fn default_idle_poll_interval_ms() -> u64 {
 fn default_search_debounce_ms() -> u64 {
     // Longer than the gap between keystrokes at a fast typing speed, so a burst becomes one
     // search rather than one cancelled scan per character, and short enough that the wait after
-    // the last key is not the thing a reader notices. Measured on a 36.5 GB index, the search
-    // itself takes 2.3 to 3.6 s, so this is a rounding error there; on a small index it is the
-    // whole wait, which is why it is not larger.
+    // the last key is not the thing a reader notices. Keep the delay short for small indexes.
     150
 }
 
@@ -1765,10 +1847,18 @@ impl Config {
             .map_or_else(Self::config_path, expand_override_path)
     }
 
+    /// Resolve the configuration with no overrides: environment, config file, then defaults.
     pub fn load() -> Result<Self> {
         Ok(Self::resolve(ConfigOverrides::default())?.config)
     }
 
+    /// Resolve the configuration from `overrides`, the `AI_SESSION_SEARCH_*` environment, the
+    /// config file, and built-in defaults, in that order of precedence.
+    ///
+    /// Returns the configuration, the config file path, and
+    /// [`ResolvedConfig::origins`] naming where each path and setting came from. A missing
+    /// config file is fine unless `overrides.config_path` or `AI_SESSION_SEARCH_CONFIG` names
+    /// it. Reads only; nothing is created.
     pub fn resolve(overrides: ConfigOverrides) -> Result<ResolvedConfig> {
         Self::resolve_with_environment(overrides, ConfigEnvironment::capture())
     }
@@ -1804,6 +1894,13 @@ impl Config {
         environment: ConfigEnvironment,
         initializing: bool,
     ) -> Result<ResolvedConfig> {
+        let relabel = {
+            let labels = ConfigOverrides {
+                source: overrides.source,
+                ..ConfigOverrides::default()
+            };
+            move |origin: String| labels.origin(origin)
+        };
         let (config_path, config_origin, explicit_config_path) =
             if let Some(path) = overrides.config_path {
                 (expand_override_path(path), "cli --config".to_string(), true)
@@ -1970,11 +2067,11 @@ impl Config {
             config,
             config_path,
             origins: ConfigOrigins {
-                config: config_origin,
-                database: database_origin,
-                cache: cache_origin,
-                threads: threads_origin,
-                index_refresh: index_refresh_origin,
+                config: relabel(config_origin),
+                database: relabel(database_origin),
+                cache: relabel(cache_origin),
+                threads: relabel(threads_origin),
+                index_refresh: relabel(index_refresh_origin),
                 search_scope: if has_search_scope_config {
                     "config file"
                 } else {
@@ -2000,17 +2097,26 @@ impl Config {
     }
 
     pub fn config_path() -> PathBuf {
-        let home = home_dir_fallback();
-        let app = home.join(".ai-session-search/config.toml");
-        let platform_legacy = dirs::config_dir()
-            .unwrap_or_else(|| home.join(".config"))
-            .join("ai-session-search/config.toml");
-        let xdg_legacy = home.join(".config/ai-session-search/config.toml");
-        choose_config_path(
-            nonempty_env_path("AI_SESSION_SEARCH_CONFIG"),
-            app,
-            &[platform_legacy, xdg_legacy],
-        )
+        let [app, legacy @ ..] = config_discovery_paths();
+        choose_config_path(nonempty_env_path("AI_SESSION_SEARCH_CONFIG"), app, &legacy)
+    }
+
+    /// Config files that exist at a discovery location and are not `active`, in discovery order.
+    /// At most one config file is read, so a setting in any of these has no effect. Files are
+    /// compared after resolving symbolic links and relative paths, so another spelling of the
+    /// active file is not listed and one file reachable at two locations is listed once.
+    pub fn config_files_not_read(active: &std::path::Path) -> Vec<PathBuf> {
+        let resolved = |path: &std::path::Path| path.canonicalize().unwrap_or_else(|_| path.into());
+        let mut seen = vec![resolved(active)];
+        let mut unread = Vec::new();
+        for path in config_discovery_paths() {
+            let identity = resolved(&path);
+            if path.is_file() && !seen.contains(&identity) {
+                seen.push(identity);
+                unread.push(path);
+            }
+        }
+        unread
     }
 
     pub fn db_path(&self) -> PathBuf {
@@ -2638,6 +2744,19 @@ fn toml_has_nested_key(document: &toml::Value, table: &str, nested: &str, key: &
         .and_then(|value| value.get(nested).cloned())
         .and_then(|value| value.get(key).cloned())
         .is_some()
+}
+
+/// Where a config file is looked for when none is named: the app directory first, then the two
+/// locations earlier releases used.
+fn config_discovery_paths() -> [PathBuf; 3] {
+    let home = home_dir_fallback();
+    [
+        home.join(".ai-session-search/config.toml"),
+        dirs::config_dir()
+            .unwrap_or_else(|| home.join(".config"))
+            .join("ai-session-search/config.toml"),
+        home.join(".config/ai-session-search/config.toml"),
+    ]
 }
 
 fn choose_config_path(
@@ -3933,7 +4052,8 @@ mcp_config = "kilo.jsonc"
                 config_path: Some(config_path),
                 cache_dir: Some(PathBuf::from("/portable/cache")),
                 ..Default::default()
-            },
+            }
+            .set_by_command_line(),
             ConfigEnvironment {
                 cache_dir: Some(PathBuf::from("/environment/cache")),
                 ..Default::default()
@@ -4435,7 +4555,8 @@ mcp_config = "kilo.jsonc"
                 database_path: Some(PathBuf::from("/cli/index.db")),
                 threads: Some(11),
                 ..Default::default()
-            },
+            }
+            .set_by_command_line(),
             ConfigEnvironment {
                 database_path: Some(PathBuf::from("/env/index.db")),
                 cache_dir: Some(PathBuf::from("/env/cache")),
@@ -4614,5 +4735,18 @@ paths = ["sessions/gemini-cli"]
         );
 
         assert_eq!(read_config_text(&missing, false).unwrap(), "");
+    }
+}
+
+#[cfg(test)]
+mod published_configuration_compatibility {
+    use super::*;
+
+    #[test]
+    fn published_example_loads_without_ignored_keys() {
+        let config: Config =
+            toml::from_str(include_str!("../tests/fixtures/v1_0_0_config.toml")).unwrap();
+        assert!(config.unknown_config_keys.is_empty());
+        config.validate().unwrap();
     }
 }

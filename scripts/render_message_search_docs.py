@@ -134,18 +134,10 @@ def rule_lines(registry: dict[str, Any]) -> list[str]:
 
 
 def readme_block(specs: dict[str, dict[str, Any]], registry: dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            "### Generated message-search defaults",
-            "",
-            registry["purpose"],
-            "",
-            *defaults_table(specs),
-            "",
-            "These are shipped defaults from an empty configuration. `aise messages search --describe --describe-surface "
-            "cli|mcp|python|rust` resolves the same contract with the active configuration. Positive `limit` counts result rows; "
-            "signed `lines_per_message` selects the beginning, end, or complete text of each already-selected message.",
-        ]
+    return (
+        "See the [generated message-search reference](docs/README.md#generated-message-search-caller-contract) "
+        "for shipped defaults, accepted values, and conflict rules. "
+        "Run `aise messages search --describe --describe-surface cli` for active settings."
     )
 
 
@@ -159,6 +151,9 @@ def docs_block(specs: dict[str, dict[str, Any]], registry: dict[str, Any]) -> st
             "### Shipped defaults by caller surface",
             "",
             *defaults_table(specs),
+            "",
+            "These are shipped defaults from an empty configuration. Positive `limit` counts result rows; "
+            "signed `lines_per_message` keeps the first N lines, the last N for a negative value, or all lines for 0.",
             "",
             "### Closed vocabularies",
             "",
@@ -178,17 +173,11 @@ def docs_block(specs: dict[str, dict[str, Any]], registry: dict[str, Any]) -> st
 
 
 def configuration_block(specs: dict[str, dict[str, Any]], registry: dict[str, Any]) -> str:
-    return "\n".join(
-        [
-            "### Generated message-search policy resolution",
-            "",
-            f"Resolution precedence, highest first: {precedence_line(registry)}.",
-            "",
-            *defaults_table(specs),
-            "",
-            "The table uses an empty configuration and is a shipped-default reference, not a claim about a user's effective settings. "
-            "Run `aise messages search --describe --describe-surface SURFACE` to inspect active values without opening or refreshing the index.",
-        ]
+    return (
+        "See the [generated message-search reference](../README.md#generated-message-search-caller-contract) "
+        "for shipped defaults and resolution precedence. "
+        "Run `aise messages search --describe --describe-surface SURFACE` "
+        "to inspect active values without opening or refreshing the index."
     )
 
 

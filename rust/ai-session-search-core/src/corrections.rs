@@ -70,9 +70,27 @@ pub struct CorrectionPolicySpec {
 /// One named category. Patterns within a category are ORed; the category is the reported label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct CorrectionCategorySpec {
     pub name: String,
     pub patterns: Vec<String>,
+}
+
+impl CorrectionCategorySpec {
+    /// Category `name`, reported as the match label, matching any of `patterns`.
+    ///
+    /// Patterns are Rust `regex` syntax and are combined into one case-insensitive alternation,
+    /// so a message is reported at the leftmost text any pattern matches. They are validated
+    /// when a run compiles the category, not here.
+    pub fn new(
+        name: impl Into<String>,
+        patterns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            patterns: patterns.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 /// Name, version, and source-appropriate digest of the rules that produced a result.
@@ -392,6 +410,7 @@ impl ResolvedCorrectionPolicySet {
 
 /// Name, version, and digest of one message-classification capability evaluated for a report.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CapabilityReceipt {
     pub name: String,
     pub version: String,
@@ -404,6 +423,7 @@ pub struct CapabilityReceipt {
 /// The receipts are not derivable from the matches — a policy that matched nothing still shaped
 /// the result, and its digest is what makes the run reproducible — so they travel together.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageClassificationReport {
     /// Every evaluated message-classification capability, including those that matched nothing.
     ///
@@ -412,6 +432,16 @@ pub struct MessageClassificationReport {
     pub policies: Vec<CapabilityReceipt>,
     /// Matches in newest-first order, after `filters.offset` is skipped and `filters.limit` taken.
     pub matches: Vec<crate::models::MessageClassificationMatch>,
+    /// Messages in the run's scope that were typed while the agent was working and whose
+    /// transcript does not record who sent them (Claude Code versions that wrote no
+    /// `queued_command` origin). A person or a program may have sent each one. Counted whether or
+    /// not they were read; a queued message also delivered as its own prompt is not counted.
+    #[serde(default)]
+    pub unattributed_input_count: u64,
+    /// Whether the run read those messages: false by default, true when the caller passed
+    /// `include_unattributed_input`. When false, matches leave them out.
+    #[serde(default)]
+    pub unattributed_input_included: bool,
 }
 
 /// The product-default correction policy, compiled into the executable.
@@ -494,6 +524,54 @@ fn describe_source(source: &CorrectionPolicySource) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn embedded_rules_find_leading_complaints_without_claiming_additional_requests() {
+        let policy = super::embedded_policy().unwrap();
+        for text in [
+            "What are you talking about? The parcel weighs three kilograms.",
+            "Uh, what are you talking about? The appointment is on Friday.",
+            "OK! Well, what are you talking about? The diagram has four nodes.",
+        ] {
+            assert_eq!(
+                policy.classify(text).map(|hit| hit.category),
+                Some("misunderstanding"),
+                "{text:?}"
+            );
+        }
+        for text in [
+            "We also need a spare lamp.",
+            "You also need to draw a triangle.",
+            "I also need to correct my own calculation.",
+            "\"What are you talking about?\" is a line in the screenplay.",
+            "Example: what are you talking about?",
+            "Log: what are you talking about?",
+            "What are we talking about at the meeting?",
+        ] {
+            assert!(policy.classify(text).is_none(), "{text:?}");
+        }
+        for (text, expected) in [
+            ("You are not finished with the sculpture.", "incomplete"),
+            (
+                "What are you talking about? You deleted the timer.",
+                "regression",
+            ),
+            (
+                "What are you talking about? You forgot the receipt.",
+                "skip_step",
+            ),
+            (
+                "What are you talking about? You are not finished.",
+                "misunderstanding",
+            ),
+        ] {
+            assert_eq!(
+                policy.classify(text).map(|hit| hit.category),
+                Some(expected),
+                "{text:?}"
+            );
+        }
+    }
 
     /// Boundary category counts. One and many must both work; zero must be refused.
     #[test]

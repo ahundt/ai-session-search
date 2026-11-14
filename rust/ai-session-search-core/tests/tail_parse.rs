@@ -8,6 +8,9 @@
 //! in the SAME state as a full reindex of the final file. The fast path is a pure optimization;
 //! on truncation or a rewritten head it must fall back to a full parse.
 
+// Exercise retained low-level storage and tail-parser compatibility guarantees.
+#![allow(deprecated)]
+
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::Path;
@@ -219,9 +222,10 @@ fn prime_agent_tail_matches_full() {
 
 /// All sessions, no filtering (for `list_recent`).
 fn all_sessions() -> SearchFilters {
-    SearchFilters {
-        limit: 100,
-        ..SearchFilters::default()
+    {
+        let mut value = SearchFilters::default();
+        value.limit = 100;
+        value
     }
 }
 
@@ -621,9 +625,10 @@ fn claude_message_line(content: &str) -> String {
 
 fn message_contents(db: &Db) -> Vec<String> {
     db.read_session_messages(
-        &MessageFilters {
-            session_id: Some("claude:integrity-sess".to_string()),
-            ..MessageFilters::default()
+        &{
+            let mut value = MessageFilters::default();
+            value.session_id = Some("claude:integrity-sess".to_string());
+            value
         },
         ai_session_search::db::MessageOrder::OldestFirst,
     )
@@ -767,27 +772,23 @@ fn claude_desktop_sidecar_change_refreshes_without_audit_append() {
     assert_eq!(first.title.as_deref(), Some("Old Title"));
     assert_eq!(first.cwd.as_deref(), Some("/tmp/old"));
     assert_eq!(
-        db.search_messages(
-            "",
-            &MessageFilters {
-                providers: Some(vec![ai_session_search::models::Provider::ClaudeDesktop,]),
-                ..MessageFilters::default()
-            },
-        )
-        .unwrap()
-        .len(),
+        db.search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.providers = Some(vec![ai_session_search::models::Provider::ClaudeDesktop]);
+            value
+        },)
+            .unwrap()
+            .len(),
         1
     );
     assert_eq!(
-        db.search_messages(
-            "",
-            &MessageFilters {
-                providers: Some(vec![ai_session_search::models::Provider::Claude]),
-                ..MessageFilters::default()
-            },
-        )
-        .unwrap()
-        .len(),
+        db.search_messages("", &{
+            let mut value = MessageFilters::default();
+            value.providers = Some(vec![ai_session_search::models::Provider::Claude]);
+            value
+        },)
+            .unwrap()
+            .len(),
         0,
         "claude-desktop messages must not be returned by provider=claude"
     );

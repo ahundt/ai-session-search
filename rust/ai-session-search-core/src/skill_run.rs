@@ -18,11 +18,23 @@ use crate::skill_catalog::{SkillName, SkillSelector};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillRunQuery {
     pub skill: SkillSelector,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<MessageClassificationDefinition>,
     pub input: SkillCapabilityInput,
+}
+
+impl SkillRunQuery {
+    /// Run `input` with the selected skill's own classification rules.
+    pub fn new(skill: SkillSelector, input: SkillCapabilityInput) -> Self {
+        Self {
+            skill,
+            definition: None,
+            input,
+        }
+    }
 }
 
 /// Direct executable message-classification rules for the selected skill.
@@ -31,8 +43,20 @@ pub struct SkillRunQuery {
 /// identity. Supplying this value replaces only its adjacent `aise-capability.toml` rules for one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageClassificationDefinition {
     pub categories: Vec<CorrectionCategorySpec>,
+}
+
+impl MessageClassificationDefinition {
+    /// Classify with `categories`, evaluated in order; the first category whose patterns match
+    /// a message is the one reported.
+    ///
+    /// The run that uses this definition rejects an empty list, a repeated category name, a
+    /// category without patterns, and a pattern that is invalid or matches empty text.
+    pub fn new(categories: Vec<CorrectionCategorySpec>) -> Self {
+        Self { categories }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,19 +66,37 @@ pub struct MessageClassificationDefinition {
     rename_all = "kebab-case",
     deny_unknown_fields
 )]
+#[non_exhaustive]
 pub enum SkillCapabilityInput {
     MessageClassification(MessageClassificationQuery),
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageClassificationQuery {
+    /// Which messages are classified. The default selects every message and returns every
+    /// match (`limit` 0); the command line applies `[analytics].corrections_limit` (50) when
+    /// `--limit` is omitted.
     pub filters: MessageFilters,
+    /// More installed skill packages whose categories run beside the selected one. Empty (the
+    /// default) runs only the selected skill.
     pub additional_skills: Vec<SkillSelector>,
+    /// Also classify messages typed while the agent was working whose transcript does not
+    /// record who sent them. Default false: such a message may have been sent by a program, so
+    /// it is left out and counted in `MessageClassificationReport::unattributed_input_count`.
+    pub include_unattributed_input: bool,
 }
+
+chainable_setters!(MessageClassificationQuery {
+    with_filters(filters: MessageFilters) value;
+    with_additional_skills(additional_skills: Vec<SkillSelector>) value;
+    with_include_unattributed_input(include_unattributed_input: bool) value;
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillRunReport {
     pub requested_selector: SkillSelector,
     pub resolved_skill: ResolvedSkillReceipt,
@@ -68,12 +110,14 @@ pub struct SkillRunReport {
     rename_all = "kebab-case",
     deny_unknown_fields
 )]
+#[non_exhaustive]
 pub enum SkillCapabilityOutput {
     MessageClassification(MessageClassificationResult),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageClassificationResult {
     /// Receipt for the primary selected skill's compiled classification policy.
     ///
@@ -86,6 +130,7 @@ pub struct MessageClassificationResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct ResolvedSkillReceipt {
     pub name: SkillName,
     pub package_version: Option<String>,
@@ -95,6 +140,7 @@ pub struct ResolvedSkillReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum SelectedSkillLocation {
     Embedded,
     Path { canonical_skill_md: PathBuf },
@@ -102,6 +148,7 @@ pub enum SelectedSkillLocation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+#[non_exhaustive]
 pub enum CapabilityExecutionSource {
     Embedded,
     Path { canonical_capability_toml: PathBuf },
@@ -197,6 +244,8 @@ mod tests {
                     match_end_char_exclusive: 8,
                     content: "Actually, use the other command.".to_string(),
                 }],
+                unattributed_input_count: 0,
+                unattributed_input_included: false,
             },
         };
 
@@ -225,7 +274,9 @@ mod tests {
                         "match_start_char": 0,
                         "match_end_char_exclusive": 8,
                         "content": "Actually, use the other command."
-                    }]
+                    }],
+                    "unattributed_input_count": 0,
+                    "unattributed_input_included": false
                 }
             })
         );

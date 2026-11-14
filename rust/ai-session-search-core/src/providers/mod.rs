@@ -68,7 +68,7 @@ pub(crate) fn walk_roots(roots: &[PathBuf], max_depth: Option<usize>) -> WalkDis
         }
         for entry in builder.build() {
             match entry {
-                Ok(entry) => match entry.metadata() {
+                Ok(entry) => match discovery_metadata(&entry) {
                     Ok(metadata) => entries.push(DiscoveredPath {
                         root: root.clone(),
                         path: entry.into_path(),
@@ -85,6 +85,24 @@ pub(crate) fn walk_roots(roots: &[PathBuf], max_depth: Option<usize>) -> WalkDis
         }
     }
     WalkDiscovery { entries, warnings }
+}
+
+fn discovery_metadata(entry: &ignore::DirEntry) -> std::result::Result<Metadata, ignore::Error> {
+    // Windows directory enumeration can retain the old size while a transcript writer keeps
+    // its handle open. Query the file itself before deciding whether indexing can skip it.
+    // `fs::metadata` requests no read access, so a writer that denies read sharing cannot
+    // make discovery fail.
+    // https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findfirstfilew
+    #[cfg(windows)]
+    if entry.file_type().is_some_and(|kind| kind.is_file()) {
+        return live_file_metadata(entry.path()).map_err(ignore::Error::Io);
+    }
+    entry.metadata()
+}
+
+#[cfg(any(windows, test))]
+fn live_file_metadata(path: &Path) -> std::io::Result<Metadata> {
+    std::fs::metadata(path)
 }
 
 fn path_warning(
@@ -116,5 +134,34 @@ pub(crate) fn malformed_jsonl_warning(count: usize) -> Option<String> {
         0 => None,
         1 => Some("skipped 1 malformed JSONL record".to_string()),
         count => Some(format!("skipped {count} malformed JSONL records")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn discovery_observes_appends_before_the_writer_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, "first\n").unwrap();
+        let before = live_file_metadata(&path).unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"second\n").unwrap();
+        assert_eq!(live_file_metadata(&path).unwrap().len(), before.len() + 7);
+        let discovery = walk_roots(&[dir.path().to_path_buf()], None);
+        assert!(discovery.warnings.is_empty());
+        let found = discovery
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap();
+        assert_eq!(found.metadata.len(), before.len() + 7);
+        drop(writer);
     }
 }

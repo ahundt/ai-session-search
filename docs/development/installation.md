@@ -73,7 +73,7 @@ one only when a `--version` requirement asks for it. You never need to name a ve
 pre-release; name one to install a specific release.
 
 None of these commands creates aliases, registers MCP servers, writes managed Markdown or skills,
-or installs client hooks. `aise integrations install` does all of that, and it points at the
+or reads transcripts. `aise integrations install` creates the integrations and starts indexing, and it points at the
 package-owned executable rather than copying it.
 
 After any installation method, register the same `aise` executable with detected
@@ -113,10 +113,9 @@ uv tool install ai-session-search && aise integrations install
 cargo install ai-session-search --locked && aise integrations install
 ```
 
-They stay two steps on purpose. `aise integrations install` runs only if the package install
-succeeded, so a failing package manager edits no client files, and keeping it a separate command
-is what gives it dry-run, status, per-client selection, durable recovery, and ownership-safe
-uninstall.
+The two commands stay separate so `aise integrations install` runs only if the package install
+succeeded. A failing package manager edits no client files. The separate integration command
+provides dry-run, status, per-client selection, durable recovery, and ownership-safe uninstall.
 
 ### Which executable the installer registers
 
@@ -147,6 +146,15 @@ Cursor receives `type: "stdio"` under `mcpServers` in `~/.cursor/mcp.json`, as r
 [its STDIO field reference](https://cursor.com/docs/mcp#stdio-server-configuration). The
 post-upgrade refresh adds the field to earlier untyped aise registrations, keeping their
 executable path and file comments. Other clients using `mcpServers` keep their own entry format.
+
+Antigravity App/IDE and CLI share the current
+`~/.gemini/config/mcp_config.json` while the installer also maintains the two legacy Antigravity
+MCP locations for older harness versions; they use distinct skill roots and share managed
+`~/.gemini/GEMINI.md` instructions with Gemini. OpenCode uses `mcp.servers.ai-session-search`
+with `type: "local"` in `~/.config/opencode/opencode.json`, the layout
+[OpenCode 2 reads](https://opencode.ai/docs/mcp-servers/), and a managed block in
+`~/.config/opencode/AGENTS.md`. Reinstall moves an entry an earlier aise wrote directly under
+`mcp`, which OpenCode 2 ignores.
 
 ### Instruction files and hooks
 
@@ -195,9 +203,10 @@ selected discovery directory; shared destinations are deduplicated. Use repeatab
 `--skill-root DIR` for one or more exact additional package destinations. Each custom directory
 must end in `ai-session-search`; it names a package directory, not a file inside one.
 
-Nothing you edited is overwritten. A modified file, an extra user file, an unmanaged directory, or
-a retargeted link is preserved and reported instead. Pass `--dry-run` to see every planned write
-and removal before anything changes.
+For skill, marketplace, and instruction content, a modified file, an extra user file, an unmanaged
+directory, or a retargeted link is preserved and reported. An explicit `aise integrations install`
+rewrites the named MCP entry, including customized launch arguments. Pass `--dry-run` to see every
+planned write and removal before anything changes.
 
 Reinstall replaces a prerelease copied harness package with a discovery
 link only when the old copy is provably app-managed and untouched. Uninstall removes a discovery
@@ -223,10 +232,40 @@ for the target platform, because SQLite is built from bundled C.
 
 ## Update and uninstall
 
-Before upgrading an index used by 1.0.0, **stop running aise processes (restart harnesses)**.
-The 1.0.1 generation-6 promotion blocks fresh 1.0.0 data opens, but cannot revoke a writer that
-already opened the index. Keep the promoted archive if downgrading; 1.0.0 needs a separate
-generation-5 snapshot, which omits any history archived after that snapshot.
+Before upgrading an index 1.0.0 uses, **stop running aise processes (restart harnesses)**. 1.1.0
+moves the index to generation 6 on first writable open. A newly started 1.0.0 refuses it, but a
+1.0.0 process that already has it open can delete the history 1.1.0 keeps from shrunk, rewritten, or
+deleted transcripts.
+
+To downgrade, stop every aise process, then:
+
+```bash
+set -euo pipefail
+# The index 1.1.0 uses, before anything moves.
+DB="$(aise config paths --format json | python -c 'import json, sys; print(json.load(sys.stdin)["database"])')"
+# Refuse every old archive name before moving any file, including dangling symlinks.
+for f in "$DB" "$DB-wal" "$DB-shm"; do
+  if [ -e "$f.from-1.1.0" ] || [ -L "$f.from-1.1.0" ]; then
+    echo "Archive already exists: $f.from-1.1.0" >&2; exit 1
+  fi
+done
+BACKUP="$DB.from-1.1.0"
+mkdir "$BACKUP" || exit 1
+# A failed move stops the downgrade; keep both locations until it is resolved.
+for f in "$DB" "$DB-wal" "$DB-shm"; do
+  if [ -e "$f" ]; then mv "$f" "$BACKUP/" || exit 1; fi
+done
+uv tool install --force 'ai-session-search==1.0.0'   # or your package manager's command below
+aise --database "$DB" reindex --full                 # rebuild at the same path from the transcripts
+```
+
+Name the path for the rebuild: with the file moved, 1.0.0 could otherwise resolve its default to a
+different directory. 1.0.0 loads the config and integration state 1.1.0 leaves. History that only
+1.1.0 kept stays in the `$BACKUP` directory. The recipe refuses existing archives before moving
+anything; choose a new backup name or preserve the earlier archive elsewhere before retrying.
+If a move fails, stop and inspect both locations before proceeding. After upgrading again and
+stopping every aise process, move the rebuilt index and its WAL files to a separate backup before
+restoring the retained files to their original paths.
 
 Use the same owner for installation, update, and removal. Before removing a
 global command, remove its MCP registrations while the command is still
@@ -267,14 +306,19 @@ workflow.
 Upgrading is one command whichever manager owns `aise`, and nothing else needs rerunning: MCP
 registrations and aliases name the executable path, not its version. The first command after the
 version changes, `aise integrations status` and `aise mcp serve` included, runs a conservative
-refresh once. It rewrites owned skill files that still match what aise recorded, visiting only
-roots in the install manifest, and replaces an aise instruction block in a harness's CLAUDE.md,
+refresh once. An empty check is also recorded beside the install manifest, so later commands
+skip harness discovery until the next version. If that marker cannot be written, commands still
+succeed and retry the check later. It rewrites owned skill files that still match what aise recorded,
+visiting only roots in the install manifest, and replaces an aise instruction block in a harness's CLAUDE.md,
 AGENTS.md, or GEMINI.md in place, as long as that block still holds text some release wrote. An
 edited file or block is left alone and reported on stderr.
 
-The recorded skill is the refresh's evidence that aise installed integrations for this
-configuration. An install made with `--no-skill` therefore gets no automatic refresh, and
-instruction files added with `--claude-md`, `--agents-md`, or `--gemini-md` are not visited;
+Recognized MCP launch registrations refresh even for OpenCode-only or `--no-skill` installs,
+preserving their executable and launch arguments without installing a skill. Automatic migration
+leaves a client's configuration unchanged if a duplicate aise server key has an unrecognized
+launch contract; `aise integrations status` reports it as stale. Skill and instruction
+refresh still require a recorded skill installation. Instruction files added with `--claude-md`,
+`--agents-md`, or `--gemini-md` are not visited;
 rerun `aise integrations install` for those. Commands that install or remove integrations
 themselves skip the refresh. `aise integrations status --format json` reports each integration
 with a `current` field for scripts. Turn the automatic refresh off with:
@@ -322,6 +366,10 @@ either alias path when that path is not an owned symbolic link, and `--no-mcp`,
 
 An ownership marker in `SKILL.md` gates the whole skill directory, so a tree is never left half
 overwritten and half refused.
+Codex marketplace files and the named marketplace registration have a separate
+`codex-marketplace.install-manifest.json` ownership record beside the aise config. Reinstall refuses
+to replace edited or unrecorded marketplace content; uninstall preserves that marketplace and its
+registration together. Inspect or move the conflicting content before reinstalling.
 An unmanaged file at a selected destination stops the entire preflight before MCP, instruction, or
 skill files are published, and the error names the conflicting path and the `--skill-root`
 alternative.
@@ -334,7 +382,7 @@ claims to know whether a change was an intentional edit or corruption, because n
 carries that intent.
 
 Uninstall removes a skill directory only when every managed file is exactly what install recorded
-and nothing else lives in it. Any other state preserves the WHOLE directory and reports each
+and nothing else lives in it. Any other state preserves the whole directory and reports each
 reason: removing an unchanged `SKILL.md` while leaving your edited `aise-capability.toml` would orphan
 your file behind a skill that no longer declares itself. `--force-full-cleanup` deletes everything
 under one exact `--skill-root`, including files you wrote; it requires that root, refuses
@@ -481,57 +529,8 @@ cargo install ai-session-search \
   --locked
 ```
 
-## Maintainer acceptance contract
-
-The integration acceptance matrix covers Claude Code/Desktop, ChatGPT Codex desktop and Codex
-CLI/IDE, Gemini CLI, **Antigravity App/IDE/CLI**, **Pi**, **Prime Agent**, Cursor, Windsurf, VS
-Code, Zed, **OpenCode**, OpenClaw, and KiloCode. Each target must pass
-install, content-aware status, byte-idempotent reinstall, dry-run, and ownership-safe uninstall
-tests. Pi and Prime Agent acceptance includes strict-JSON MCP registration, MCP-first guidance,
-native skill discovery, managed `AGENTS.md`, explicit selection, status, idempotent reinstall,
-dry-run, and ownership-safe uninstall. Antigravity App/IDE and CLI share the current
-`~/.gemini/config/mcp_config.json` while the installer also maintains the two legacy Antigravity
-MCP locations for older harness versions; they use distinct skill roots and share managed
-`~/.gemini/GEMINI.md` instructions with Gemini. OpenCode uses `mcp.servers.ai-session-search`
-with `type: "local"` in `~/.config/opencode/opencode.json`, the layout
-[OpenCode 2 reads](https://opencode.ai/docs/mcp-servers/), and a managed block in
-`~/.config/opencode/AGENTS.md`. Reinstall moves an entry an earlier aise wrote directly under
-`mcp`, which OpenCode 2 ignores.
-
-Maintainers install from a repository checkout with
-`sh scripts/install-native.sh --bin-dir DIR`; the packaged archive ships the same script as
-`install.sh`.
-
-The canonical repository URL is `https://github.com/ahundt/ai-session-search`. Keep it equal to
-`project.urls.Repository` in `pyproject.toml` and `workspace.package.repository` in `Cargo.toml`;
-installation documentation must not introduce a second repository identity. When a harness
-changes its configuration syntax or security guidance, update this guide, the CI workflow, and
-the installer acceptance tests in the same commit.
-
-CI checks direct-Git installation without depending on GitHub availability. It
-uses the checked-out repository as a `file://` remote and `$GITHUB_SHA` as the
-immutable revision, then verifies pip, `uv add`, `uv tool install`, `uvx`, and
-`cargo install --git`. The Python acceptance harness is reusable locally:
-
-```bash
-uv run --isolated --no-project python scripts/verify_python_install_methods.py \
-  --git-url "file://$(git rev-parse --show-toplevel)" \
-  --git-rev "$(git rev-parse HEAD)" \
-  --source-root "$(git rev-parse --show-toplevel)" \
-  --timeout-seconds 600
-```
-
-The harness deliberately accepts the repository and revision as parameters. It
-rejects mutable or abbreviated revisions, insecure HTTP, embedded credentials,
-and relative local paths. Temporary virtual environments, tool installations,
-configuration, and application caches are scoped to one temporary root and removed
-on success or failure. The harness deliberately inherits the caller's content-addressed
-uv cache and `CARGO_TARGET_DIR`: normal standalone invocations reuse uv's platform cache,
-while `run_ci_local.sh` selects the workspace `target` directory. Set either environment
-variable explicitly to use a different shared cache; the harness never deletes it.
-
-On `No space left on device`, reclaim with `cargo clean`, or `cargo clean -p <package>`. Never
-delete `$CARGO_HOME` or uv's shared cache to recover space.
+Rules for changing the installer, its acceptance tests, and the install documentation are in
+[installer and configuration maintainer contracts](maintainer-contracts-for-install-and-config.md).
 
 ## Primary references
 

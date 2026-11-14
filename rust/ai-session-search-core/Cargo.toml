@@ -1,9 +1,9 @@
 [package]
 name = "ai-session-search"
-version = "1.0.1"
+version = "1.1.0"
 edition = "2021"
 rust-version.workspace = true
-description = "Local-first search, inspection, export, recovery, and MCP recall across supported AI coding-agent sessions."
+description = "Search and recover local AI coding-agent session history from Claude Code, Codex, Gemini CLI, Cursor, and five more tools via CLI, MCP server, Python, or Rust"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -22,8 +22,8 @@ include = [
     "src/**",
     "tests/**",
 ]
-keywords = ["cli", "search", "claude", "codex", "cursor"]
-categories = ["command-line-utilities", "development-tools"]
+keywords = ["claude-code", "codex", "mcp", "history", "coding-agent"]
+categories = ["command-line-utilities", "development-tools", "artificial-intelligence"]
 
 [dependencies]
 anyhow = "1.0"
@@ -33,7 +33,7 @@ crossterm = "0.29"
 dirs = "7.0"
 edtf = { version = "0.2.0", features = ["chrono"] }
 fd-lock = "4.0"
-file-id = "0.2.3"
+file-id = { version = "0.2.3", features = ["serde"] }
 fuzzy-matcher = "0.3"
 ignore = "0.4"
 interim = { version = "0.2.1", features = ["chrono_0_4", "jiff_0_2"] }
@@ -98,3 +98,7 @@ path = "src/main.rs"
 rmcp = { version = "3.4.0", default-features = false, features = ["client", "server", "transport-async-rw"] }
 tempfile = "3.23"
 tokio = { version = "1.48", features = ["io-util", "rt-multi-thread", "time"] }
+
+[lints.clippy]
+exhaustive_structs = "warn"
+exhaustive_enums = "warn"

@@ -152,7 +152,7 @@ administrator" text when the system has more specific context. Errors remain bou
 secrets, but preserving actionability takes priority over shaving a few diagnostic bytes.
 
 A condition that clears without anyone changing the checkout is reported as waiting, not as failed.
-Exhausted storage is the case in hand: free space returns when a person or another program releases
+When storage is exhausted, free space returns when a person or another program releases
 it, which can take minutes or days, so the automatic index refresh reports `postponed` with a retry
 interval and states that the last completed snapshot remains intact. A one-shot detached child and
 an idle MCP worker own no retry timer, so status must not promise that work resumes merely because
@@ -185,13 +185,13 @@ describe current source behavior, not a timeless latency guarantee.
 
 | Key surface | Current time bound | Current peak/retained memory | Latency, output, and regression guard |
 | --- | --- | --- | --- |
-| Provider discovery and indexing | Discovery `O(F)`; incremental parse/index `O(B_new)`; full rebuild `O(B_all)` | Discovery retains `O(F)` source metadata. A full provider parse currently retains normalized messages, transcript lines, file edits, and the joined transcript for one source, so peak growth is `O(B_session)`; custom trigram rebuild is `O(B + P)`. | Benchmark cold and incremental refresh separately. The existing 40 MiB fixture guards full versus incremental time. Measure peak RSS and cancellation latency before claiming a lower parser bound; trigram rebuild remains another known peak-memory cliff. |
+| Provider discovery and indexing | Discovery `O(F)`; incremental source parse `O(B_new + overlap)` with at most 1 MiB overlap; [whole-source fallbacks](../../skills/ai-session-search/references/search-costs-and-receipts.md#per-operation) `O(B_all)`; persistence also counts stored session messages and copies stored transcript bytes; full rebuild `O(B_all)` | Discovery retains `O(F)` source metadata. A full provider parse currently retains normalized messages, transcript lines, file edits, and the joined transcript for one source, so peak growth is `O(B_session)`; custom trigram rebuild is `O(B + P)`. | Benchmark cold and incremental refresh separately. The existing 40 MiB fixture guards full versus incremental time. Measure peak RSS and cancellation latency before claiming a lower parser bound; trigram rebuild remains another known peak-memory cliff. |
 | Session list, resolve, and focused read | Session-span filtering is worst-case `O(R)` constant-time comparisons; favorable indexed list is `O(log N + O + K)` because current paging uses SQL `OFFSET`, while a planner-selected temporary sort is conservatively `O(R log R + O + K)`; zero-limit list is `O(R)` plus any sort; focused read is `O(log M + K)` after resolution; current partial-ID resolution is `O(N)` | `O(K + D_K)` returned rows plus SQLite cache/temp-sort memory; overlap itself adds `O(1)` application memory | Date bounds use closed overlap: known start <= query end and known end >= query start. Do not call list paging keyset-based. Track offset skipping, query plans, and the known case-insensitive `LIKE` session-resolution scan; never hide work behind a small output page. |
 | Exact and regex message search | Indexed safe candidates plus authoritative verification `O(P_Q + C + verified bytes)`; unsafe/no-literal regex worst case `O(B)` | Finite page `O(W + D_W + evidence bytes)`; explicit all-results `O(N + D_K + evidence bytes)` | Row-count bounds alone do not bound retained text bytes. Content and JSON-stable tool-argument anchors reuse schema-v4's raw-content trigram superset; RFC 6901 projection and matching remain authoritative. Context is fetched for retained hits in one batched statement, not N+1 queries. |
 | Fuzzy message search | `O(B + N + W log W)` aggregate work | `O(D_A + D_W + D_max + J × Q + evidence bytes)`; retained row count is corpus-independent for finite `W`, but text bytes are not | Score the complete eligible corpus in bounded parallel batches, compact retained top-K deterministically, and reject unbounded fuzzy requests. Tool-argument projection is exhaustive because subsequence matches have no required contiguous trigram. Benchmark exact/regex/fuzzy across content, tool name, and tool arguments, including giant rows. |
 | Session search | `O(R + B × (Q + 1) + N + K log K)` aggregate work for positive `K`; session-span overlap rejects rows before transcript scoring | `O(K + D_K + batch_budget + D_max)`; overlap adds `O(1)` application memory; explicit all-results makes `K` the number of matches | Bounded batches score on the application worker runtime, but SQLite traversal and global top-K remain serial. A result limit bounds retained hits, not corpus scoring. Preserve deterministic order and compare Rust, Python, CLI, and MCP eligible-ID and ordered-result digests as appropriate. |
 | Context and presentation | Context DB/output work `O(K × (before + after + 1))`; evidence/window formatting proportional to retained text | Same order as returned context/evidence | Batch enrichment after page selection. Presentation budgets must not trigger a second corpus scan or change membership/page identity. |
-| Message-search receipt (`receipt_level=summary` or `full`) | Adds the `corpus` denominator, computed by `Db::filtered_corpus_count` as `count(rows the structural filters admit)` minus `count(the same rows restricted to the excluded classes)`, so no statement tests `kind != ...` against message rows. Time `O(F + E)` index entries: `F` rows matched by the selected filter family's own index (`count(*)` with no filter walks the smallest index of `messages`), `E` rows of the excluded classes read from the partial covering index `idx_messages_excluded_kinds` (`(kind, role, provider, session_id, ts, tool_name) where kind in ('compaction', 'harness_notice')`, 2 % of rows). Measured 2026-08-15 on the 22.6 GB, 2.69 M-message index: the former single `kind != ?` statement read every row page in 116.9 s (14 s sys); the replacement's first term reads the 80 MB `idx_messages_ts` in 3.3-5.9 s cold, 0.15 s with `--role`, 1.1 s with a provider, and the second term an index of ~56 K entries (the 995 K-entry `idx_messages_tool_calls` analog counts in 2.35 s cold). Explicit `kinds` outside the excludable set still count by row scan, `O(N)` row pages, stated in the MCP description and skill. | `O(1)` application memory beyond the search; the partial index adds ~6 MB on this index and one build pass | The partial index is deliberate: a whole-table index leading with `kind` displaced the ordered `idx_messages_tool_calls` and `idx_messages_session_seq` walks for `kind = 'tool_call'` and `--kind` searches with a seek plus temp B-tree sort when checked with `explain query plan` against a replica of the production schema and `sqlite_stat1`; a partial index is usable only when the statement text implies its `where` clause (`Db::excluded_kinds_predicate` renders the one clause both DDL and count use), so no other statement can select it. Built by `Db::ensure_message_kind_index` at open only while `messages` is empty and otherwise once by the elected refresh writer at the start of `reindex_until`, so a query process never pays the build and peers stay on WAL reads. Plan tests: `corpus_count_statements_are_served_from_covering_indexes` (nine filter families), `corpus_count_equals_the_naive_count_for_every_class_predicate`, `refresh_builds_the_message_kind_index_an_older_aise_did_not_create`. Deferred after 1.0.0rc2, each with its measurement: `sqlite_stat1` on the maintainer's index dates from a 622,983-row table (2.69 M today), so planner estimates are stale and `pragma optimize` at the end of a refresh is the candidate fix; an explicit `--kinds` set outside the excludable classes still counts by row scan; a `--tool` filter's search statement could let the partial `idx_messages_tool_name` serve it by stating `tool_name is not null`, whose effect on the ordered `session_id, seq` walk is unmeasured. |
+| Message-search receipt (`receipt_level=summary` or `full`) | Adds a corpus count over structural filters. Safe excluded-kind counts use a partial covering index; other kind sets can scan eligible rows. | Constant application memory beyond the search; indexes require storage and writer maintenance. | `corpus_count_statements_are_served_from_covering_indexes` checks plans; `corpus_count_equals_the_naive_count_for_every_class_predicate` checks membership. |
 | Skill capabilities and analysis | Skill name resolution `O(K_s × N_s)`; classification/analysis scales with selected source-attributable human bytes × applicable `Q`; repeat mining additionally enumerates phrases from those bytes; MCP presentation adds `O(D + V)` per returned match; relationship graph `O(N log N + E log E)` | Catalog metadata excludes instruction bodies; classification and repeats may materialize the eligible human slice; MCP retains bounded view bytes `O(V)` per returned match while Rust/Python/CLI programmatic results intentionally retain complete selected messages | Bound capability documents by declared bytes, classify only source-authoritative original human text (including only human fragments of mixed messages), preserve exact message/match coordinates, and budget only MCP delivery unless a caller explicitly requests `detail=full`. Benchmark classification separately from catalog resolution. Never introduce all-pairs graph comparison. |
 | File recovery and export | File reconstruction `O(E + L)`; full export/publish proportional to selected transcript bytes | One-pass reconstruction `O(L)`; full document export can retain `O(L)` | Preserve the one-pass reconstruction invariant. Use streaming formats for large exports when possible and report whether output is complete. |
 | Read-only SQL | Query work is determined by the SQL plan, worst case `O(R)` scanned rows; response offset/limit is applied after execution | Returned rows and cell payloads are bounded only by explicit `limit`/`max_cell_chars`; SQLite cache is separate | Prefer SQL `LIMIT` for expensive queries. Native and MCP elapsed timeout defaults are zero/disabled in current source; a configured timeout is an explicit availability guard, not a search default. |
@@ -233,11 +233,23 @@ indexes, configuration, user edits, unrelated client settings, and uncommitted r
 Destructive cleanup requires an exact target and explicit authorization.
 
 The index is a session-history archive. A source shrink or rewrite under the same parser retains
-stored messages and file edits absent from the new parse. A parser transition may correct message
-metadata only when every stored content occurrence and file-edit operation remains represented;
-otherwise refuse the session transaction atomically, including session identity and checkpoint
-updates. Content occurrences are counted, so repeated text cannot stand in for missing evidence.
-Preserve the prior index and sources until a parser can represent the archived evidence.
+stored messages and file edits absent from the new parse. A parser transition repairs each stored
+row it matches (native correlation identity first, role and content for legacy rows), retains
+archive-only rows, and appends parse-only rows after the highest stored sequence when archive-only
+rows remain. With no archive-only rows, messages and file edits follow the current parser’s source
+order. Matches are counted, so repeated text cannot stand in for a missing occurrence.
+
+Tail parsing checks both the head fingerprint and overlap digest. An older build's checkpoint
+without a digest, a parser-version change, changed overlap bytes, or an appended record that
+changes an indexed row requires a full parse. Queued Claude delivery through an attachment or directly after dequeue
+needs at most one full parse per delivery; queue records that only add rows stay incremental.
+Linked Claude interactive answers, Codex `request_user_input` responses, and Codex
+`thread_settings_applied` records closing fork replay can also require earlier context.
+Rewrites between the head and overlap remain undetected by refresh; use `aise reindex --full`.
+Codex fork reconciliation checks each fork's own edits through its session index; a parent edit
+reparses a fork only when that fork holds a matching edit.
+The optional digest column is added on writable open within generation 6; read-only opens
+also accept older layouts without it.
 
 Index compatibility uses three independent controls. Generation 6 fences executables that predate
 archive preservation; the healthy generation 5 to 6 promotion inserts only compatibility metadata
@@ -271,16 +283,22 @@ Rust, Python, CLI, and MCP must route message search and deterministic capabilit
 typed service requests and responses. Adapters translate surface syntax and serialization; they
 must not independently redefine matching, ordering, filtering, paging, or completeness.
 
+Keep familiar tasks on existing selectors. A distinction in provider storage is not sufficient
+reason for another public parameter, response field, enum or workflow step. Reuse canonical
+requests and existing evidence/read surfaces; require a concrete user benefit for added exposure.
+
 ### REQ003-preserve-surface-semantics
+
+Python retains `search_sessions("")` for compatibility and emits `DeprecationWarning` naming
+`list_sessions()` as the replacement. The CLI rejects empty ranked queries. This temporary
+surface difference preserves published Python calls during deprecation rather than removing an
+accepted argument value in a minor release.
 
 Intentional defaults are part of the API:
 
-| Surface | Omitted literal, regex, or queryless message-search limit | Rationale |
-| --- | --- | --- |
-| Rust | All results when no purpose or operation default applies | Programmatic callers control consumption |
-| Python | All results when no purpose or operation default applies | Programmatic callers control consumption |
-| CLI | All results when no purpose or operation default applies | Output can be redirected, piped, filtered, or explicitly limited |
-| MCP | Configured finite page; currently 15 by default | Tool results enter an agent context directly, and the page is sized so an ordinary call lands near half of `[mcp].max_tool_result_chars` |
+The [generated caller reference](../README.md#generated-message-search-caller-contract) owns the
+surface defaults and their precedence. MCP supplies a finite page because results enter model
+context; unbounded programmatic results preserve explicit caller control.
 
 Every surface accepts an explicit positive page size. `all_results` states a complete-corpus request
 explicitly for literal, regex, or queryless search. Fuzzy search always requires finite retention
@@ -290,11 +308,29 @@ deliberately supply a finite operation-level default before the surface default 
 This distinction applies to result membership. Separate presentation windows may shorten displayed
 content without removing a result.
 
+MCP `get_session` and message search use `detail=compact|full` for character presentation.
+`get_session.response_format=concise|detailed` remains an accepted deprecated alias with matching
+values; conflicting simultaneous settings fail. MCP describes deprecation in the schema and
+keeps stderr silent. Neither spelling changes message membership or the signed line window.
+
+MCP focused reads use `seq`; `message_seq` remains accepted with a schema deprecation notice,
+and conflicting simultaneous values fail. Search result references keep `message_ref.message_seq`.
+CLI `messages get`, MCP focused reads, Python and Rust accept independent before/after context
+counts; each explicit side overrides the symmetric `context` radius without changing the anchor.
+
 ### REQ004-separate-retrieval-presentation
 
 Line windows, field-view limits, match-view budgets, response formats, and whitespace
 presentation must never change matching, ranking, hit membership, context membership, result count,
 offsets, next-page identity, classification categories, or policy digests.
+
+Text windows do not bound metadata. Emitting full content-part arrays with each ordinary search
+hit made even compact, one-hit MCP calls exceed the result ceiling. Ordinary hits therefore carry
+a bounded source header while the index retains full partitions and correlation identity. Apply
+the same constraint to capability matches and receipts: measure total serialized output, preserve
+required evidence and classification results, and do not hide excess payload by dropping matches
+or raising client limits. Capability-definition input limits protect parsing; they do not bound
+the output. Recheck both emitted schemas and actual result size after any public-surface change.
 
 `lines_per_message` uses one sign convention:
 
@@ -345,15 +381,6 @@ already emitted under that name**. Adding an optional field does not increment i
 reading by name is unaffected, and spending an increment on an addition teaches consumers to ignore
 the signal.
 
-Before the first published release the version does not move at all, and the reason is that the
-signal has no recipient: an increment tells an existing consumer to re-read the contract, and until
-a release exists there is none. Reshaping the response is therefore cheap now and expensive later,
-which is an argument for taking deliberate shape changes before publishing rather than after. What
-a pre-release reshape still owes is the lockstep edit above, because the `outputSchema` is closed
-and two tests validate it against live responses. This paragraph becomes binding at the first
-published release; the rule itself does not change at that point, only the set of consumers it
-protects.
-
 ### REQ007-preserve-page-identity
 
 Evidence generation, context enrichment, reference extraction, formatting, and presenter failures
@@ -377,7 +404,10 @@ accepts, under the index tokenizer's own case folding, which differs from the ve
 tokenizer folds a character differently (`trigram::FTS5_UNFOLDED_LOWERCASE`, U+0130), the
 prefilter leaves that position out rather than requiring a trigram that excludes matching rows;
 `the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes that set from the
-linked SQLite.
+linked SQLite and the compiling Rust toolchain's `char::to_lowercase` mappings. Literal matching
+uses those same Rust mappings, so its Unicode version follows the compiler; regex case matching
+uses the locked regex dependency's Unicode tables. The exclusion table retains the union needed
+by supported compilers, including entries an older compiler does not yet recognize.
 
 `max_hits_per_page` and `max_context_neighbors_per_hit` are policy ceilings: an oversized resolved
 request errors. They do not silently clamp the request. Explicit `all_results` is not a finite page
@@ -490,7 +520,7 @@ Native install receipts may ignore additive metadata but still require the suppo
 package identity, target/version evidence, and executable hash; unknown metadata grants no authority.
 
 The immutable 1.0.0 skill-manifest reader rejects unknown top-level keys and silently drops unknown
-nested keys on rewrite. A 1.0.1 reader cannot restore fields an older writer already discarded.
+nested keys on rewrite. A 1.1.0 reader cannot restore fields an older writer already discarded.
 Background status is weaker evidence: unknown optional failure details become unclassified, while
 an unknown refresh state remains unknown and must never be reported as successful.
 
@@ -548,29 +578,31 @@ canonical records rather than adapter-specific response models.
 Do not add a second parser for an opaque or duplicative database without evidence that it contains
 unique supported data.
 
-Authorship for a user turn comes from structural evidence: a per-message origin marker where the
-format has one (Antigravity's `USER_EXPLICIT`), otherwise the session's own start (Claude, Codex,
-Cursor, Pi: a session nothing spawned is a person's, a spawned run's user turns are the caller's
-delegation). Google AI Studio and Gemini CLI store one person-started chat per file with no spawn
-concept, so their user turns resolve to human by that same session-level evidence; the Gemini CLI
-adapter first sets aside the `functionResponse` echoes the API writes as user turns and records
-`toolCalls` as tool-call and tool-result rows and `warning`/`info`/`error` turns as harness
-notices, so no generated text is left in a user row to be called human. Both parse versions moved
-(`aistudio-v3`, `gemini-cli-v4`) so an existing index reparses those files at its next refresh.
+Input retrieval follows recorded source and purpose. `role=user` selects
+prompts, queued submissions and linked interactive-answer regions across storage roles. Explicit
+native provenance takes precedence over session fallback; generated tool output, harness context,
+delegation and copied parent history do not satisfy that selection. Omitting role searches complete
+content; other filters retain their existing behavior. A queued submission can have an unknown sender and delivery outcome
+while its input purpose is known; retain that uncertainty instead of hiding the submission.
 
-Adding a provider variant is an index-compatibility event even when the schema generation does not
-move: Prime Agent shipped at generation 5, so a `1.0.0rc1` executable opening an index that a later
-build has written cannot decode `sessions.provider` for those rows. Two aise executables on one
-machine is the ordinary case (one per package manager, or a harness registration pinned to an
-absolute path), and it produced exactly this on 2026-08-13 in a Pi session: every command of the
-older build failed while reading a Prime Agent row with advice to run `aise reindex --full`, which
-enumerates the same rows and failed identically. The open path therefore inspects
-`select distinct provider from sessions` (covered by `idx_sessions_provider`, about 1.4 ms on a
-6,946-session index) and refuses once with `SchemaState::UnknownProviders`, naming the provider,
-this build's version, and the fix — upgrade aise — the same way `SchemaState::Newer` refuses a newer
-generation. The per-row decode failure keeps the same upgrade advice for a row written after the
-open. Bumping the schema generation for a provider addition was rejected because it forces every
-user through a full reparse for a change that touches no existing row.
+Authorship retains the existing structural conventions: Antigravity's `USER_EXPLICIT` marks Human;
+ordinary root-session user turns resolve to Human and known spawned-run delegation to Agent.
+Native per-part metadata and explicit Unknown override those defaults. Interactive results keep
+their tool role and source event identity; content partitions distinguish input from generated
+wrappers. Canonical decoded answers retain the original searchable payload and generated
+separators cannot join separate answers into a matching phrase. Parser-version changes must
+repair identifiable old rows without deleting archive-only inputs or multiplying events.
+
+Gemini CLI supports legacy JSON and native JSONL history, including explicit subagent evidence,
+generated `functionResponse` echoes, tool calls/results and harness notices. Rewind, masking and
+removal cannot erase original input from the append log. Google AI Studio JSON chunks distinguish
+user from model content. Its legacy Markdown path preserves the existing whole-document role
+convention; the format cannot establish individual turn boundaries, so do not infer them from
+prose or headings.
+
+Adding a provider is an index-compatibility event. The open path checks indexed provider values
+and refuses unsupported values with upgrade guidance; rebuilding with the same older executable
+cannot teach it a new provider. Reader/writer compatibility levels preserve that boundary.
 
 ### REQ021-state-local-data-boundary
 
@@ -579,7 +611,7 @@ record is outside the index and must not be advertised as searchable.
 
 ### REQ022-separate-guidance-capabilities
 
-Harnesses load and interpret `SKILL.md`. Aise does not execute that prose or invoke a model.
+Harnesses load and interpret `SKILL.md`. AI Session Search does not execute that prose or invoke a model.
 Deterministic runnable behavior belongs in an adjacent, closed-schema `aise-capability.toml` parsed by
 aise. Skill guidance and machine capability declarations are related package components with
 different execution authorities.
@@ -606,8 +638,9 @@ silent registry replacement. After a version change by any manager, the first co
 owned skill files once, visiting only manifest-recorded roots, and replaces in place each client
 instruction block that still holds text some release wrote; the `skills update` that
 `aise package update` runs does the same first, then also visits detected client roots that still
-exist. Neither configures a new client or rewrites an edited file. Stable executable paths,
-aliases, and MCP registrations do not need rewriting. Instruction blocks carry no ownership record, so a block is
+exist. Neither configures a new client or rewrites an edited file. Stable executable paths and
+aliases need no rewriting. MCP registration formats migrate from recognized launch contracts even
+without a skill record, retaining the executable and launch arguments. Instruction blocks carry no ownership record, so a block is
 recognized by its text: changing a line requires adding the old line's digest to
 `EARLIER_INSTRUCTION_LINE_DIGESTS`, which a pinned-digest test enforces. Uninstall integrations
 before removing the global executable.
@@ -628,13 +661,13 @@ Upgrading is replacing the executable, by whichever manager owns it; a user who 
 setting must not need to change anything, and one who did must not have to edit it again. A renamed
 config key keeps its old name as a serde alias, and a key a release accepted is not removed before
 the next major version. Installed files change only in ways the post-upgrade refresh applies without
-touching an edit (`REQ024-delegate-package-updates`). Release notes never carry upgrade steps. The
-CI `rust` job on every push, the local gate, and the publish `upgrade` job that `verify` waits for
-install each published release's integrations and printed config from `UPGRADE_FLOOR` in
-`scripts/verify_upgrade_path.py` on, run the new executable, and fail when anything would need a
-manual step.
+touching an edit (`REQ024-delegate-package-updates`). Release notes carry no step a user must run
+for settings or installed files to keep working. The CI `rust` job on every push, the local gate,
+and the publish `upgrade` job that `verify` waits for install each published release's integrations
+and printed config from `UPGRADE_FLOOR` in `scripts/verify_upgrade_path.py` on, run the new
+executable, and fail when anything would need a manual step.
 
-Starting with 1.0.1, ordinary config tables tolerate unknown keys from newer releases. Serde's
+Starting with 1.1.0, ordinary config tables tolerate unknown keys from newer releases. Serde's
 ignored-field tracking collects dotted paths on `Config::unknown_config_keys`; loading prints
 nothing. Suggestions use serialized typed fields and existing registries, without a parallel list
 of valid keys. Doctor's human/JSON status and MCP `get_index_status` report these diagnostics;
@@ -710,67 +743,63 @@ criteria, UX consequences, error behavior, ownership states, complexity bounds, 
 verification plan, and unresolved external actions. New summaries must retain verified mechanisms
 instead of erasing useful prior analysis.
 
-Open design decision, recorded 2026-08-16 for the maintainer: **where the resume command lives.**
-Today `util::resume_plan` is called directly by `aise resume` (cli.rs) and by the MCP
-`get_resume_command` tool (mcp_server.rs); it is not exposed through the shared service, so
-Python has no session-level resume (only the provider-status `resume_command`), and neither
-`get_session` nor `aise show` carries the command. The candidate design: compute `resume`
-(`{command, cwd}` or an unavailable reason with the `aise show`/`aise export` fallbacks) once at
-the shared typed layer as session metadata; return it always on `get_session` (structured
-`session.resume` plus one text line) and `aise show`; make it opt-in on `list_sessions` /
-`search_sessions` / `aise list|search` through the existing `include` group so paged output stays
-short (roughly 80 bytes per row otherwise); expose it on the Python `SessionRecord` with stubs.
-`get_resume_command` and `aise resume` then remain only as the cheapest id-to-command hop, and
-whether to retire them is the maintainer's call because it removes a public tool. Costs are one
-`resume_plan` string formatting per returned session; no index read. Deferred until decided; the
-`REQ002-share-typed-contract` gap (Python has no resume) is part of the same change.
+`CatalogService::resume_command` owns resume argv and availability. `aise resume`,
+MCP `get_resume_command`, and Python `resume_command(id)` render that shared result.
 
-Recorded 2026-10-31 before 1.0.0 froze the surface: **what the public Rust API exposes.**
+Public Rust result signatures expose `anyhow::Error`; callers may downcast service failures
+before converting them. Dependency major-version changes therefore require API compatibility
+review even when application code changes little.
 
-`anyhow::Error` appears in the public signatures of the `lib.rs` error helpers,
-`db::is_sqlite_busy_error`, and others, so 1.0.0's public signatures are coupled to `anyhow` 1.x:
-an `anyhow` 2.0 would
-be a breaking change for this crate's callers even if no line here changed. Accepted rather than
-wrapped, because a crate-local error enum would have to reproduce the downcast and context
-behavior the CLI already depends on, and `anyhow` has held 1.x since 2019. Revisit if `anyhow`
-announces a 2.0.
+The six deprecated `trigram_index` connection helpers use rusqlite 0.41 in 1.1.0 instead of
+1.0.0's 0.40. This accepted Rust type break picks up the bundled SQLite fix for
+RUSTSEC-2026-0459. `ai_session_search::rusqlite` re-exports the exact dependency so callers can
+construct a matching `Connection` without a separate dependency. Prefer
+`IndexService::reindex_report` for preparation and `MessageService::search` for verified queries.
 
-`aise vocab` and `aise repeats` reach `analytics::run_vocab` and `analytics::run_repeats` directly
-from `cli.rs`; neither is in `service.rs`, so neither has a typed request, an MCP tool, or a Python
-method. That is the same `REQ002-share-typed-contract` shape as the resume decision above, and it
-is recorded rather than fixed because both functions render to stdout and giving them a typed
-response is a design task, not a rename. Filling the gap later stays additive: a new typed request,
-a new Python method, and a new MCP tool break nothing, so 1.0.0 does not block it.
+`aise vocab` and `aise repeats` reached `analytics::run_vocab` and `analytics::run_repeats`
+directly from `cli.rs` through 1.0.0. In 1.1.0 both run through `AnalysisService::vocabulary`
+(`VocabularyQuery` to `TermFrequency` rows) and `AnalysisService::repeats` (`RepeatsQuery` to
+`RepeatsReport`), and the CLI functions only build the request and render. `aise repeats --format
+json` keeps its bare array of groups; `--report` prints the report object, which carries the
+unattributed-input count. The Rust vocabulary call refuses under an `allowed-roots` access scope
+because full-text term counts span every session. The hidden compatibility command `aise vocab`
+retains historical index-wide counts even under an `allowed-roots` scope; it is omitted from
+root help. Library `vocabulary()` enforces the scope refusal. Python `vocabulary()` and `repeats()` call those services. Neither has an MCP analytics tool.
 
-Those two decisions are why the clap argument structs are shaped the way they are. The externally
-reachable ones carry `#[non_exhaustive]` so that adding a flag stays an additive change
-instead of breaking any crate that constructs one, matching the config structs frozen the same way.
-`analytics::run_vocab`, `run_repeats`, `run_stats`, `run_planning`, `mcp_schema_budget::run`, and
-`sql_query::schema_path` are `pub(crate)`: they take clap-derived arguments and return `Result<()>`
-after printing, so they were never usable as a library and had no caller outside this crate.
-`DateRange` and `DbSchemaArgs` stay public because `DbCmd::Schema` and the Python bindings hold
-them; narrowing those would cascade through the public command enums for no gain.
+Read-only SQL goes through `SqlService` (`SessionSearch::sql`), which applies the `allowed-roots`
+refusal itself; `sql_query::run`, which took a path and skipped it, is deprecated. A library
+caller's published `load`, `open`, and `open_with_access_inputs` constructors preserve empty reads
+before the first refresh. New `open_strict` and `open_strict_with_access_inputs` constructors return
+`ServiceError::IndexNotRefreshed` until `IndexService::prepare_for_read` applies the configured
+policy. Python preserves historical empty reads when no `index_refresh` argument is supplied;
+an explicit new keyword selects strict reads. Existing-only always opens read-only and never
+creates an absent index. `MessageService::context` retains exact-ID lookup and empty missing
+results; `context_resolved` supplies prefix lookup and lookup errors without narrowing old calls.
 
-Recorded 2026-11-01, the same coupling as `anyhow` above and wider: `clap` itself. Every provider,
-role, kind, mode, format and selector enum the CLI takes as a value derives `ValueEnum`, and the
-subcommand and argument structs derive `Subcommand` and `Args`, so a `clap` 5.0 breaks this
-crate's callers exactly as an `anyhow` 2.0 would. `rg 'derive\([^)]*\b(ValueEnum|Subcommand|Args)\b'
-rust/ai-session-search-core/src` reports the current set rather than a count that rots here.
+Public argument types are non-exhaustive. New callers use typed services; command-printing
+adapters retained for compatibility carry deprecation notes.
 
-Those derives also keep `clap` non-optional for a library-only consumer, who compiles a couple of
-hundred crates; `cargo tree -p ai-session-search --no-default-features` gives the figure for a
-given lockfile. The separable subtrees are `ratatui`, `rmcp` with the `tokio` it pulls,
-`crossterm` and `clap`; `rusqlite` is not separable, because the index is SQLite.
+The remaining public CLI adapters (`files::run`, `messages::run`, `skills::run`, and
+`DbQueryArgs::resolve`) are externally callable: clap's `FromArgMatches` constructs their
+non-exhaustive argument types. They remain deprecated compatibility paths in 1.1.0, with typed
+service alternatives named in their notes. Internal dispatch uses crate-private adapters.
+Skill row `cells` methods implement the public `render::Row` trait; Rust cannot narrow their
+visibility independently. Their row types remain available with deprecation notes instead.
+The consumer crate exercises these paths and compile-checks the internal dispatch boundary.
 
-Gating them is mechanically feasible rather than entangled: `service.rs`, `db.rs`,
-`message_search.rs`, `models.rs`, and `config.rs` reference none of `cli`, `tui`, or
-`mcp_server`, and `mod cli` is already private. It was not done for 1.0.0 because the exposure is
-a version risk and a build-weight cost rather than a correctness or usability defect, `clap` has
-held 4.x since 2022, and no API consumer exists yet to pay the weight. Gating later breaks only
-the `default-features = false` configuration, which today drops `ureq` alone. Revisit if `clap`
-announces a 5.0, or when a library consumer asks for a lighter build; a gating change needs
-`cargo check --no-default-features` added to the gate first, because nothing currently builds the
-feature-off configuration.
+CLI-facing public enums derive clap traits. The default-off feature configuration removes only
+`release-check`; it does not remove the terminal, MCP, or CLI dependencies. Major dependency
+updates must account for those public trait implementations and the supported MSRV.
+
+Rust session limits preserve both configuration defaults and compatibility. `SessionQuery::default()`
+omits the limit; `CatalogService::list_query` and `search_query` resolve it from
+`[search].default_limit` (50 by default). `with_limit(0)` explicitly returns every match.
+`SessionQuery::from_filters` preserves the supplied `SearchFilters.limit`, including 0; callers can
+then select `with_configured_limit()` to use its structural scope with the configured default.
+The existing `list_sessions`, `search`, and explicit-scoring methods still take `SearchFilters`
+and interpret a directly assigned 0 as all. Neither the field nor those calls are deprecated.
+The consumer test `session_requests_distinguish_configured_limits_from_explicit_all_and_legacy_fields`
+uses three indexed sessions and a configured default of 2, and covers listing and ranking.
 
 ### REQ033-commit-coherent-progress
 
@@ -800,29 +829,6 @@ taxonomies, test matrices, complexity analysis, and useful UX reasoning. Additio
 lossy replacements. Remove duplication only after the durable source of truth contains the
 substance being preserved.
 
-## Current measured installation evidence
-
-Measured on 2026-07-27 from commit `41f52c3` and installed `aise 1.0.0-rc.1`:
-
-- Current and compatibility MCP targets reported configured.
-- Both managed end-user skills validated and linked into every selected harness root.
-- `~/.gemini/config/mcp_config.json` contained `codebase-memory-mcp` and `ai-session-search`, with
-  the user-local `aise` executable and `args=["mcp","serve"]`.
-- The uv-managed and Cargo-managed executables both ran normally, including under an
-  empty environment. The uv executable completed MCP initialize and tools/list verification.
-- `ModuleNotFoundError: No module named 'encodings'` was reproducible only with a deliberately
-  invalid `PYTHONHOME`. Running Antigravity processes did not expose `PYTHONHOME` or `PYTHONPATH`.
-- An interactive Antigravity CLI discovered `ai-session-search/get_index_status` and displayed
-  one-time, conversation, persistent, and deny permission choices. Only one-time permission was
-  selected. This proves live discovery and permission routing; it does not substitute for the
-  separate protocol verification or claim an unseen result payload.
-- `aise package check --format json` classified the uv checkout as `direct-source`, refused
-  automatic replacement, reported current `1.0.0-rc.1`, latest published `0.3.1`, and
-  `current_build_is_newer_than_latest_release=true`.
-
-This evidence is time-scoped. Rerun integration status, package ownership/check, MCP handshake,
-provider parsing, and installed dogfood before a new release-readiness claim.
-
 ## Verification map
 
 | Contract | Primary implementation | Representative verification |
@@ -834,7 +840,7 @@ provider parsing, and installed dogfood before a new release-readiness claim.
 | `REQ011-validate-language-boundaries` | `rust/ai-session-search-python/src/lib.rs`, `ai_session_search/_native.pyi` | native binding tests, stubtest, runtime/stub parity |
 | `REQ014-use-platform-app-paths`; `REQ015-separate-app-harness-roots`; `REQ016-support-multiple-skill-roots`; `REQ017-preserve-install-ownership`; `REQ018-preserve-unmanaged-content`; `REQ019-verify-each-harness` | `config.rs`, `integrations.rs`, `skills.rs`, `skill_manifest.rs`, `text_file_transaction.rs` | integration/config unit tests and repository contracts |
 | `REQ020-normalize-provider-records`; `REQ021-state-local-data-boundary` | provider modules under `rust/ai-session-search-core/src/providers/` | provider fixtures, incremental/full parse parity, session-id binding |
-| `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_capability.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
+| `REQ022-separate-guidance-capabilities`; `REQ023-accept-capability-parameters` | `skill_catalog.rs`, `skill_run.rs`, `message_classification.rs`, `skills.rs`, `mcp_server.rs` | skill catalog, process lifecycle, Python, CLI, and MCP capability tests |
 | `REQ024-delegate-package-updates` | `update.rs`, release configuration | package ownership/update tests and installed `aise package status/check` |
 | `REQ049-keep-upgrades-one-command` | `config.rs` serde aliases, `integrations.rs` post-upgrade refresh, `scripts/verify_upgrade_path.py`, CI `rust` job, `run_ci_local.sh`, publish `upgrade` job | alias and refresh unit tests, instruction-text digest test, upgrade check from every published release since `UPGRADE_FLOOR` |
 | `REQ027-use-tdd`; `REQ028-test-cross-surface-contracts`; `REQ029-dogfood-installed-artifacts`; `REQ033-commit-coherent-progress`; `REQ034-gate-release-artifacts` | `tests/`, Rust test suites, `run_ci_local.sh`, release workflows | focused tests followed by all local release-gate stages |

@@ -31,18 +31,19 @@ use crate::models::{
     MessageClassificationMatch, MessageFilters, MessageHit, MessageSearchMode, PlanningCount,
     Provider, Role,
 };
-use crate::render::{render, OutputFormat, Row};
+use crate::render::{emit, OutputFormat, Row};
 use crate::util::truncate_for_display;
 
 const TABLE_CONTENT_CHARS: usize = 100;
 const USER_REQUEST_START: &str = "<USER_REQUEST>";
 const USER_REQUEST_END: &str = "</USER_REQUEST>";
 
-/// Historical built-in correction categories retained as a compatibility test oracle.
+/// Expected default correction categories retained as a test oracle.
 ///
 /// The executable source is the selected message-classification skill's `aise-capability.toml`.
 /// These patterns remain narrowed to second-person / imperative / demonstrative forms so tests
-/// can compare the current compiled capability with the pre-skills behavior.
+/// can compare the current compiled capability with the expected default rules.
+#[cfg(test)]
 pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static str>)> {
     vec![
         (
@@ -68,6 +69,7 @@ pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static s
         (
             "misunderstanding",
             vec![
+                r"^\s*(?:(?:ok|well|uh|oh|no)[,!?]?\s+){0,2}what are you talking about\b",
                 r"\b(that is|that'?s|it is|it'?s) (actually )?(wrong|incorrect|not correct|not right|not what|a mistake)\b",
                 r"\byou'?re wrong\b",
                 r"\byou (misunderstood|got it wrong|misread)\b",
@@ -81,7 +83,6 @@ pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static s
         (
             "incomplete",
             vec![
-                r"\balso need\b",
                 r"\bmust also\b",
                 r"\bnot done\b",
                 r"\bnot finished\b",
@@ -90,7 +91,7 @@ pub(crate) fn default_correction_patterns() -> Vec<(&'static str, Vec<&'static s
                 r"\bbut you\b",
             ],
         ),
-        // Catch-all (last). A bare `\bstop\b` was ~98% false positives on real data:
+        // Catch-all (last). A bare `\bstop\b` also matches ordinary discussion:
         // it matched test fixtures ("run this command once and stop"), checkpoint
         // instructions ("commit and then stop"), and negations ("don't stop"). Restrict
         // to imperative-stop corrections: a leading "stop" (optionally softened by
@@ -211,6 +212,7 @@ impl Row for PlanningCount {
 
 /// One role's message count, for `stats`.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct RoleStat {
     pub role: String,
     pub count: i64,
@@ -245,9 +247,13 @@ pub struct CorrectionsArgs {
     pub path: Option<String>,
     #[command(flatten)]
     pub dates: DateRange,
-    /// Max matches. Omit to use `[capabilities.message_classification].limit`. 0 = every match.
-    #[arg(long)]
+    /// Max matches. Omit for `[capabilities.message_classification].limit`.
+    /// Deprecated: 0 means every match; use --all-results instead.
+    #[arg(long, conflicts_with = "all_results")]
     pub limit: Option<usize>,
+    /// Return every matching message instead of a page; conflicts with --limit.
+    #[arg(long)]
+    pub all_results: bool,
     /// Matches to skip before `--limit` applies, newest first. 0 starts at the newest match.
     #[arg(long, default_value_t = 0)]
     pub offset: usize,
@@ -255,12 +261,17 @@ pub struct CorrectionsArgs {
     /// something a person told the agent: in a spawned run the `user` rows are the calling
     /// agent's delegation prompt. Pass `user subagent` for both, as `search` and `list` return
     /// by default.
-    #[arg(long = "session-kinds", value_enum, num_args = 1..)]
+    #[arg(long = "session-kinds", value_enum, num_args = 1.., value_delimiter = ',')]
     pub session_kinds: Vec<crate::models::SessionKind>,
     /// Additional message-classification skills to evaluate, in argument order after the primary
     /// selected skill. Each value is a catalog name, skill directory, or exact SKILL.md path.
     #[arg(long = "skill", value_name = "NAME_OR_PATH")]
     pub additional_skills: Vec<std::ffi::OsString>,
+    /// Also read messages typed while the agent was working whose transcript does not record who
+    /// sent them (older Claude Code versions). Off by default because a program may have sent
+    /// them; the output counts how many were left out.
+    #[arg(long)]
+    pub include_unattributed_input: bool,
     /// Presentation preset for JSON/JSONL results: compact bounds the selected field and match
     /// view; full keeps the complete field and only the exact match span. Omit to preserve the
     /// complete typed report. The bounded form keeps the full message recoverable by message_ref.
@@ -366,14 +377,21 @@ pub(crate) fn message_classification_filters(
     config: &Config,
     args: &CorrectionsArgs,
 ) -> Result<MessageFilters> {
+    if args.limit == Some(0) {
+        eprintln!("aise: --limit 0 is deprecated for classification; use --all-results");
+    }
     let mut filters = filters_from(
         db,
         &args.session_id,
         args.provider,
         &args.path,
         &args.dates,
-        args.limit
-            .unwrap_or(config.capabilities.message_classification.limit),
+        if args.all_results {
+            0
+        } else {
+            args.limit
+                .unwrap_or(config.capabilities.message_classification.limit)
+        },
         args.offset,
     )?;
     // Left as `None` when the caller named no class, so `find_corrections` applies its own
@@ -509,6 +527,16 @@ fn render_correction_report(
     let stdout = io::stdout();
     let mut out = stdout.lock();
     crate::render::render_record(report, &report.matches, format, &mut out)?;
+    if !report.unattributed_input_included {
+        if let Some(note) = unattributed_input_note(report.unattributed_input_count) {
+            // Below the table; on stderr for CSV and plain output, so their rows stay parseable.
+            if format == OutputFormat::Table {
+                writeln!(out, "{note}")?;
+            } else {
+                eprintln!("{note}");
+            }
+        }
+    }
     out.flush()?;
     Ok(())
 }
@@ -564,17 +592,47 @@ pub(crate) fn run_stats(db: &Db, config: &Config, args: &StatsArgs) -> Result<()
     emit(&rows, args.format)
 }
 
-/// One vocabulary term and its frequency (rendered by `vocab`).
-#[derive(Debug, Serialize)]
-struct VocabRow {
-    term: String,
-    /// Documents (messages) containing the term.
-    docs: i64,
-    /// Total occurrences across all messages.
-    count: i64,
+/// Which terms [`AnalysisService::vocabulary`](crate::service::AnalysisService::vocabulary)
+/// reports, as `aise vocab` selects them.
+///
+/// ```
+/// use ai_session_search::VocabularyQuery;
+/// let query = VocabularyQuery::default().with_prefix("retr").with_limit(20);
+/// assert!(!query.trigram);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct VocabularyQuery {
+    /// Keep only terms starting with this text, compared case-insensitively. `None` (the default)
+    /// and `Some("")` report every term.
+    pub prefix: Option<String>,
+    /// Read the 3-character substring index instead of word tokens. Terms are then 3 characters,
+    /// spaces and punctuation included, and both counts are messages. Default `false`.
+    pub trigram: bool,
+    /// Maximum terms, most frequent first. `None` uses `[analytics].vocab_limit` (50 by
+    /// default), as `aise vocab` does; `Some(0)` returns every term.
+    pub limit: Option<usize>,
 }
 
-impl Row for VocabRow {
+chainable_setters!(VocabularyQuery {
+    with_prefix(prefix: impl Into<String>) some;
+    with_trigram(trigram: bool) value;
+    with_limit(limit: usize) some;
+});
+
+/// One indexed term and how often it occurs, in `aise vocab` row order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct TermFrequency {
+    /// The case-folded term.
+    pub term: String,
+    /// Messages containing the term.
+    pub docs: i64,
+    /// Occurrences across all messages. For the trigram index this is also a message count.
+    pub count: i64,
+}
+
+impl Row for TermFrequency {
     fn headers() -> &'static [&'static str] {
         &["term", "docs", "count"]
     }
@@ -606,18 +664,147 @@ pub(crate) struct VocabArgs {
     pub format: OutputFormat,
 }
 
-pub(crate) fn run_vocab(db: &Db, config: &AnalyticsConfig, args: &VocabArgs) -> Result<()> {
-    let limit = args.limit.unwrap_or(config.vocab_limit);
-    let rows: Vec<VocabRow> = db
-        .vocabulary(args.trigram, limit, args.prefix.as_deref())?
-        .into_iter()
-        .map(|(term, docs, count)| VocabRow { term, docs, count })
-        .collect();
+pub(crate) fn run_vocab(db: &Db, config: &Config, args: &VocabArgs) -> Result<()> {
+    let query = VocabularyQuery {
+        prefix: args.prefix.clone(),
+        trigram: args.trigram,
+        limit: args.limit,
+    };
+    // The command line keeps reading index-wide counts under every search scope, as it always
+    // has; the library call refuses under allowed-roots (see AnalysisService::vocabulary).
+    let rows = crate::service::AnalysisService::new(config, db).index_vocabulary(&query)?;
     emit(&rows, args.format)
 }
 
+/// Which messages [`AnalysisService::repeats`](crate::service::AnalysisService::repeats) mines
+/// for recurring phrases, and how many groups and examples it returns.
+///
+/// ```
+/// use ai_session_search::{MessageFilters, RepeatsQuery};
+/// let query = RepeatsQuery::default()
+///     .with_filters(MessageFilters::default().with_path_prefix("/work/project"))
+///     .with_min_matches(3)
+///     .with_max_groups(10);
+/// assert_eq!(query.phrase_min_words, None);
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct RepeatsQuery {
+    /// Narrow candidate messages to those containing this text before mining: a
+    /// case-insensitive literal, or a Rust regex when `filters.match_mode` is
+    /// [`MessageSearchMode::Regex`]. `None` (the default) mines every candidate.
+    pub text: Option<String>,
+    /// Structural filters. `filters.role` `None` (the default) or `Some(Role::User)` mines text a
+    /// person typed, leaving out generated and harness rows; another role mines that stored role.
+    /// `filters.session_id` accepts a unique prefix. `filters.limit` caps candidate messages
+    /// scanned; 0 (the default) scans every candidate.
+    pub filters: MessageFilters,
+    /// Also mine queued messages whose transcript does not record who sent them. Default `false`;
+    /// [`RepeatsReport::unattributed_input_count`] counts them either way.
+    pub include_unattributed_input: bool,
+    /// Maximum groups, most supported first. `None` uses `[analytics].repeat_max_groups` (50);
+    /// `Some(0)` returns every group.
+    pub max_groups: Option<usize>,
+    /// Example messages kept per group. `None` uses `[analytics].repeat_max_examples_per_group`
+    /// (3); `Some(0)` keeps every matching message. `matches` and `sessions` always count the
+    /// whole group.
+    pub max_examples_per_group: Option<usize>,
+    /// Messages a phrase must appear in to form a group. `None` uses
+    /// `[analytics].repeat_min_matches` (2); must be at least 1.
+    pub min_matches: Option<usize>,
+    /// Fewest words in a phrase. `None` uses `[analytics].repeat_phrase_min_words` (2); must be
+    /// at least 1.
+    pub phrase_min_words: Option<usize>,
+    /// Most words in a phrase. `None` uses `[analytics].repeat_phrase_max_words` (5); must be at
+    /// least the minimum.
+    pub phrase_max_words: Option<usize>,
+}
+
+chainable_setters!(RepeatsQuery {
+    with_text(text: impl Into<String>) some;
+    with_filters(filters: MessageFilters) value;
+    with_include_unattributed_input(include_unattributed_input: bool) value;
+    with_max_groups(max_groups: usize) some;
+    with_max_examples_per_group(max_examples_per_group: usize) some;
+    with_min_matches(min_matches: usize) some;
+    with_phrase_min_words(phrase_min_words: usize) some;
+    with_phrase_max_words(phrase_max_words: usize) some;
+});
+
+/// Recurring phrases found by [`AnalysisService::repeats`](crate::service::AnalysisService::repeats).
 #[derive(Debug, Clone, Serialize)]
-struct RepeatGroupExample {
+#[non_exhaustive]
+pub struct RepeatsReport {
+    /// Groups ordered by matching messages (most first), then by phrase length (longest first),
+    /// then alphabetically. A shorter phrase found in exactly the same messages as a longer one
+    /// is dropped.
+    pub groups: Vec<RepeatGroup>,
+    /// Queued messages in the filters' scope whose transcript does not record who sent them.
+    /// Counted whether or not they were mined; 0 when the query mines a non-user role.
+    pub unattributed_input_count: u64,
+    /// Whether those messages were mined (`RepeatsQuery::include_unattributed_input`).
+    pub unattributed_input_included: bool,
+}
+
+impl RepeatsReport {
+    /// JSON report rendered by `aise repeats --report --format json`.
+    ///
+    /// `context` supplies the neighbor count in each example's follow-up command; it does
+    /// not change the mined groups or example membership. Conversion allocates `O(E + G)`
+    /// rows for `E` examples and `G` groups, plus their text bytes.
+    pub fn to_json(&self, context: i64) -> serde_json::Value {
+        serde_json::json!({
+            "groups": self.groups.iter().map(|group| RepeatGroupRow::new(group, context)).collect::<Vec<_>>(),
+            "unattributed_input_count": self.unattributed_input_count,
+            "unattributed_input_included": self.unattributed_input_included,
+        })
+    }
+}
+
+/// One recurring phrase and where it appears.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct RepeatGroup {
+    /// The normalized phrase: lowercase words separated by single spaces.
+    pub repeat: String,
+    /// Messages containing the phrase.
+    pub matches: usize,
+    /// Distinct sessions among those messages.
+    pub sessions: usize,
+    /// Example messages in mining order, at most `max_examples_per_group`.
+    pub examples: Vec<RepeatExample>,
+}
+
+/// One message containing a recurring phrase.
+#[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
+pub struct RepeatExample {
+    /// Canonical session id.
+    pub session_id: String,
+    /// Message sequence number within the session; pass it to
+    /// [`MessageService::context`](crate::service::MessageService::context) to read around it.
+    pub seq: i64,
+    /// Message timestamp, when recorded.
+    pub timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    /// The mined text cut to 100 characters.
+    pub preview: String,
+}
+
+impl RepeatExample {
+    fn from_hit(hit: &MessageHit) -> Self {
+        Self {
+            session_id: hit.session_id.clone(),
+            seq: hit.seq,
+            timestamp: hit.ts,
+            preview: truncate_for_display(repeat_mining_text(&hit.content), TABLE_CONTENT_CHARS),
+        }
+    }
+}
+
+/// `aise repeats` row for one example: the typed example plus its display timestamp and the
+/// command that reads it in context.
+#[derive(Debug, Clone, Serialize)]
+struct RepeatExampleRow {
     session_id: String,
     seq: i64,
     ts: Option<String>,
@@ -625,27 +812,37 @@ struct RepeatGroupExample {
     context_command: String,
 }
 
-impl RepeatGroupExample {
-    fn from_hit(hit: &MessageHit, context: i64) -> Self {
+/// `aise repeats` row for one group. Its JSON shape is what `--format json` has always printed.
+#[derive(Debug, Serialize)]
+struct RepeatGroupRow {
+    repeat: String,
+    matches: usize,
+    sessions: usize,
+    examples: Vec<RepeatExampleRow>,
+}
+
+impl RepeatGroupRow {
+    fn new(group: &RepeatGroup, context: i64) -> Self {
         Self {
-            session_id: hit.session_id.clone(),
-            seq: hit.seq,
-            ts: hit.ts.map(crate::util::display_timestamp),
-            preview: truncate_for_display(repeat_mining_text(&hit.content), TABLE_CONTENT_CHARS),
-            context_command: context_command(&hit.session_id, hit.seq, context),
+            repeat: group.repeat.clone(),
+            matches: group.matches,
+            sessions: group.sessions,
+            examples: group
+                .examples
+                .iter()
+                .map(|example| RepeatExampleRow {
+                    session_id: example.session_id.clone(),
+                    seq: example.seq,
+                    ts: example.timestamp.map(crate::util::display_timestamp),
+                    preview: example.preview.clone(),
+                    context_command: context_command(&example.session_id, example.seq, context),
+                })
+                .collect(),
         }
     }
 }
 
-#[derive(Debug, Serialize)]
-struct RepeatGroup {
-    repeat: String,
-    matches: usize,
-    sessions: usize,
-    examples: Vec<RepeatGroupExample>,
-}
-
-impl Row for RepeatGroup {
+impl Row for RepeatGroupRow {
     fn headers() -> &'static [&'static str] {
         &["repeat", "matches", "sessions", "examples", "preview"]
     }
@@ -675,12 +872,15 @@ impl Row for RepeatGroup {
 #[derive(Debug, Args)]
 pub(crate) struct RepeatsArgs {
     /// Optional text to narrow candidate messages before repeat mining. Exact literal by default;
-    /// add --regex to interpret it as a Rust regex. A query starting with `-` is parsed as a flag
-    /// here; pass it after `--`, with every other flag before the `--`, e.g. `--regex -- ^/\S+`.
+    /// add --query-mode regex to interpret it as a Rust regex. A query starting with `-` is parsed as a flag
+    /// here; pass it after `--`, with every other flag before the `--`, e.g. `--query-mode regex -- ^/\S+`.
     pub query: Option<String>,
-    /// Interpret QUERY as a Rust regex before repeat mining.
+    /// Deprecated: use --query-mode regex. Interpret QUERY as a Rust regex.
     #[arg(long)]
     pub regex: bool,
+    /// QUERY matching model: literal (default) or regex. Requires QUERY.
+    #[arg(long, value_parser = ["literal", "regex"])]
+    pub query_mode: Option<String>,
     /// Filter by role: user (source-attributable human text only), assistant, tool
     /// (calls/results), slash (human-entered commands), or compaction. Omit to mine human text.
     #[arg(long = "role", value_enum)]
@@ -701,9 +901,15 @@ pub(crate) struct RepeatsArgs {
     /// Neighboring messages before/after each match in generated follow-up commands.
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(i64).range(0..))]
     pub context: i64,
-    /// Max candidate messages to scan. 0 = every candidate message.
-    #[arg(long, default_value_t = 0)]
+    /// Maximum candidate messages to examine: a positive count, or 0 (default) for every candidate.
+    /// The deprecated --limit alias has the same meaning. Use --max-groups to bound returned groups.
+    #[arg(long = "max-candidates", alias = "limit", default_value_t = 0)]
     pub limit: usize,
+    /// Also mine messages typed while the agent was working whose transcript does not record who
+    /// sent them (older Claude Code versions). Off by default because a program may have sent
+    /// them; a note on stderr counts how many were left out. Applies to user text only.
+    #[arg(long)]
+    pub include_unattributed_input: bool,
     /// Max repeat groups to output. Omit to use `[analytics].repeat_max_groups`. 0 = every group.
     #[arg(long)]
     pub max_groups: Option<usize>,
@@ -725,98 +931,161 @@ pub(crate) struct RepeatsArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
+    /// With --format json or jsonl, print one object {groups, unattributed_input_count,
+    /// unattributed_input_included} instead of the bare array of groups, so the count of queued
+    /// messages left out travels with the result. Omit to keep the bare array.
+    #[arg(long)]
+    pub report: bool,
 }
 
-pub(crate) fn run_repeats(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> Result<()> {
-    if args.regex && args.query.is_none() {
-        bail!("--regex requires QUERY");
+pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Result<()> {
+    if args.regex {
+        eprintln!("aise: repeats --regex is deprecated; use --query-mode regex");
+        if args.query_mode.as_deref() == Some("literal") {
+            bail!("--regex conflicts with --query-mode literal; pass one --query-mode");
+        }
     }
-    run_repeats_issues(db, config, args)
-}
-
-fn repeat_filters(
-    db: &Db,
-    args: &RepeatsArgs,
-    default_role: Option<Role>,
-) -> Result<MessageFilters> {
+    if (args.regex || args.query_mode.is_some()) && args.query.is_none() {
+        bail!("--query-mode and deprecated --regex require QUERY");
+    }
+    if args.report && !matches!(args.format, OutputFormat::Json | OutputFormat::Jsonl) {
+        bail!("--report requires --format json or --format jsonl");
+    }
     let (since, until) = args.dates.resolve_now()?;
-    let exact_session_id = args
-        .session_id
-        .as_deref()
-        .map(|id| db.resolve_session_record(id).map(|session| session.id))
-        .transpose()?;
-    Ok(MessageFilters {
-        role: args.role.or(default_role),
-        providers: args.provider.map(|provider| vec![provider]),
-        session_id: exact_session_id,
-        path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
-        since,
-        until,
-        match_mode: if args.regex {
-            MessageSearchMode::Regex
-        } else {
-            MessageSearchMode::Literal
+    let query = RepeatsQuery {
+        text: args.query.clone(),
+        filters: MessageFilters {
+            role: args.role,
+            providers: args.provider.map(|provider| vec![provider]),
+            session_id: args.session_id.clone(),
+            path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
+            since,
+            until,
+            match_mode: if args.regex || args.query_mode.as_deref() == Some("regex") {
+                MessageSearchMode::Regex
+            } else {
+                MessageSearchMode::Literal
+            },
+            limit: args.limit,
+            ..Default::default()
         },
-        limit: args.limit,
-        ..Default::default()
-    })
+        include_unattributed_input: args.include_unattributed_input,
+        max_groups: args.max_groups,
+        max_examples_per_group: args.max_examples_per_group,
+        min_matches: args.min_matches,
+        phrase_min_words: args.phrase_min_words,
+        phrase_max_words: args.phrase_max_words,
+    };
+    let report = crate::service::AnalysisService::new(config, db).repeats(&query)?;
+    let rows = report
+        .groups
+        .iter()
+        .map(|group| RepeatGroupRow::new(group, args.context))
+        .collect::<Vec<_>>();
+    if args.report {
+        let envelope = report.to_json(args.context);
+        if args.format == OutputFormat::Json {
+            println!("{}", serde_json::to_string_pretty(&envelope)?);
+        } else {
+            println!("{}", serde_json::to_string(&envelope)?);
+        }
+        return Ok(());
+    }
+    emit(&rows, args.format)?;
+    if !report.unattributed_input_included {
+        // On stderr: the bare JSON array of groups has nowhere to carry it; --report does.
+        if let Some(note) = unattributed_input_note(report.unattributed_input_count) {
+            eprintln!("{note}");
+        }
+    }
+    Ok(())
 }
 
-/// The text the repeat scan filters messages by, in both literal and regex mode. `--regex` used
-/// to travel inside the filters (`MessageFilters::regex`) while the query text was passed as
-/// `""`; when the two modes were unified under `match_mode` (2026-07-14) the blank stayed, so
-/// `aise repeats --regex PATTERN` mined every message and the pattern was never applied.
-fn repeat_query(args: &RepeatsArgs) -> &str {
-    args.query.as_deref().unwrap_or("")
-}
-
-fn run_repeats_issues(db: &Db, config: &AnalyticsConfig, args: &RepeatsArgs) -> Result<()> {
-    let max_groups = args.max_groups.unwrap_or(config.repeat_max_groups);
-    let max_examples_per_group = args
+/// Mine recurring phrases for [`AnalysisService::repeats`](crate::service::AnalysisService::repeats).
+pub(crate) fn mine_repeats(
+    db: &Db,
+    config: &AnalyticsConfig,
+    query: &RepeatsQuery,
+) -> Result<RepeatsReport> {
+    let max_groups = query.max_groups.unwrap_or(config.repeat_max_groups);
+    let max_examples_per_group = query
         .max_examples_per_group
         .unwrap_or(config.repeat_max_examples_per_group);
-    let min_matches = args.min_matches.unwrap_or(config.repeat_min_matches);
-    let phrase_min_words = args
+    let min_matches = query.min_matches.unwrap_or(config.repeat_min_matches);
+    let phrase_min_words = query
         .phrase_min_words
         .unwrap_or(config.repeat_phrase_min_words);
-    let phrase_max_words = args
+    let phrase_max_words = query
         .phrase_max_words
         .unwrap_or(config.repeat_phrase_max_words);
 
+    let invalid =
+        |message: &str| -> anyhow::Error { crate::ServiceError::invalid_argument(message).into() };
     if phrase_min_words == 0 {
-        bail!("--phrase-min-words must be at least 1");
+        return Err(invalid("--phrase-min-words must be at least 1"));
     }
     if min_matches == 0 {
-        bail!("--min-matches must be at least 1");
+        return Err(invalid("--min-matches must be at least 1"));
     }
     if phrase_max_words < phrase_min_words {
-        bail!("--phrase-max-words must be >= --phrase-min-words");
+        return Err(invalid("--phrase-max-words must be >= --phrase-min-words"));
     }
-    let filters = repeat_filters(db, args, Some(Role::User))?;
-    let query = repeat_query(args);
+    let mut filters = query.filters.clone();
     // Default/user repeat mining is evidence about what a person wrote, not every provider row
     // stored with `role=user`. Explicit assistant/tool/slash/compaction analysis retains its
     // role-based contract because those roles do not claim human authorship.
-    let hits = if args.role.is_none() || args.role == Some(Role::User) {
-        db.search_attributable_human_messages(query, &filters)?
+    let human_text = filters.role.is_none() || filters.role == Some(Role::User);
+    filters.role = Some(filters.role.unwrap_or(Role::User));
+    if let Some(id) = filters.session_id.take() {
+        filters.session_id = Some(db.resolve_session_record(&id)?.id);
+    }
+    // The repeat scan filters messages by this text in both literal and regex mode. `--regex`
+    // used to travel inside the filters while the query text was passed as `""`, so `aise
+    // repeats --regex PATTERN` mined every message and the pattern was never applied.
+    let text = query.text.as_deref().unwrap_or("");
+    let hits = if human_text {
+        db.search_attributable_human_messages(text, &filters, query.include_unattributed_input)?
     } else {
-        db.search_messages(query, &filters)?
+        db.search_messages(text, &filters)?
     };
-    let rows = repeat_phrase_groups(
+    let groups = repeat_phrase_groups(
         &hits,
-        args.context,
         min_matches,
         phrase_min_words,
         phrase_max_words,
         max_groups,
         max_examples_per_group,
     );
-    emit(&rows, args.format)
+    let unattributed_input_count = if human_text {
+        db.unattributed_input_count(&filters)?
+    } else {
+        0
+    };
+    Ok(RepeatsReport {
+        groups,
+        unattributed_input_count,
+        unattributed_input_included: human_text && query.include_unattributed_input,
+    })
+}
+
+/// One line telling a reader how many messages a corrections or repeats run left out because
+/// their transcript does not record who sent them, and how to read them; `None` for zero.
+pub(crate) fn unattributed_input_note(count: u64) -> Option<String> {
+    let (noun, possessive, object) = if count == 1 {
+        ("message", "its", "it")
+    } else {
+        ("messages", "their", "them")
+    };
+    (count > 0).then(|| {
+        format!(
+            "{count} queued {noun} left out because {possessive} transcript does not record who \
+             sent {object}; --include-unattributed-input reads {object}"
+        )
+    })
 }
 
 fn repeat_phrase_groups(
     hits: &[MessageHit],
-    context: i64,
     min_matches: usize,
     min_words: usize,
     max_words: usize,
@@ -868,7 +1137,7 @@ fn repeat_phrase_groups(
             let examples = indices
                 .iter()
                 .take(example_count)
-                .map(|&index| RepeatGroupExample::from_hit(&hits[index], context))
+                .map(|&index| RepeatExample::from_hit(&hits[index]))
                 .collect();
             RepeatGroup {
                 repeat,
@@ -1030,14 +1299,6 @@ fn context_command(session_id: &str, seq: i64, context: i64) -> String {
     format!("aise messages get {session_id} --seq {seq} --context {context}")
 }
 
-fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    render(rows, format, &mut out)?;
-    out.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1073,6 +1334,7 @@ mod tests {
 
     fn hit(seq: i64, role: Role, content: &str) -> MessageHit {
         MessageHit {
+            provenance: None,
             session_id: "claude:test".to_string(),
             provider: Provider::Claude,
             seq,
@@ -1191,32 +1453,21 @@ mod tests {
                    (108, 1, 18, 43, 'generated', 'tool_payload');",
         )
         .unwrap();
-        let args = RepeatsArgs {
-            query: None,
-            regex: false,
-            role: None,
-            provider: None,
-            session_id: None,
-            path: None,
-            dates: DateRange::default(),
-            context: 0,
-            limit: 0,
-            max_groups: Some(0),
-            max_examples_per_group: Some(0),
-            min_matches: Some(2),
-            phrase_min_words: Some(2),
-            phrase_max_words: Some(4),
-            format: OutputFormat::Json,
-        };
-        let filters = repeat_filters(&db, &args, Some(Role::User)).unwrap();
-        let hits = db.search_attributable_human_messages("", &filters).unwrap();
-        assert_eq!(
-            hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
-            [0, 1, 6, 7]
-        );
-        assert_eq!(hits[2].content, "mixed human phrase");
-        assert_eq!(hits[3].content, "mixed human phrase");
-        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 4, 0, 0);
+        let query = RepeatsQuery::default()
+            .with_max_groups(0)
+            .with_max_examples_per_group(0)
+            .with_min_matches(2)
+            .with_phrase_min_words(2)
+            .with_phrase_max_words(4);
+        let report = mine_repeats(&db, &AnalyticsConfig::default(), &query).unwrap();
+        let mined = report
+            .groups
+            .iter()
+            .flat_map(|group| group.examples.iter().map(|example| example.seq))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(mined, BTreeSet::from([0, 1, 6, 7]));
+        assert_eq!(report.unattributed_input_count, 0);
+        let groups = report.groups;
         assert!(groups
             .iter()
             .any(|group| group.repeat == "durable human phrase"));
@@ -1256,49 +1507,32 @@ mod tests {
                     'please rerun the login fix', 'human', 'original');",
         )
         .unwrap();
-        let regex_args = |pattern: &str| RepeatsArgs {
-            query: Some(pattern.to_string()),
-            regex: true,
-            role: None,
-            provider: None,
-            session_id: None,
-            path: None,
-            dates: DateRange::default(),
-            context: 0,
-            limit: 0,
-            max_groups: Some(0),
-            max_examples_per_group: Some(0),
-            min_matches: Some(2),
-            phrase_min_words: Some(2),
-            phrase_max_words: Some(4),
-            format: OutputFormat::Json,
+        let regex = |pattern: &str| {
+            mine_repeats(
+                &db,
+                &AnalyticsConfig::default(),
+                &RepeatsQuery::default()
+                    .with_text(pattern)
+                    .with_filters(
+                        MessageFilters::default().with_match_mode(MessageSearchMode::Regex),
+                    )
+                    .with_max_groups(0)
+                    .with_max_examples_per_group(0)
+                    .with_phrase_max_words(4),
+            )
         };
-        let slash = regex_args(r"^/\S+");
-        assert_eq!(repeat_query(&slash), r"^/\S+");
-        let filters = repeat_filters(&db, &slash, Some(Role::User)).unwrap();
-        assert_eq!(filters.match_mode, MessageSearchMode::Regex);
-        let hits = db
-            .search_attributable_human_messages(repeat_query(&slash), &filters)
-            .unwrap();
-        assert_eq!(
-            hits.iter().map(|hit| hit.seq).collect::<Vec<_>>(),
-            [0, 1],
+        let slash = regex(r"^/\S+").unwrap();
+        assert!(!slash.groups.is_empty());
+        assert!(
+            slash
+                .groups
+                .iter()
+                .flat_map(|group| &group.examples)
+                .all(|example| example.seq < 2),
             "only the slash-command messages match ^/\\S+"
         );
-
-        let none = regex_args("zzz_no_match");
-        let filters = repeat_filters(&db, &none, Some(Role::User)).unwrap();
-        assert!(db
-            .search_attributable_human_messages(repeat_query(&none), &filters)
-            .unwrap()
-            .is_empty());
-
-        let invalid = regex_args("[unclosed");
-        let filters = repeat_filters(&db, &invalid, Some(Role::User)).unwrap();
-        let error = db
-            .search_attributable_human_messages(repeat_query(&invalid), &filters)
-            .unwrap_err()
-            .to_string();
+        assert!(regex("zzz_no_match").unwrap().groups.is_empty());
+        let error = regex("[unclosed").unwrap_err().to_string();
         assert!(error.contains("invalid regex"), "{error}");
     }
 
@@ -1322,7 +1556,7 @@ mod tests {
             ),
         ];
 
-        let groups = repeat_phrase_groups(&hits, 3, 2, 2, 4, 0, 0);
+        let groups = repeat_phrase_groups(&hits, 2, 2, 4, 0, 0);
 
         let avoid_magic_values = groups
             .iter()
@@ -1341,7 +1575,7 @@ mod tests {
             vec![10, 20]
         );
         assert_eq!(
-            avoid_magic_values.examples[0].context_command,
+            RepeatGroupRow::new(avoid_magic_values, 3).examples[0].context_command,
             "aise messages get claude:test --seq 10 --context 3"
         );
     }
@@ -1353,7 +1587,7 @@ mod tests {
             hit(20, Role::User, "avoid magic values everywhere"),
         ];
 
-        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 4, 0, 0);
+        let groups = repeat_phrase_groups(&hits, 2, 2, 4, 0, 0);
 
         assert_eq!(
             groups.len(),
@@ -1375,7 +1609,7 @@ mod tests {
         assert!(!phrases.contains("current local time"));
         assert!(!phrases.contains("additional metadata"));
 
-        let member = RepeatGroupExample::from_hit(&hit(1, Role::User, content), 0);
+        let member = RepeatExample::from_hit(&hit(1, Role::User, content));
         assert!(member.preview.starts_with("avoid magic values"));
         assert!(!member.preview.contains("USER_REQUEST"));
     }
@@ -1396,7 +1630,7 @@ mod tests {
             hit(30, Role::User, "avoid magic values everywhere"),
         ];
 
-        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 4, 1, 2);
+        let groups = repeat_phrase_groups(&hits, 2, 2, 4, 1, 2);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].matches, 3);
@@ -1414,7 +1648,7 @@ mod tests {
         assert!(serialized[0].get("examples").is_some());
         assert!(serialized[0]["examples"][0].get("matched_text").is_none());
 
-        let all_examples = repeat_phrase_groups(&hits, 0, 2, 2, 4, 1, 0);
+        let all_examples = repeat_phrase_groups(&hits, 2, 2, 4, 1, 0);
         assert_eq!(all_examples[0].examples.len(), 3);
     }
 
@@ -1427,7 +1661,7 @@ mod tests {
             hit(40, Role::User, "charlie delta fourth"),
         ];
 
-        let groups = repeat_phrase_groups(&hits, 0, 2, 2, 2, 1, 1);
+        let groups = repeat_phrase_groups(&hits, 2, 2, 2, 1, 1);
 
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].examples.len(), 1);
@@ -1528,7 +1762,7 @@ mod tests {
             ("that's wrong, the API returns a list", "misunderstanding"),
             ("no, that's not what I asked", "misunderstanding"),
             ("you're wrong about the types", "misunderstanding"),
-            ("you also need to handle the error case", "incomplete"),
+            ("you are not done with the error case", "incomplete"),
             ("that's not finished, the tests still fail", "incomplete"),
             ("stop changing the config", "other"),
             ("please stop", "other"),
@@ -1553,6 +1787,7 @@ mod tests {
             "we should have access to the API",
             "run the command once and stop",
             "the incorrect assumption was already fixed",
+            "you also need to draw a triangle",
         ];
         for text in negatives {
             assert_eq!(

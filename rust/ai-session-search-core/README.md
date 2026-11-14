@@ -1,10 +1,11 @@
 # AI Session Search core
 
-Search your local AI coding sessions from Rust. This crate holds the provider adapters,
-normalized domain model, SQLite index, query services, CLI, and MCP transport behind
-[AI Session Search](https://github.com/ahundt/ai-session-search), which reads Claude Code,
-Claude Desktop, ChatGPT Codex, Cursor, Antigravity, Pi, Prime Agent, Google AI Studio, and
-Gemini CLI.
+Search and recover local AI coding-agent session history from Claude Code, Claude Desktop local
+agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI.
+One SQLite index backs the `aise` CLI, MCP server, Python package, and Rust library in
+[AI Session Search](https://github.com/ahundt/ai-session-search).
+
+mcp-name: io.github.ahundt/ai-session-search
 
 The crate builds one executable, `aise`:
 
@@ -24,9 +25,29 @@ use ai_session_search::{MessageFilters, SearchFilters, SessionSearch};
 ```
 
 `SessionSearch` owns the configuration, the SQLite connection, and the worker pool. Keep one
-instance for a related unit of work, then compose the immutable filter and publication types
-re-exported beside it. The crate root is the entry point to build against; the storage, CLI, MCP,
+instance for a related unit of work, then compose the filter and publication types
+re-exported beside it. Opening never reads your session files: call
+`app.index().prepare_for_read()` once to apply the configured refresh policy, or reads on a
+never-indexed database fail with `ServiceError::IndexNotRefreshed`.
+
+```rust,no_run
+use ai_session_search::SessionSearch;
+
+fn main() -> ai_session_search::anyhow::Result<()> {
+    let app = SessionSearch::load()?;
+    app.index().prepare_for_read()?;
+    let recent = app.catalog().list_query(&ai_session_search::SessionQuery::default().with_limit(5))?;
+    println!("{} sessions", recent.len());
+    Ok(())
+}
+```
+The crate root is the entry point to build against; the storage, CLI, MCP,
 provider, and PyO3 modules are implementation surfaces.
+
+Public structs and enums are `#[non_exhaustive]`: construct requests with `Default`, constructors,
+and `with_*` setters, and include a wildcard when matching enums. `SessionQuery` applies configured
+session limits; `SearchFilters` retains zero-means-all behavior. The library guide covers
+[deprecated entry points](https://github.com/ahundt/ai-session-search/blob/main/docs/development/library-api.md#deprecated-rust-entry-points).
 
 Set `default-features = false` to omit the CLI's `release-check` network client; search, index,
 export, and recovery do not need it.

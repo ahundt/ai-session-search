@@ -16,12 +16,6 @@ zero shared commits. Together with the merge commit, the initial monorepo contai
 
 ## Transformation
 
-The follower was cloned from a complete, non-shallow local mirror. Local unpushed
-commit `a0f6cfd` was fetched into that mirror without changing or publishing the
-source repository. `git_history_cleanup_helper` commits `ee6e07c` and `b9f4758`
-provided the clone-first merge, verified bundles, source fingerprints, exact path
-exclusion, binary-preservation policy, commit maps, and final verification.
-
 The follower history was rewritten to:
 
 1. Remove `docs/demo.gif` and blob
@@ -30,10 +24,6 @@ The follower history was rewritten to:
    imported as `rust/sessiongrep/`, then renamed in the major-version cutover).
 3. Preserve all other source, binary assets, commit authors, messages, dates, and
    selected ancestry.
-
-The removed path, blob, and README reference are unreachable from destination
-refs. Original-to-filtered commit maps and verified source bundles are private
-migration audit artifacts and are not part of the published repository.
 
 ## Licensing and credit
 

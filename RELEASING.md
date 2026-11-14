@@ -1,7 +1,7 @@
 # Releasing AI Session Search
 
-**Start here. This is the whole release procedure, start to finish, and the only document a
-release has to follow.** Work down it in order: set the version, pass the gate, finish
+This is the complete release procedure and the only document a release has to follow.
+Work down it in order: set the version, pass the gate, finish
 ["Before tagging, confirm"](#local-gate), tag, then approve each protected environment.
 
 | Document | When |
@@ -27,7 +27,7 @@ One release has one identity, spelled the way each ecosystem requires:
 | Final X.Y.Z (including patch releases) | `X.Y.Z`, tag `vX.Y.Z` | `X.Y.Z` |
 
 `scripts/release_versions.py` is the sole mapping between the two spellings. Preparing a
-release means setting all eight declarations to the new version, then running
+release means setting all nine declarations to the new version, then running
 `cargo update --workspace` and `uv lock` so both lockfiles record it (the gate's lockfile checks
 fail otherwise), in one commit, and tagging that commit. The consumer crate stays unpublished at `0.0.0`; only its requirement on the released
 core crate carries the release version:
@@ -35,6 +35,7 @@ core crate carries the release version:
 | Location | Field |
 | --- | --- |
 | `pyproject.toml` | `project.version` |
+| `server.json` | server and package versions (Cargo/SemVer spelling) |
 | `rust/ai-session-search-core/Cargo.toml` | `package.version` |
 | `rust/ai-session-search-python/Cargo.toml` | `package.version` |
 | `rust/ai-session-search-python/Cargo.toml` | `dependencies.ai-session-search.version` |
@@ -54,7 +55,7 @@ uv run python -m scripts.verify_release_metadata --tag vX.Y.ZrcN
 What is published is recorded by the registries and by `git tag`, never by this file: `git tag
 --list 'v*'`, `https://crates.io/crates/ai-session-search`, and
 `https://pypi.org/project/ai-session-search/`. The working tree declares the next candidate in
-the eight locations above.
+the nine locations above.
 
 ## Toolchain and compatibility
 
@@ -63,8 +64,7 @@ Releases require Rust at or above the workspace `rust-version` (1.89 at the time
 Free-threaded CPython is not supported. The distribution exposes one executable, `aise`, and
 MCP clients run `aise mcp serve`.
 
-1.0.0 is the first stable release; the interfaces of the former private single-user package do
-not constrain it. Release tools (uv, cargo-cyclonedx, cargo-deny)
+1.0.0 is the published stable compatibility baseline. Release tools (uv, cargo-cyclonedx, cargo-deny)
 are pinned by version in `.github/workflows/ci.yml`, `prepare-packages.yml`, and `publish.yml`;
 change them only in a separate reviewed toolchain change.
 
@@ -97,17 +97,8 @@ Do not create a tag until these are also true of the specific release:
 - The exact release commit passes the local gate and package preparation below.
 - Every declaration in the identity table is the new version, and the metadata gate passes
   against the tag you are about to create.
-- The install documentation does not claim that the registries hold only release candidates. The
-  two sentences that did, "No stable version is published yet" in `README.md` and crates.io
-  "carries only release candidates" in `docs/development/installation.md`, were rewritten for
-  1.0.0 and must not return: a published stable release is not undone by the version a working
-  tree declares next, so declaring the following candidate does not make either true again. The
-  documented Cargo command drops `--version '^1.0.0-rc'` in the same release, because a bare
-  `cargo install` reaches a stable version and nothing but a candidate needed the range; see
-  [Pre-release semantics](#pre-release-semantics). `verify_release_metadata` cannot see this --
-  a claim about the registries is not a version declaration -- so
-  `test_the_documentation_does_not_claim_that_no_stable_release_exists` holds the line in the
-  local gate.
+- The install documentation gives stable-release commands and does not claim that the registries
+  hold only release candidates. The repository contract tests guard that guidance.
 - The message-search response shape is the one you intend to publish. Once any version is on a
   registry, removing a field, renaming one, changing a type, or changing what a value means
   requires incrementing `MESSAGE_SEARCH_RESPONSE_SCHEMA_VERSION` across the serializer, the
@@ -169,7 +160,7 @@ The version published by hand is the release version itself, never a placeholder
 `X.Y.Z-rc.0`: a placeholder consumes a version number nobody installs and invites a yank that
 is not warranted, and it is unnecessary because the `crate` job builds the crate twice and
 requires `cmp` to pass, so `cargo package` output is deterministic and reproduces the
-workflow's attested crate byte for byte. Verify that rather than assume it. Because the
+workflow's attested crate byte for byte. Verify the match. Because the
 comparison needs the attested artifact, this happens after the tag, between the workflow
 parking at `crates-io` and approving that environment:
 
@@ -206,8 +197,7 @@ parking at `crates-io` and approving that environment:
 
 ## Pre-release semantics
 
-Three surfaces express pre-release status, two of them implicitly. Verify all three rather than
-assuming the version string carried through:
+Verify pre-release status on all three surfaces; two express it implicitly:
 
 | Surface | How it is expressed | Verify |
 | --- | --- | --- |
@@ -254,31 +244,12 @@ command that could not install once shipped on the README, and it is why
 `test_the_release_check_runs_the_cargo_command_the_readme_gives` ties this table to the README's
 install block.
 
-#### Why a candidate needed an explicit version range and 1.0.0 does not
+#### Pre-release selection
 
-Measured while `1.0.0rc1` and `1.0.0rc2` were the only published versions:
+`cargo install` selects a candidate only when its version requirement asks for one. Stable
+installation uses the unqualified command in the table above. Test the documented invocation.
 
-```
-uv tool install ai-session-search             -> ai-session-search==1.0.0rc2
-uv pip install ai-session-search              -> ai-session-search==1.0.0rc2
-uv add ai-session-search                      -> ai-session-search==1.0.0rc2
-python -m pip install ai-session-search       -> ai-session-search-1.0.0rc2
-cargo add ai-session-search                   -> Adding ai-session-search v1.0.0-rc.2
-cargo install ai-session-search --locked      -> error: could not find `ai-session-search`
-                                                 in registry `crates-io` with version `*`
-cargo install ai-session-search --locked --version '^1.0.0-rc'
-                                              -> Installing ai-session-search v1.0.0-rc.2
-```
-
-Cargo splits on the verb. `cargo add` resolves a candidate the way the Python resolvers do,
-while `cargo install` takes one only when a requirement asks for it, so while every published
-version was a candidate the README had to carry `--version '^1.0.0-rc'` to install at all.
-Publishing a stable version ends that: `cargo install` reaches a non-prerelease version without
-being asked, so from 1.0.0 the README gives the bare command and the table above is where each
-release proves it still installs. A reader has no way to tell an explicit candidate range from
-an instruction to install a candidate, which is the other reason it does not survive 1.0.0.
-
-The Python result surprises people, so do not "fix" it.
+Do not "fix" Python's pre-release selection.
 [PEP 440](https://peps.python.org/pep-0440/#handling-of-pre-releases) excludes pre-releases
 from version specifiers "unless they are already present on the system, explicitly requested by
 the user, or if the only available version that satisfies the version specifier is a
@@ -305,9 +276,9 @@ environment, override it:
 AI_SESSION_SEARCH_RUSTC_WRAPPER= ./run_ci_local.sh
 ```
 
-That form exports an empty `RUSTC_WRAPPER`, which turns the wrapper off. The gate also sets
-`CARGO_INCREMENTAL=0`, so with no wrapper every run is a cold full rebuild of a large workspace
-and takes far longer than a cached one.
+That form exports an empty `RUSTC_WRAPPER`, which turns the wrapper off. The gate defaults
+`CARGO_INCREMENTAL=0` when unset or empty. With no wrapper, a full rebuild of the large workspace
+takes far longer than a cached one.
 
 The gate checks both lockfiles, builds the current ABI3 extension, runs Ruff, mypy, stub parity,
 Python tests, Rust formatting/check/Clippy/tests/doctests, the release executable and MCP
@@ -395,7 +366,13 @@ Before tagging, confirm:
   temporary files were cleaned up in each case.
 - Latency and memory were measured against the prior release and any regression is understood.
   Use `scripts/benchmark_release.py` with `--fixture generated`, then compare the baseline and
-  candidate JSONL with `scripts/render_benchmark_report.py`. A release whose diff cannot change a
+  candidate JSONL with `scripts/render_benchmark_report.py`. Cross-version comparison requires
+  equal result digests or an exact baseline/candidate digest pair in that case's `accepted_results`
+  manifest declaration. Each declaration names an added field or documented change, its exact
+  difference, and the changelog reference. The checked pairs use the default generated fixture
+  (seed 20260716, 128 sessions, 32 messages per session). Review a new pair when outputs change;
+  `require_equal=false` and `baseline_allow_failure=true` are deprecated and no longer bypass
+  comparison or process failures. A release whose diff cannot change a
   hot path can record that reasoning instead of a measurement, naming the diff.
 
 ## TestPyPI rehearsal
@@ -403,8 +380,7 @@ Before tagging, confirm:
 crates.io has no test registry, so only the Python half can be rehearsed. The tag push rehearses
 it automatically: `publish-testpypi` runs on both triggers and `publish-crate` waits for it, so a
 rejected wheel tag or unrenderable metadata stops the release while every registry version is
-still repairable. The 1.0.0rc2 tag push is why it works that way, because the job was
-dispatch-only then and reported `skipped` while the crate went to crates.io.
+still repairable.
 
 The job uploads the verified wheels and sdist, then installs the release from TestPyPI alone and
 runs `aise --version`, because an accepted upload is a weaker property than an installable wheel.
@@ -517,11 +493,18 @@ git rev-list -n1 vX.Y.ZrcN   # must equal the commit CI passed on
 
 **2. Find the run and watch it.**
 
-- Browser: `https://github.com/<owner>/<repo>/actions/workflows/publish.yml`, newest run.
+Select the run by the tag and its commit. The newest run can belong to another tag or to a manual
+dispatch started in the meantime.
+
+- Browser: `https://github.com/<owner>/<repo>/actions/workflows/publish.yml`, the push run for
+  the tag, whose commit is the one `git rev-list -n1 vX.Y.ZrcN` printed.
 - Commands:
 
 ```bash
-RID=$(gh run list --workflow publish.yml --limit 1 --json databaseId --jq '.[0].databaseId')
+TAG_SHA=$(git rev-list -n1 vX.Y.ZrcN)
+RID=$(gh run list --workflow publish.yml --event push --branch vX.Y.ZrcN \
+  --json databaseId,headSha --jq ".[] | select(.headSha == \"$TAG_SHA\") | .databaseId" | head -n1)
+test -n "$RID"   # empty means the run has not started yet; wait and repeat
 gh run watch "$RID"
 gh run view "$RID" --json status,jobs \
   --jq '{status, waiting:[.jobs[]|select(.status=="waiting")|.name],
@@ -592,9 +575,28 @@ Editing a release body changes a public page; it does not change the tag or any 
 
 ## Post-release and recovery
 
-Install the published version into clean Cargo and Python environments. Verify `aise --version`,
-`aise package status`, a typed search, Python imports, MCP startup/EOF/cancellation, and database
-compatibility against an index written by the previous release.
+Install the published version into clean Cargo and Python environments, then run the checks
+below from a checkout of the tagged commit. `PYTHON` is the interpreter of the environment the
+package was installed into and `AISE` is the installed executable.
+
+```bash
+"$AISE" --version          # must print the released version
+"$AISE" package status     # must name the manager that installed it
+# The installed Python package, not the checkout: help, configuration contract, import, and
+# MCP initialize, tools/list and exit on EOF.
+PATH="$(dirname "$PYTHON"):$PATH" "$PYTHON" -I scripts/verify_installed_distribution.py \
+  --source-root "$PWD"
+# The same command-line contract for a Cargo or native-archive executable, with isolated state.
+"$PYTHON" -I scripts/verify_native_executable.py --executable "$AISE"
+# An index written by each published release opens, refreshes, and equals a fresh build.
+uv run --no-project python -m scripts.verify_upgrade_path --executable "$AISE"
+```
+
+Then upgrade your own installation, run one typed search against your own index, such as
+`aise messages search --query-mode regex 'fn \w+' --limit 3`, and confirm that a harness with the
+MCP server registered lists its tools. MCP cancellation is tested at the tagged commit by
+`cargo test -p ai-session-search --lib official_rmcp`; no script cancels a request against an
+installed executable.
 
 If a stage fails:
 

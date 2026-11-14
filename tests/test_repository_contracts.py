@@ -562,6 +562,7 @@ def test_skill_package_documentation_matches_the_one_shipped_package() -> None:
             "docs/development/configuration.md",
             "docs/development/installation.md",
             "docs/development/maintainer-requirements-and-design-decisions.md",
+            "docs/development/maintainer-contracts-for-install-and-config.md",
         )
     )
     for retired_claim in (
@@ -618,7 +619,7 @@ def test_internal_maintainer_skill_is_project_scoped_and_not_packaged() -> None:
     assert "### REQ023-accept-capability-parameters" in requirements_text
     assert "## Verification map" in requirements_text
     assert "~/.gemini/config/mcp_config.json" in requirements_text
-    assert "ModuleNotFoundError: No module named 'encodings'" in requirements_text
+    assert "Current measured installation evidence" not in requirements_text
     assert "Cumulative user requirements" not in requirements_text
     assert re.search(r"(?m)^\d+\. > ", requirements_text) is None
     assert re.search(r"REQ\d{3}(?!-)", requirements_text) is None
@@ -676,8 +677,10 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     architecture = (ROOT / "docs/migration/rust-python-api-architecture.md").read_text(encoding="utf-8")
     parity = (ROOT / "docs/migration/capability-parity.md").read_text(encoding="utf-8")
 
-    assert "uv sync --locked --all-extras" in readme
-    assert "mypy.stubtest ai_session_search" in readme
+    contributing = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+    assert "[CONTRIBUTING.md](CONTRIBUTING.md)" in readme
+    assert "uv sync --locked --all-extras" in contributing
+    assert "mypy.stubtest ai_session_search" in contributing
     assert "closed schemas" in readme
     configuration = (ROOT / "docs/development/configuration.md").read_text(encoding="utf-8")
     # Both line-window scopes stay documented with their shared sign convention.
@@ -706,9 +709,12 @@ def test_public_docs_match_native_abi_mcp_and_quality_gates() -> None:
     assert "~/.prime/agent/settings.json" in installation and 'type: "stdio"' in installation
     for mcp_path in ("~/.pi/agent/mcp.json", "~/.prime/agent/settings.json"):
         assert mcp_path in readme
-    acceptance = installation.split("The integration acceptance matrix", 1)[1]
+    maintainer_contracts = (ROOT / "docs/development/maintainer-contracts-for-install-and-config.md").read_text(
+        encoding="utf-8"
+    )
+    acceptance = maintainer_contracts.split("The integration acceptance matrix", 1)[1]
     assert "Pi" in acceptance and "Prime Agent" in acceptance
-    assert "toml_edit::DocumentMut" in configuration
+    assert "toml_edit::DocumentMut" in maintainer_contracts
     assert "ChatGPT Codex desktop" in configuration
     assert "~/.gemini/config/mcp_config.json" in configuration
     assert "~/.gemini/antigravity-cli/skills/" in configuration
@@ -744,7 +750,7 @@ def test_readme_opening_and_format_count_cover_every_provider() -> None:
     # One count-word anchor, in the prose. A second assertion pinned the same word in a heading,
     # which forced the heading to stay a noun phrase; the prose anchor alone still fails when a
     # new provider changes PROVIDER_COUNT_WORD without the README following.
-    assert f"parses all {PROVIDER_COUNT_WORD} formats" in readme
+    assert f"Search {PROVIDER_COUNT_WORD} providers from one index" in readme
     for provider_id in PROVIDER_IDS:
         assert f"`{provider_id}`" in readme, f"README has no session-source row for {provider_id}"
 
@@ -797,7 +803,7 @@ def test_message_search_default_extent_is_documented_consistently() -> None:
     assert "Rust, CLI, or Python message search" in normalized_readme
     assert "every literal, regex, or no-text match" in normalized_readme
     assert "--all-results" in normalized_readme
-    assert "Session-level and MCP searches page instead" in normalized_readme
+    assert "Session-level and MCP searches page by default" in normalized_readme
     assert "Fuzzy search always needs a finite page" in normalized_readme
     assert "every literal, regex, or no-text CLI match" in cli
     assert "Rust, CLI, and Python" in core and "MCP" in core
@@ -1422,21 +1428,11 @@ def test_dependency_automation_covers_each_locked_ecosystem() -> None:
     assert policy.count('interval: "weekly"') == 3
 
 
-def test_release_guide_records_standard_tool_adoption_decisions() -> None:
-    from pathlib import Path
-
-    guide = Path("docs/development/releasing-design-decisions.md").read_text(encoding="utf-8")
-    for tool in (
-        "maturin-action",
-        "cibuildwheel",
-        "cargo-dist",
-        "release-plz",
-        "cargo-semver-checks",
-        "cargo-binstall",
-        "Dependabot",
-        "zizmor",
-    ):
+def test_release_guide_names_the_tools_used_by_the_workflow() -> None:
+    guide = (ROOT / "docs/development/releasing-design-decisions.md").read_text(encoding="utf-8")
+    for tool in ("uv", "maturin-action", "cargo-deny", "actionlint", "zizmor", "Dependabot"):
         assert tool in guide
+    assert "Planned after the first public baseline" not in guide
 
 
 def test_temporal_complexity_contracts_are_kept_with_their_owners() -> None:
@@ -1464,7 +1460,7 @@ def test_readme_and_packaged_skill_explain_temporal_and_recent_directory_retriev
         "`until` tests the span start",
         "may contain gaps",
         "component-boundary descendant",
-        "leaves lexical siblings",
+        "excluding siblings such as `project-other`",
     ):
         assert phrase in skill
 

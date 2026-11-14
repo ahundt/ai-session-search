@@ -8,6 +8,7 @@ use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Provider {
     Claude,
     #[serde(rename = "claude-desktop")]
@@ -117,6 +118,7 @@ impl std::str::FromStr for Provider {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum Role {
     User,
     Assistant,
@@ -179,6 +181,7 @@ impl std::str::FromStr for Role {
 /// not equivalent over rows whose stored `kind` is outside the current enum: `AllExcept`
 /// keeps them, `Only` does not. See [`MessageFilters::kind_predicate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KindPredicate {
     /// Caller named no set: return everything except these classes.
     AllExcept(Vec<MessageKind>),
@@ -195,6 +198,7 @@ pub enum KindPredicate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MessageKind {
     Conversation,
     Compaction,
@@ -213,6 +217,7 @@ pub enum MessageKind {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 #[clap(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum MessageSearchMode {
     #[default]
     Literal,
@@ -248,6 +253,7 @@ impl std::str::FromStr for MessageSearchMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SearchField {
     Content,
     ToolName,
@@ -305,11 +311,9 @@ impl MessageKind {
     }
 
     /// Every class [`MessageFilters::kind_predicate`] can leave out when the caller names no
-    /// set: `HarnessNotice` always, `Compaction` under `no_compaction`. Together a small share of
-    /// any real index (2 % of 2.69 M rows measured), which is what lets a count over the default
-    /// predicate be written as `count(everything) - count(these)`; the storage layer keeps a
-    /// partial index over exactly this set for the second term. Kept in ascending name order so
-    /// the SQL rendered from it is stable.
+    /// set: `HarnessNotice` always, `Compaction` under `no_compaction`. This lets the default
+    /// count subtract excluded classes from the total using a partial covering index.
+    /// Kept in ascending name order so the rendered SQL is stable.
     pub const EXCLUDABLE_BY_DEFAULT: &'static [Self] = &[Self::Compaction, Self::HarnessNotice];
 
     /// Parse a `kind` value read back from the index, mapping anything unrecognized to
@@ -366,6 +370,7 @@ impl std::str::FromStr for MessageKind {
 )]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum MessageAuthorship {
     Human,
     Agent,
@@ -393,21 +398,26 @@ impl MessageAuthorship {
     }
 }
 
+fn parse_provenance_enum<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, String> {
+    T::deserialize(serde::de::value::StringDeserializer::<
+        serde::de::value::Error,
+    >::new(value.to_ascii_lowercase().replace('-', "_")))
+    .map_err(|error| {
+        format!(
+            "invalid {} {value:?}: {error}",
+            std::any::type_name::<T>()
+                .rsplit("::")
+                .next()
+                .unwrap_or("provenance")
+        )
+    })
+}
+
 impl std::str::FromStr for MessageAuthorship {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().replace('-', "_").as_str() {
-            "human" => Ok(Self::Human),
-            "agent" => Ok(Self::Agent),
-            "harness" => Ok(Self::Harness),
-            "generated" => Ok(Self::Generated),
-            "mixed" => Ok(Self::Mixed),
-            "unknown" => Ok(Self::Unknown),
-            other => Err(format!(
-                "unknown message authorship: {other} — must be one of \"human\", \"agent\", \"harness\", \"generated\", \"mixed\", \"unknown\""
-            )),
-        }
+        parse_provenance_enum(value)
     }
 }
 
@@ -417,12 +427,25 @@ impl std::str::FromStr for MessageAuthorship {
 /// validation and match attribution linear in the number of parts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ContentPartAuthorship {
     Human,
     Agent,
     Harness,
     Generated,
     Unknown,
+}
+
+impl From<ContentPartAuthorship> for MessageAuthorship {
+    fn from(part: ContentPartAuthorship) -> Self {
+        match part {
+            ContentPartAuthorship::Human => Self::Human,
+            ContentPartAuthorship::Agent => Self::Agent,
+            ContentPartAuthorship::Harness => Self::Harness,
+            ContentPartAuthorship::Generated => Self::Generated,
+            ContentPartAuthorship::Unknown => Self::Unknown,
+        }
+    }
 }
 
 impl ContentPartAuthorship {
@@ -445,16 +468,7 @@ impl std::str::FromStr for ContentPartAuthorship {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().replace('-', "_").as_str() {
-            "human" => Ok(Self::Human),
-            "agent" => Ok(Self::Agent),
-            "harness" => Ok(Self::Harness),
-            "generated" => Ok(Self::Generated),
-            "unknown" => Ok(Self::Unknown),
-            other => Err(format!(
-                "unknown content-part authorship: {other} — must be one of \"human\", \"agent\", \"harness\", \"generated\", \"unknown\""
-            )),
-        }
+        parse_provenance_enum(value)
     }
 }
 
@@ -462,6 +476,7 @@ impl std::str::FromStr for ContentPartAuthorship {
 /// provider string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum ContentPartOrigin {
     DirectInput,
     QuotedContent,
@@ -492,17 +507,7 @@ impl std::str::FromStr for ContentPartOrigin {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().replace('-', "_").as_str() {
-            "direct_input" => Ok(Self::DirectInput),
-            "quoted_content" => Ok(Self::QuotedContent),
-            "harness_context" => Ok(Self::HarnessContext),
-            "generated_summary" => Ok(Self::GeneratedSummary),
-            "tool_payload" => Ok(Self::ToolPayload),
-            "unknown" => Ok(Self::Unknown),
-            other => Err(format!(
-                "unknown content-part origin: {other} — must be one of \"direct_input\", \"quoted_content\", \"harness_context\", \"generated_summary\", \"tool_payload\", \"unknown\""
-            )),
-        }
+        parse_provenance_enum(value)
     }
 }
 
@@ -511,6 +516,7 @@ impl std::str::FromStr for ContentPartOrigin {
 /// Offsets are half-open Unicode-scalar positions, matching the public message-search character
 /// coordinates rather than UTF-8 byte indexes. Parts are stored without another copy of the text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageContentPart {
     pub ordinal: u32,
     pub start_char: usize,
@@ -519,20 +525,62 @@ pub struct MessageContentPart {
     pub origin: ContentPartOrigin,
 }
 
-/// Closed authority that owns a provider-native event identity.
+impl MessageContentPart {
+    /// Construct a region with half-open Unicode-scalar offsets. Full-message validation occurs
+    /// through [`MessageProvenance::validate`] before persistence.
+    pub fn new(
+        ordinal: u32,
+        start_char: usize,
+        end_char: usize,
+        authorship: ContentPartAuthorship,
+        origin: ContentPartOrigin,
+    ) -> Self {
+        Self {
+            ordinal,
+            start_char,
+            end_char,
+            authorship,
+            origin,
+        }
+    }
+
+    pub(crate) fn is_user_input(&self) -> bool {
+        match self.origin {
+            ContentPartOrigin::DirectInput => matches!(
+                self.authorship,
+                ContentPartAuthorship::Human | ContentPartAuthorship::Unknown
+            ),
+            ContentPartOrigin::QuotedContent | ContentPartOrigin::Unknown => {
+                self.authorship == ContentPartAuthorship::Human
+            }
+            ContentPartOrigin::HarnessContext
+            | ContentPartOrigin::GeneratedSummary
+            | ContentPartOrigin::ToolPayload => false,
+        }
+    }
+}
+
+/// Closed authority for an event identity. `SourceLocal` identifies a reference derived from
+/// a local transcript, rather than an ID supplied by its provider.
 ///
 /// Related harness surfaces share an authority only when their source format can carry the same
 /// native identity. The additional identity `scope` prevents unrelated ID domains owned by that
 /// authority from colliding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageCorrelationAuthority {
     Anthropic,
+    #[serde(alias = "openai")]
     OpenAi,
     Cursor,
     Google,
     Pi,
+    #[serde(alias = "primeagent")]
     PrimeAgent,
+    /// Identity generated by the parser from stable source-local coordinates, not a provider UUID.
+    #[serde(alias = "sourcelocal")]
+    SourceLocal,
 }
 
 impl MessageCorrelationAuthority {
@@ -544,6 +592,7 @@ impl MessageCorrelationAuthority {
             Self::Google => "google",
             Self::Pi => "pi",
             Self::PrimeAgent => "prime_agent",
+            Self::SourceLocal => "source_local",
         }
     }
 
@@ -556,34 +605,44 @@ impl std::str::FromStr for MessageCorrelationAuthority {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().replace('-', "_").as_str() {
-            "anthropic" => Ok(Self::Anthropic),
-            "open_ai" | "openai" => Ok(Self::OpenAi),
-            "cursor" => Ok(Self::Cursor),
-            "google" => Ok(Self::Google),
-            "pi" => Ok(Self::Pi),
-            "prime_agent" | "primeagent" => Ok(Self::PrimeAgent),
-            other => Err(format!(
-                "unknown message correlation authority: {other} — must be one of \"anthropic\", \"open_ai\", \"cursor\", \"google\", \"pi\", \"prime_agent\""
-            )),
-        }
+        parse_provenance_enum(value)
     }
 }
 
-/// Stable identity shared by an original source event and every known rendered/mirrored copy.
+/// Event identity shared by an original source event and its proven rendered/mirrored copies.
+/// Source-local identities are scoped to the referenced transcript and do not prove that an
+/// event in another source is a copy.
 ///
 /// Hash/equality deliberately cover only identity. Whether a stored row is the original or a copy
 /// is separate metadata and must never split one correlation group.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageCorrelationIdentity {
     pub authority: MessageCorrelationAuthority,
     pub scope: String,
     pub id: String,
 }
 
+impl MessageCorrelationIdentity {
+    /// Construct a source identity. [`MessageProvenance::validate`] checks nonempty scope and ID
+    /// before persistence.
+    pub fn new(
+        authority: MessageCorrelationAuthority,
+        scope: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Self {
+        Self {
+            authority,
+            scope: scope.into(),
+            id: id.into(),
+        }
+    }
+}
+
 /// How this stored row relates to its correlation group.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MessageRecordRelation {
     Original,
     Mirror,
@@ -609,26 +668,182 @@ impl std::str::FromStr for MessageRecordRelation {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.to_ascii_lowercase().as_str() {
-            "original" => Ok(Self::Original),
-            "mirror" => Ok(Self::Mirror),
-            "unknown" => Ok(Self::Unknown),
-            other => Err(format!(
-                "unknown correlated record relation: {other} — must be one of \"original\", \"mirror\", \"unknown\""
-            )),
+        parse_provenance_enum(value)
+    }
+}
+
+/// Submission and delivery evidence for recorded input. `Submitted` marks an enqueue;
+/// it does not confirm that the model received the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum InputDeliveryState {
+    Submitted,
+}
+
+impl InputDeliveryState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Submitted => "submitted",
         }
     }
 }
 
+impl std::str::FromStr for InputDeliveryState {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_provenance_enum(value)
+    }
+}
+
+impl InputDeliveryState {
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+}
+
+/// How the provider recorded user input, independent of sender attribution and delivery.
+/// `Queued` marks an input-queue enqueue; `InteractiveAnswer` marks a linked answer in a tool
+/// result. Neither origin proves that the model received the input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MessageInputOrigin {
+    DirectConversation,
+    Queued,
+    InteractiveAnswer,
+}
+
+impl MessageInputOrigin {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectConversation => "direct_conversation",
+            Self::Queued => "queued",
+            Self::InteractiveAnswer => "interactive_answer",
+        }
+    }
+
+    pub fn from_db_str(value: &str) -> Option<Self> {
+        value.parse().ok()
+    }
+}
+
+impl std::str::FromStr for MessageInputOrigin {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        parse_provenance_enum(value)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "StoredMessageProvenance")]
+#[non_exhaustive]
 pub struct MessageProvenance {
     pub authorship: MessageAuthorship,
     pub record_relation: MessageRecordRelation,
     pub correlation_identity: Option<MessageCorrelationIdentity>,
+    /// `None` when the source provides no delivery evidence.
+    pub input_delivery_state: Option<InputDeliveryState>,
+    /// `None` when the source provides no origin evidence.
+    pub input_origin: Option<MessageInputOrigin>,
     pub content_parts: Vec<MessageContentPart>,
+    /// SQL-only `input_origin='unknown'` marks rows written before origin recording.
+    #[serde(skip)]
+    pub(crate) legacy_input_origin: bool,
+}
+
+/// Read-only storage adapter: legacy origin "unknown" must set the private legacy marker as
+/// well as public None. A field deserializer cannot set a sibling field; a manual parent visitor
+/// would repeat these fields plus serde's missing/duplicate-field handling. Keep this private so
+/// storage compatibility does not introduce a second public provenance model.
+#[derive(Deserialize)]
+struct StoredMessageProvenance {
+    authorship: MessageAuthorship,
+    record_relation: MessageRecordRelation,
+    correlation_identity: Option<MessageCorrelationIdentity>,
+    input_delivery_state: Option<String>,
+    input_origin: Option<String>,
+    content_parts: Vec<MessageContentPart>,
+}
+
+impl TryFrom<StoredMessageProvenance> for MessageProvenance {
+    type Error = String;
+
+    fn try_from(source: StoredMessageProvenance) -> Result<Self, Self::Error> {
+        Ok(Self {
+            legacy_input_origin: source.input_origin.as_deref() == Some("unknown"),
+            authorship: source.authorship,
+            record_relation: source.record_relation,
+            correlation_identity: source.correlation_identity,
+            input_delivery_state: source
+                .input_delivery_state
+                .filter(|value| value != "unknown")
+                .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            input_origin: source
+                .input_origin
+                .filter(|value| value != "unknown")
+                .map(|value| serde_json::from_value(serde_json::Value::String(value)))
+                .transpose()
+                .map_err(|error| error.to_string())?,
+            content_parts: source.content_parts,
+        })
+    }
 }
 
 impl MessageProvenance {
+    /// Borrow the four-field hit header without copying or serializing partitions or identity.
+    /// Full evidence can exceed an MCP response cap even for one hit with bounded text.
+    /// Serialization takes constant time and space, independent of evidence size.
+    pub fn hit_header(&self) -> impl Serialize + '_ {
+        struct Header<'a>(&'a MessageProvenance);
+        impl Serialize for Header<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                use serde::ser::SerializeStruct;
+                let mut header = serializer.serialize_struct("MessageProvenance", 4)?;
+                header.serialize_field("authorship", &self.0.authorship)?;
+                header.serialize_field("record_relation", &self.0.record_relation)?;
+                header.serialize_field("input_origin", &self.0.input_origin)?;
+                header.serialize_field("input_delivery_state", &self.0.input_delivery_state)?;
+                header.end()
+            }
+        }
+        Header(self)
+    }
+
+    pub(crate) fn stored_input_origin(&self) -> Option<&'static str> {
+        self.input_origin
+            .map(MessageInputOrigin::as_str)
+            .or(self.legacy_input_origin.then_some("unknown"))
+    }
+
+    /// Explicit source evidence, also used for source-family reconciliation without role inference.
+    pub(crate) fn is_whole_user_input(&self) -> bool {
+        self.authorship == MessageAuthorship::Human
+            || (self.authorship == MessageAuthorship::Unknown
+                && matches!(
+                    self.input_origin,
+                    Some(
+                        MessageInputOrigin::DirectConversation
+                            | MessageInputOrigin::Queued
+                            | MessageInputOrigin::InteractiveAnswer
+                    )
+                ))
+    }
+
+    /// Retrieval fallback for older rows; this must not establish native source-family identity.
+    pub(crate) fn is_legacy_user_input(&self, role: Role) -> bool {
+        self.authorship == MessageAuthorship::Unknown
+            && (self.record_relation == MessageRecordRelation::Unknown
+                || (self.record_relation == MessageRecordRelation::Original
+                    && self.legacy_input_origin))
+            && self.input_origin.is_none()
+            && matches!(role, Role::User | Role::Slash)
+    }
+
     /// Validate in one pass: `O(S)` time and `O(1)` additional memory for `S` content parts.
     pub fn validate(&self, content: &str) -> Result<(), String> {
         if let Some(identity) = &self.correlation_identity {
@@ -703,7 +918,8 @@ impl MessageProvenance {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Message {
     pub seq: i64,
     pub role: Role,
@@ -717,7 +933,25 @@ pub struct Message {
     pub provenance: MessageProvenance,
 }
 
+impl Message {
+    /// A conversation message with no timestamp, tool, or recorded provenance.
+    pub fn new(seq: i64, role: Role, content: impl Into<String>) -> Self {
+        Self {
+            seq,
+            role,
+            ts: None,
+            tool_name: None,
+            kind: MessageKind::Conversation,
+            tool_call_id: None,
+            is_compaction: false,
+            content: content.into(),
+            provenance: MessageProvenance::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SessionRecord {
     pub id: String,
     pub provider: Provider,
@@ -750,17 +984,48 @@ pub struct SessionRecord {
     /// row carries in `id` and needs no rule about stripping a prefix before comparing.
     ///
     /// PATTERN: this names a row that need not exist. Providers keep a spawned run's transcript
-    /// after the parent conversation is rotated away — in one project directory, 549 runs
-    /// referenced 69 distinct parents and not one of those parent transcripts was still on
-    /// disk. Recovering exactly that otherwise-unreachable work is a reason this is indexed, so
-    /// do NOT add `references sessions(id)` to this column: the constraint would reject every
-    /// such run at insert, and a cascade would delete the runs when a parent is reindexed away.
+    /// after the parent conversation is rotated away. Do not add `references sessions(id)`:
+    /// that would reject an orphaned run or cascade-delete it when its parent is removed.
     pub parent_session_id: Option<String>,
     /// Human-meaningful name for the spawned agent when the provider records one: claude's
     /// `agentType` (`Explore`, `general-purpose`), codex's `agent_nickname`, or the agent's
     /// own directory or file name where that is all a provider records. Display and grouping
     /// only; the link is `parent_session_id`.
     pub agent_label: Option<String>,
+}
+
+impl SessionRecord {
+    /// A session with its identity and parse provenance; every descriptive field is empty.
+    pub fn new(
+        id: impl Into<String>,
+        provider: Provider,
+        provider_session_id: impl Into<String>,
+        source_path: impl Into<String>,
+        parse_version: impl Into<String>,
+        discovery_source: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            provider,
+            provider_session_id: provider_session_id.into(),
+            title: None,
+            summary: None,
+            cwd: None,
+            repo_root: None,
+            created_at: None,
+            updated_at: None,
+            last_message_at: None,
+            preview_text: String::new(),
+            source_path: source_path.into(),
+            message_count: None,
+            parse_version: parse_version.into(),
+            raw_metadata_json: None,
+            parse_warning: None,
+            discovery_source: discovery_source.into(),
+            parent_session_id: None,
+            agent_label: None,
+        }
+    }
 }
 
 /// Opaque keyset cursor for a bounded session-analysis document scan.
@@ -784,6 +1049,7 @@ impl AnalysisCursor {
 /// whose transcript role is `user`: agent delegation, harness, generated, mirrored, and unknown
 /// content is excluded, while only human-authored parts of mixed messages are retained.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct AnalysisDocument {
     pub session: SessionRecord,
     pub user_text: String,
@@ -794,6 +1060,7 @@ pub struct AnalysisDocument {
 
 /// One bounded keyset page of provider-normalized analysis documents.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct AnalysisDocumentPage {
     pub documents: Vec<AnalysisDocument>,
     pub next_cursor: Option<AnalysisCursor>,
@@ -803,7 +1070,8 @@ pub struct AnalysisDocumentPage {
 /// extracted from an assistant turn. Threaded through [`ParsedSession`] like
 /// [`Message`], persisted to the `file_edits` table, and replayed to reconstruct
 /// historical file content (`files extract`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct FileEdit {
     /// Monotonic order within the session (independent of message seq).
     pub seq: i64,
@@ -819,11 +1087,30 @@ pub struct FileEdit {
     pub edits: Vec<EditOp>,
 }
 
+impl FileEdit {
+    /// An edit with no timestamp, no full content and no replacements; `file_name` is the
+    /// basename of `file_path`, as the parsers store it. Set `new_content` for a `Write` or push
+    /// [`EditOp`]s for an `Edit`.
+    pub fn new(seq: i64, tool: impl Into<String>, file_path: impl Into<String>) -> Self {
+        let file_path = file_path.into();
+        Self {
+            seq,
+            ts: None,
+            tool: tool.into(),
+            file_name: crate::util::file_basename(&file_path),
+            file_path,
+            new_content: None,
+            edits: Vec::new(),
+        }
+    }
+}
+
 /// One `old_string`→`new_string` replacement from an `Edit`/`MultiEdit` tool call.
 /// `replace_all` mirrors Claude's `Edit` flag: when true the replacement is applied to
 /// every occurrence, otherwise only the first (which is also the only one, since a
 /// non-`replace_all` `Edit` requires `old_string` to be unique).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct EditOp {
     pub old: String,
     pub new: String,
@@ -844,6 +1131,7 @@ impl EditOp {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ParsedSession {
     pub session: SessionRecord,
     pub transcript_text: String,
@@ -851,27 +1139,89 @@ pub struct ParsedSession {
     pub messages: Vec<Message>,
     /// File-mutating tool calls persisted to the `file_edits` table (file-version recovery).
     pub file_edits: Vec<FileEdit>,
+    /// Rows an earlier parser derived from records that are still in this source but that this
+    /// parser no longer indexes; see `RetractedRows`.
+    #[serde(skip)]
+    pub(crate) retracted: RetractedRows,
+}
+
+/// What an earlier parser made of records this parser declines, rendered the way it did then.
+///
+/// The index is an archive: a stored row the current parse lacks is kept, because its source
+/// record may have been compacted or pruned away. That rule cannot tell a record that is gone
+/// from a record that is present but no longer a message, such as Claude Code's
+/// `api-request-blob` request copies. These rows name the second case. A stored row the parse
+/// does not hold and that equals one of these is removed on reindex; every other stored row the
+/// parse lacks is kept, so content whose record is gone from the source is never deleted.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RetractedRows {
+    pub(crate) messages: Vec<Message>,
+    pub(crate) file_edits: Vec<FileEdit>,
+    /// The session-text entries the earlier parser wrote for those records. When an archive keep
+    /// merges stored session text with the parse's, one stored paragraph equal to each of these
+    /// is left out, as `messages` are.
+    pub(crate) transcript: Vec<String>,
+}
+
+impl ParsedSession {
+    /// A parse result with no transcript text and no file edits.
+    pub fn new(session: SessionRecord, messages: Vec<Message>) -> Self {
+        Self {
+            session,
+            transcript_text: String::new(),
+            messages,
+            file_edits: Vec::new(),
+            retracted: RetractedRows::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SourceFile {
     pub provider: Provider,
     pub path: std::path::PathBuf,
     pub mtime_ns: i64,
     pub size_bytes: i64,
+    pub(crate) sidecar: Option<SourceSidecar>,
+}
+
+/// Discovery-only metadata; no public request or result carries this bookkeeping.
+#[derive(Debug, Clone)]
+pub(crate) struct SourceSidecar {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) mtime_ns: i64,
+    pub(crate) size_bytes: i64,
+}
+
+impl SourceFile {
+    /// A transcript file to hand to a provider adapter's `parse`, as its `discover` reports one.
+    pub fn new(
+        provider: Provider,
+        path: impl Into<std::path::PathBuf>,
+        mtime_ns: i64,
+        size_bytes: i64,
+    ) -> Self {
+        Self {
+            provider,
+            path: path.into(),
+            mtime_ns,
+            size_bytes,
+            sidecar: None,
+        }
+    }
 }
 
 /// Who started a session — the session-level counterpart of [`MessageKind`], selected the same
 /// way through a set rather than a flag per class.
 ///
-/// The two spellings are the providers' own. Codex stores this exact enum on its session
-/// metadata as `thread_source`, with the values `user` and `subagent` (167 and 247 of the 414
-/// rollouts this was checked against). `subagent` is what every provider that marks the concept
-/// calls it: codex's `thread_source` value and `source.subagent` key, the `subagents`
-/// directory claude and cursor both write, claude's `subagent_type` Task parameter, and
-/// gemini-cli's `subagent_N` author labels. `user` is the counterpart because it is the one
-/// reading no provider contradicts — and because a subagent IS an agent, so naming the other
-/// class `agent` would make `[agent]` unpredictable, while nothing about a subagent is a user.
+/// The two spellings are the providers' own. Codex stores this exact enum on its session metadata
+/// as `thread_source`, with the values `user` and `subagent`. `subagent` is what every provider
+/// that marks the concept calls it: codex's `thread_source` value and `source.subagent` key, the
+/// `subagents` directory claude and cursor both write, claude's `subagent_type` Task parameter, and
+/// gemini-cli's `subagent_N` author labels. `user` is the counterpart because it is the one reading
+/// no provider contradicts — and because a subagent IS an agent, so naming the other class `agent`
+/// would make `[agent]` unpredictable, while nothing about a subagent is a user.
 ///
 /// Derived from [`SessionRecord::parent_session_id`] rather than stored, so the classes are
 /// exhaustive by construction and no row can fall outside them. That is why selection needs no
@@ -885,15 +1235,15 @@ pub struct SourceFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 #[clap(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum SessionKind {
     /// A session a person started. Codex's `thread_source: "user"`; claude's
-    /// `isSidechain: false`, which held on 143,220 of 143,224 records in top-level transcripts.
+    /// `isSidechain: false` identifies a top-level Claude transcript.
     User,
     /// A run some other session spawned, with [`SessionRecord::parent_session_id`] naming the
     /// spawner and [`SessionRecord::agent_label`] naming the kind of agent. Codex's
-    /// `thread_source: "subagent"`; claude's `isSidechain: true`. On this machine they
-    /// outnumber user-started claude sessions roughly five to one, which is why selecting by
-    /// class is worth a parameter.
+    /// `thread_source: "subagent"`; Claude's `isSidechain: true`. Select this class to
+    /// search spawned work separately from sessions a person started.
     Subagent,
 }
 
@@ -953,8 +1303,23 @@ impl std::str::FromStr for SessionKind {
     }
 }
 
+/// Structural filters for session listing, session search, export, and analysis.
+///
+/// Start from [`SearchFilters::default`], which selects every session, and narrow it with the
+/// `with_*` setters or by assigning fields:
+///
+/// ```
+/// use ai_session_search::{Provider, SearchFilters};
+/// let recent = SearchFilters::default()
+///     .with_provider(Provider::Claude)
+///     .with_path_prefix("/work/project")
+///     .with_limit(5);
+/// assert_eq!(recent.limit, 5);
+/// ```
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct SearchFilters {
+    /// Restrict to one indexed session source. `None` (the default) selects every provider.
     pub provider: Option<Provider>,
     /// Which classes of session to return. `None` selects the default set
     /// ([`SessionKind::default_search_set`]), which is every class.
@@ -963,8 +1328,13 @@ pub struct SearchFilters {
     /// [`MessageFilters::kinds`] one level up. Adding a class means adding a [`SessionKind`]
     /// variant, never an `include_<class>` boolean or a `<class>_only` flag beside it.
     pub session_kinds: Option<Vec<SessionKind>>,
+    /// Keep sessions whose cwd, repository root, or transcript path is this directory or below
+    /// it, matched on whole path components. `None` (the default) applies no path restriction.
     pub path_prefix: Option<String>,
+    /// Drop sessions whose cwd, repository root, or transcript path is under any of these
+    /// directories. Empty (the default) drops nothing.
     pub exclude_path_prefixes: Vec<String>,
+    /// Drop these exact canonical session ids. Empty (the default) drops nothing.
     pub exclude_session_ids: Vec<String>,
     /// Return only sessions spawned by this exact session id. The link
     /// [`SessionRecord::parent_session_id`] stores is typed precisely so "every subagent of
@@ -976,9 +1346,28 @@ pub struct SearchFilters {
     /// Inclusive query end. Session retrieval keeps rows whose known indexed start
     /// (`created_at`, falling back to `updated_at`) is on or before this instant.
     pub until: Option<DateTime<Utc>>,
+    /// Maximum sessions returned, newest first. 0 (the default) returns every matching session.
+    ///
+    /// The command line uses `[search].default_limit` (50) when `--limit` is omitted; this
+    /// legacy library default is 0. Use [`SessionQuery`] with `CatalogService::list_query` or
+    /// `CatalogService::search_query` to resolve an omitted limit from configuration.
     pub limit: usize,
+    /// Keep only sessions whose transcript produced a parse warning. Default `false`.
     pub warnings_only: bool,
 }
+
+chainable_setters!(SearchFilters {
+    with_provider(provider: Provider) some;
+    with_session_kinds(session_kinds: Vec<SessionKind>) some;
+    with_path_prefix(path_prefix: impl Into<String>) some;
+    with_exclude_path_prefixes(exclude_path_prefixes: Vec<String>) value;
+    with_exclude_session_ids(exclude_session_ids: Vec<String>) value;
+    with_parent_session_id(parent_session_id: impl Into<String>) some;
+    with_since(since: DateTime<Utc>) some;
+    with_until(until: DateTime<Utc>) some;
+    with_limit(limit: usize) value;
+    with_warnings_only(warnings_only: bool) value;
+});
 
 impl SearchFilters {
     /// The session classes this request returns, with the default applied. Every reader goes
@@ -995,9 +1384,10 @@ impl SearchFilters {
             !kinds.is_empty() && kinds.iter().all(|kind| *kind == SessionKind::User)
         });
         if self.parent_session_id.is_some() && only_user_sessions {
-            anyhow::bail!(
-                "session_kinds cannot contain only \"user\" when parent_session_id is set; pass [\"subagent\"], omit session_kinds to use both classes, or omit parent_session_id to search user-started sessions"
-            );
+            return Err(crate::ServiceError::invalid_argument(
+                "session_kinds cannot contain only \"user\" when parent_session_id is set; pass [\"subagent\"], omit session_kinds to use both classes, or omit parent_session_id to search user-started sessions",
+            )
+            .into());
         }
         Ok(())
     }
@@ -1009,6 +1399,7 @@ impl SearchFilters {
 /// recency sample, message limit, or claim of representativeness.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AnalysisSessionSelection {
     /// Analyze every session accepted by the request scope.
     #[default]
@@ -1038,13 +1429,14 @@ impl AnalysisRequest {
     pub fn new(scope: SearchFilters, selection: AnalysisSessionSelection) -> anyhow::Result<Self> {
         scope.validate()?;
         if scope.limit != 0 {
-            anyhow::bail!(
+            return Err(crate::ServiceError::invalid_argument(format!(
                 "analysis does not accept SearchFilters.limit={}; set it to 0 and choose \
                  AnalysisSessionSelection::FirstCanonicalSessions {{ max_sessions }} for the \
                  explicitly labeled canonical-order prefix, or AllEligible for every session in \
                  scope",
                 scope.limit
-            );
+            ))
+            .into());
         }
         Ok(Self { scope, selection })
     }
@@ -1061,6 +1453,7 @@ impl AnalysisRequest {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SessionWithTranscript {
     #[serde(flatten)]
     pub session: SessionRecord,
@@ -1068,6 +1461,7 @@ pub struct SessionWithTranscript {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SearchHit {
     #[serde(flatten)]
     pub session: SessionRecord,
@@ -1076,12 +1470,49 @@ pub struct SearchHit {
     pub match_snippet: String,
 }
 
+/// Internal matching policy derived from role; storage differences do not need a public selector.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MessageInputScope {
+    #[default]
+    Any,
+    UserInput,
+}
+impl MessageInputScope {
+    pub(crate) fn for_role(role: Option<Role>) -> Self {
+        if role == Some(Role::User) {
+            Self::UserInput
+        } else {
+            Self::Any
+        }
+    }
+}
+
+pub(crate) fn serialize_hit_provenance<
+    S: serde::Serializer,
+    T: std::borrow::Borrow<MessageProvenance>,
+>(
+    value: &Option<T>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    value
+        .as_ref()
+        .map(|source| source.borrow().hit_header())
+        .serialize(serializer)
+}
+
 /// Filters for message-level search (`messages search`, analytics). Exact/regex `limit == 0`
 /// means unlimited; fuzzy validation requires a positive finite page.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[non_exhaustive]
 pub struct MessageFilters {
+    /// User selects recorded input across source roles in search and range reads.
+    /// Released generation-five layouts without input columns retain stored-role filtering.
+    /// Other roles select stored roles; analytics retain their operation-specific policies.
     pub role: Option<Role>,
+    /// Set only by the database compatibility path, never by a serialized caller request.
+    #[serde(skip)]
+    pub(crate) stored_user_role: bool,
     /// Which semantic message classes to return. `None` selects the default set
     /// ([`MessageKind::default_search_set`]): every class except `HarnessNotice`, which is
     /// harness output rather than user or model prose.
@@ -1159,11 +1590,44 @@ pub struct MessageFilters {
     /// `crate::db::Db::find_corrections`, which forces `User` for the same reason it forces
     /// `Role::User`.
     pub session_kinds: Option<Vec<SessionKind>>,
+    /// Maximum messages returned. 0 (the default) returns every match; fuzzy matching requires
+    /// a positive limit.
     pub limit: usize,
+    /// Matches skipped before `limit` counts. Default 0.
     pub offset: usize,
 }
 
+chainable_setters!(MessageFilters {
+    with_role(role: Role) some;
+    with_kinds(kinds: Vec<MessageKind>) some;
+    with_field(field: SearchField) some;
+    with_argument_path(argument_path: impl Into<String>) some;
+    with_providers(providers: Vec<Provider>) some;
+    with_session_id(session_id: impl Into<String>) some;
+    with_path_prefix(path_prefix: impl Into<String>) some;
+    with_exclude_path_prefixes(exclude_path_prefixes: Vec<String>) value;
+    with_exclude_session_ids(exclude_session_ids: Vec<String>) value;
+    with_since(since: DateTime<Utc>) some;
+    with_until(until: DateTime<Utc>) some;
+    with_seq_from(seq_from: i64) some;
+    with_seq_to(seq_to: i64) some;
+    with_match_mode(match_mode: MessageSearchMode) value;
+    with_tool(tool: impl Into<String>) some;
+    with_no_compaction(no_compaction: bool) value;
+    with_session_kinds(session_kinds: Vec<SessionKind>) some;
+    with_limit(limit: usize) value;
+    with_offset(offset: usize) value;
+});
+
 impl MessageFilters {
+    pub(crate) fn input_scope(&self) -> MessageInputScope {
+        if self.stored_user_role {
+            MessageInputScope::Any
+        } else {
+            MessageInputScope::for_role(self.role)
+        }
+    }
+
     /// Validate invariants shared by CLI, MCP, Rust, and language bindings.
     ///
     /// `query` is interpreted according to [`MessageFilters::match_mode`].
@@ -1295,7 +1759,14 @@ impl MessageFilters {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct MessageHit {
+    /// Source evidence loaded for user-selected matching, including unknown senders.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_hit_provenance"
+    )]
+    pub provenance: Option<Box<MessageProvenance>>,
     pub session_id: String,
     pub provider: Provider,
     pub seq: i64,
@@ -1311,12 +1782,39 @@ pub struct MessageHit {
     pub content: String,
 }
 
+impl MessageHit {
+    /// Construct a hit with no timestamp, tool, score or provenance metadata.
+    pub fn new(
+        session_id: impl Into<String>,
+        provider: Provider,
+        seq: i64,
+        role: Role,
+        kind: MessageKind,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            provider,
+            seq,
+            role,
+            kind,
+            content: content.into(),
+            provenance: None,
+            ts: None,
+            tool_name: None,
+            tool_call_id: None,
+            fuzzy_score: None,
+        }
+    }
+}
+
 /// Lightweight per-session metadata used to enrich message hits with human-readable
 /// context (working dir / repo / title) in the MCP `search_messages` response, so an
 /// agent can interpret and group results without a follow-up `get_session` per hit.
 /// Kept off [`MessageHit`] so the CLI table rendering is unchanged; the MCP layer joins
 /// it on via [`crate::db::Db::session_metadata`].
 #[derive(Debug, Clone, Default, Serialize)]
+#[non_exhaustive]
 pub struct SessionMeta {
     pub provider_session_id: Option<String>,
     pub cwd: Option<String>,
@@ -1337,6 +1835,7 @@ pub struct SessionMeta {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ProviderParserHealth {
     pub provider: Provider,
     pub expected_parse_version: String,
@@ -1346,6 +1845,7 @@ pub struct ProviderParserHealth {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ParserHealth {
     pub schema_version: i64,
     pub expected_schema_version: i64,
@@ -1355,10 +1855,34 @@ pub struct ParserHealth {
     pub stale_sessions: i64,
     pub parse_warnings: i64,
     pub providers: Vec<ProviderParserHealth>,
+    /// Records of a type the provider's parser does not recognize, which were not indexed,
+    /// summed across indexed sessions, most records first. Names and counts only; at most
+    /// `UnrecognizedRecordType::LIMIT` entries. Empty when every record type was recognized.
+    pub unrecognized_record_types: Vec<UnrecognizedRecordType>,
+}
+
+/// One record type a provider's parser did not recognize, across the sessions that contain it.
+/// A new harness release that adds a record kind appears here instead of silently changing what
+/// is indexed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct UnrecognizedRecordType {
+    pub provider: Provider,
+    pub record_type: String,
+    /// Records of this type that were not indexed.
+    pub records: i64,
+    /// Indexed sessions containing at least one such record.
+    pub sessions: i64,
+}
+
+impl UnrecognizedRecordType {
+    /// Most entries `ParserHealth::unrecognized_record_types` reports.
+    pub const LIMIT: usize = 20;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IndexSnapshotAvailability {
     Unavailable,
     Usable,
@@ -1374,6 +1898,7 @@ impl IndexSnapshotAvailability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct IndexSnapshotStatus {
     pub availability: IndexSnapshotAvailability,
     pub last_successful_refresh_at: Option<DateTime<Utc>>,
@@ -1381,6 +1906,7 @@ pub struct IndexSnapshotStatus {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IndexRefreshState {
     NotStarted,
     Indexing,
@@ -1403,6 +1929,7 @@ impl IndexRefreshState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum IndexRefreshTrigger {
     IntegrationInstall,
     CommandLine,
@@ -1420,6 +1947,7 @@ impl IndexRefreshTrigger {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct IndexRefreshStatus {
     pub state: IndexRefreshState,
     pub started_by: Option<IndexRefreshTrigger>,
@@ -1434,6 +1962,7 @@ pub struct IndexRefreshStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct IndexReadinessStatus {
     pub snapshot: IndexSnapshotStatus,
     pub refresh: IndexRefreshStatus,
@@ -1463,6 +1992,7 @@ impl IndexReadinessStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct IndexStatus {
     pub parser_health: ParserHealth,
     /// Stale sessions whose source files are currently enabled and discoverable.
@@ -1481,6 +2011,7 @@ pub struct IndexStatus {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SessionTimeProfile {
     pub messages: i64,
     pub timestamped_messages: i64,
@@ -1498,6 +2029,7 @@ pub struct SessionTimeProfile {
 /// prefilter output that requires verification. For fuzzy search, it is every row that matched
 /// during complete-corpus scoring, independent of the requested result page.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SearchExplain {
     /// Trigram query derived from literal text or regex literals. `None` means the query has no
     /// >=3-char literal anchor, so it must scan the structurally-filtered corpus.
@@ -1579,6 +2111,7 @@ impl SearchExplain {
 
 /// A message classified by one of the selected capability's rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MessageClassificationMatch {
     pub session_id: String,
     /// Session-local message sequence used with `session_id` for exact focused recovery.
@@ -1602,6 +2135,7 @@ pub struct MessageClassificationMatch {
 
 /// Aggregate slash-command usage frequency.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct PlanningCount {
     pub command: String,
     pub count: i64,
@@ -1614,7 +2148,11 @@ pub struct PlanningCount {
 /// contains a `/`. `limit == 0` means unlimited; `offset` skips rows in the surface's
 /// deterministic order.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct FileQuery {
+    /// Glob over edited files: `*` matches any run of characters and `?` one character. Without a
+    /// `/` it matches the file name exactly (`retry.py`, `*.rs`); with a `/` it matches the end of
+    /// the full path (`src/*.rs`). `None` (the default) selects every file.
     pub pattern: Option<String>,
     /// Restrict to one indexed session source.
     pub provider: Option<Provider>,
@@ -1627,9 +2165,15 @@ pub struct FileQuery {
     pub exclude_path_prefixes: Vec<String>,
     /// Exclude exact canonical session IDs before grouping, reconstruction selection, and limits.
     pub exclude_session_ids: Vec<String>,
+    /// Keep edits at or after this instant. `None` (the default) sets no lower bound.
     pub since: Option<DateTime<Utc>>,
+    /// Keep edits at or before this instant. `None` (the default) sets no upper bound.
     pub until: Option<DateTime<Utc>>,
+    /// File search keeps files edited at least this many times. `None` (the default) sets no
+    /// minimum.
     pub min_edits: Option<i64>,
+    /// File search keeps files edited at most this many times. `None` (the default) sets no
+    /// maximum.
     pub max_edits: Option<i64>,
     /// Maximum rows returned by file search, cross-reference, and history. Zero explicitly means
     /// unlimited and may materialize the complete filtered result.
@@ -1638,8 +2182,24 @@ pub struct FileQuery {
     pub offset: usize,
 }
 
+chainable_setters!(FileQuery {
+    with_pattern(pattern: impl Into<String>) some;
+    with_provider(provider: Provider) some;
+    with_session_id(session_id: impl Into<String>) some;
+    with_path_prefix(path_prefix: impl Into<String>) some;
+    with_exclude_path_prefixes(exclude_path_prefixes: Vec<String>) value;
+    with_exclude_session_ids(exclude_session_ids: Vec<String>) value;
+    with_since(since: DateTime<Utc>) some;
+    with_until(until: DateTime<Utc>) some;
+    with_min_edits(min_edits: i64) some;
+    with_max_edits(max_edits: i64) some;
+    with_limit(limit: usize) value;
+    with_offset(offset: usize) value;
+});
+
 /// One aggregate row per file across the filtered edit set (`files search`).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FileEditSummary {
     pub file_path: String,
     pub file_name: String,
@@ -1650,6 +2210,7 @@ pub struct FileEditSummary {
 
 /// One reconstructed version (edit) of a file within a session (`files history`).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FileVersion {
     pub session_id: String,
     pub provider: Provider,
@@ -1662,6 +2223,7 @@ pub struct FileVersion {
 
 /// A file ↔ session linkage with that pair's edit count (`files cross-ref`).
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FileCrossRef {
     pub file_path: String,
     pub session_id: String,
@@ -1670,6 +2232,7 @@ pub struct FileCrossRef {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ProviderHealth {
     pub provider: Provider,
     pub enabled: bool,
@@ -1691,6 +2254,7 @@ pub struct ProviderHealth {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct DiagnosticStatus {
     pub db_path: String,
     pub unknown_config_keys: Vec<crate::config::UnknownConfigKey>,
@@ -1700,9 +2264,164 @@ pub struct DiagnosticStatus {
     pub providers: Vec<ProviderHealth>,
 }
 
+/// Session selection with a presence-aware limit for `CatalogService::list_query` and
+/// `CatalogService::search_query`. The default omits the limit and uses `[search].default_limit`;
+/// `with_limit(0)` explicitly returns every match. Existing `SearchFilters` calls keep their
+/// historical zero-means-all behavior.
+#[derive(Debug, Clone, Default)]
+pub struct SessionQuery {
+    filters: SearchFilters,
+    limit: Option<usize>,
+}
+
+impl SessionQuery {
+    /// Preserve an existing filter's limit literally, including 0 for all. Call
+    /// `with_configured_limit` afterwards to use its structural filters with the configured
+    /// default. Moves the filter without copying its strings: O(1).
+    pub fn from_filters(filters: SearchFilters) -> Self {
+        let limit = Some(filters.limit);
+        Self { filters, limit }
+    }
+
+    /// Return at most `limit` sessions; 0 returns every match. O(1) adapter work.
+    #[must_use]
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// Omit the limit so it resolves from `[search].default_limit` (50 by default).
+    /// A standalone `CatalogService::new` uses that library default. O(1) adapter work.
+    #[must_use]
+    pub fn with_configured_limit(mut self) -> Self {
+        self.limit = None;
+        self
+    }
+
+    pub(crate) fn resolved_filters(&self, configured_limit: usize) -> SearchFilters {
+        let mut filters = self.filters.clone();
+        filters.limit = self.limit.unwrap_or(configured_limit);
+        filters
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_part_authorship_converts_without_changing_meaning() {
+        for (part, message) in [
+            (ContentPartAuthorship::Human, MessageAuthorship::Human),
+            (ContentPartAuthorship::Agent, MessageAuthorship::Agent),
+            (ContentPartAuthorship::Harness, MessageAuthorship::Harness),
+            (
+                ContentPartAuthorship::Generated,
+                MessageAuthorship::Generated,
+            ),
+            (ContentPartAuthorship::Unknown, MessageAuthorship::Unknown),
+        ] {
+            assert_eq!(MessageAuthorship::from(part), message);
+        }
+    }
+
+    #[test]
+    fn hit_header_borrows_provenance_without_serializing_unbounded_evidence() {
+        let mut provenance = MessageProvenance {
+            authorship: MessageAuthorship::Mixed,
+            record_relation: MessageRecordRelation::Original,
+            input_origin: Some(MessageInputOrigin::InteractiveAnswer),
+            input_delivery_state: Some(InputDeliveryState::Submitted),
+            correlation_identity: Some(MessageCorrelationIdentity {
+                authority: MessageCorrelationAuthority::SourceLocal,
+                scope: "s".repeat(100_000),
+                id: "i".repeat(100_000),
+            }),
+            content_parts: (0..1_001)
+                .map(|ordinal| MessageContentPart {
+                    ordinal,
+                    start_char: ordinal as usize,
+                    end_char: ordinal as usize + 1,
+                    authorship: ContentPartAuthorship::Unknown,
+                    origin: ContentPartOrigin::DirectInput,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let expected = serde_json::json!({
+            "authorship": "mixed", "record_relation": "original",
+            "input_origin": "interactive_answer", "input_delivery_state": "submitted"
+        });
+        assert_eq!(
+            serde_json::to_value(provenance.hit_header()).unwrap(),
+            expected
+        );
+        assert_eq!(provenance.content_parts.len(), 1_001);
+        assert_eq!(
+            serde_json::to_value(&provenance).unwrap()["content_parts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1_001
+        );
+        provenance.input_origin = None;
+        provenance.input_delivery_state = None;
+        let header = serde_json::to_value(provenance.hit_header()).unwrap();
+        assert!(header["input_origin"].is_null());
+        assert!(header["input_delivery_state"].is_null());
+        assert_eq!(header.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn legacy_input_sentinels_decode_to_absent_evidence() {
+        let provenance: MessageProvenance = serde_json::from_value(serde_json::json!({
+            "authorship": "unknown", "record_relation": "original",
+            "correlation_identity": null, "content_parts": [],
+            "input_origin": "unknown", "input_delivery_state": "unknown"
+        }))
+        .unwrap();
+        assert_eq!(provenance.input_origin, None);
+        assert_eq!(provenance.input_delivery_state, None);
+        assert!(provenance.is_legacy_user_input(Role::User));
+        assert!(!provenance.is_legacy_user_input(Role::Tool));
+        let output = serde_json::to_value(&provenance).unwrap();
+        assert!(output["input_origin"].is_null());
+        assert!(output["input_delivery_state"].is_null());
+        assert_eq!(output.as_object().unwrap().len(), 6);
+        assert!(!MessageProvenance {
+            record_relation: MessageRecordRelation::Original,
+            ..Default::default()
+        }
+        .is_legacy_user_input(Role::User));
+    }
+
+    #[test]
+    fn legacy_input_marker_depends_only_on_origin_and_preserves_eligibility() {
+        for origin in [None, Some("unknown"), Some("queued")] {
+            for delivery in [None, Some("unknown"), Some("submitted")] {
+                for relation in ["original", "unknown", "mirror"] {
+                    let provenance: MessageProvenance = serde_json::from_value(serde_json::json!({
+                        "authorship": "unknown", "record_relation": relation,
+                        "correlation_identity": null, "content_parts": [],
+                        "input_origin": origin, "input_delivery_state": delivery
+                    }))
+                    .unwrap();
+                    assert_eq!(provenance.legacy_input_origin, origin == Some("unknown"));
+                    assert_eq!(provenance.stored_input_origin(), origin);
+                    assert_eq!(
+                        provenance.is_legacy_user_input(Role::User),
+                        origin != Some("queued")
+                            && (relation == "unknown"
+                                || (relation == "original" && origin == Some("unknown")))
+                    );
+                    assert_eq!(
+                        provenance.input_delivery_state,
+                        (delivery == Some("submitted")).then_some(InputDeliveryState::Submitted)
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn message_provenance_accepts_complete_unicode_scalar_parts_and_scoped_correlation() {
@@ -1730,6 +2449,7 @@ mod tests {
                     origin: ContentPartOrigin::QuotedContent,
                 },
             ],
+            ..Default::default()
         };
 
         // Four Unicode scalars but seven UTF-8 bytes proves these are character, not byte, ranges.
@@ -1919,13 +2639,9 @@ mod tests {
     /// The session-class spellings are the providers' own, not invented here, and the
     /// alternatives considered are locked out rather than silently accepted.
     ///
-    /// Evidence, gathered from live data before choosing:
-    /// - codex stores this exact enum as `thread_source` on its session metadata, valued
-    ///   `user` (167 rollouts) and `subagent` (247) — the same partition, already named.
-    /// - `subagent` is unanimous across every provider that marks the concept: codex's
-    ///   `thread_source` value and `source.subagent` key, the `subagents` directory claude and
-    ///   cursor both write, claude's `subagent_type` Task parameter (in 15 of 401 transcripts
-    ///   scanned), and gemini-cli's `subagent_N` author labels.
+    /// Provider spellings include Codex's `thread_source` and `source.subagent`, the
+    /// `subagents` directory used by Claude and Cursor, Claude's `subagent_type` Task
+    /// parameter, and Gemini CLI's `subagent_N` author labels.
     ///
     /// `agent` is rejected on purpose: a subagent IS an agent, so `[agent]` could be read as
     /// "every session" or "every session that is not a subagent", and the caller cannot tell
@@ -2004,10 +2720,7 @@ mod tests {
         assert!(!warnings_only);
     }
 
-    /// The default returns both classes. Subagent runs are real work — 4,051 of them against
-    /// 858 user-started claude sessions here — so unlike `MessageKind::HarnessNotice`, which
-    /// is harness bookkeeping and stays out by default, hiding these would answer "what did I
-    /// do about X" with half the evidence.
+    /// Include user-started and spawned sessions by default so searches cover both kinds of work.
     #[test]
     fn the_default_session_class_set_is_every_class() {
         assert_eq!(
@@ -2081,6 +2794,40 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provenance_parsing_preserves_supported_spellings_without_speculative_states() {
+        for value in [
+            "direct_conversation",
+            "DIRECT_CONVERSATION",
+            "direct-conversation",
+        ] {
+            assert_eq!(
+                value.parse::<MessageInputOrigin>().unwrap(),
+                MessageInputOrigin::DirectConversation
+            );
+        }
+        for (value, expected) in [
+            ("openai", MessageCorrelationAuthority::OpenAi),
+            ("primeagent", MessageCorrelationAuthority::PrimeAgent),
+            ("sourcelocal", MessageCorrelationAuthority::SourceLocal),
+        ] {
+            assert_eq!(
+                value.parse::<MessageCorrelationAuthority>().unwrap(),
+                expected
+            );
+        }
+        let error = "UnrecognizedOrigin"
+            .parse::<MessageInputOrigin>()
+            .unwrap_err();
+        assert!(error.contains("MessageInputOrigin") && error.contains("UnrecognizedOrigin"));
+        for value in ["unknown", "delivered", "cancelled", "canceled"] {
+            assert!(value.parse::<InputDeliveryState>().is_err());
+        }
+        for value in ["unknown", "direct", "queued_input", "interactive"] {
+            assert!(value.parse::<MessageInputOrigin>().is_err());
+        }
+    }
+
     /// Every typed value this crate writes as a string parses back as the same value.
     ///
     /// `as_str` is what the database, JSON output, and CLI display carry, and `from_str` is what
@@ -2141,6 +2888,14 @@ mod tests {
                 MessageCorrelationAuthority::Anthropic, MessageCorrelationAuthority::OpenAi,
                 MessageCorrelationAuthority::Cursor, MessageCorrelationAuthority::Google,
                 MessageCorrelationAuthority::Pi, MessageCorrelationAuthority::PrimeAgent,
+                MessageCorrelationAuthority::SourceLocal,
+            ],
+            InputDeliveryState => [
+                InputDeliveryState::Submitted,
+            ],
+            MessageInputOrigin => [
+                MessageInputOrigin::DirectConversation, MessageInputOrigin::Queued,
+                MessageInputOrigin::InteractiveAnswer,
             ],
             MessageRecordRelation => [
                 MessageRecordRelation::Original, MessageRecordRelation::Mirror,

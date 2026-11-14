@@ -30,6 +30,7 @@ pub const DEFAULT_PREVIEW_CHARS: usize = 220;
 const REF_CANDIDATE_REGEX: &str = r#"https?://|file://|www\.|[[:alnum:].-]+\.[[:alpha:]]{2,}/"#;
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct SessionInspection {
     pub session: SessionRecord,
     pub user_intent: Vec<MessagePreview>,
@@ -42,12 +43,48 @@ pub struct SessionInspection {
     pub truncated_evidence: Vec<EvidenceSection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_profile: Option<crate::models::SessionTimeProfile>,
+    /// The same follow-ups as [`SessionInspection::follow_ups`], written as POSIX-shell `aise`
+    /// commands for a person or an agent with a shell.
     pub next_commands: Vec<String>,
+    /// Follow-up reads as library calls, in the order of `next_commands`. Each item's
+    /// `expand_command` likewise corresponds to
+    /// [`MessageService::context`](crate::service::MessageService::context)`(session.id, seq, 3, 3)`.
+    /// Not serialized: JSON output keeps carrying `next_commands`.
+    #[serde(skip)]
+    pub follow_ups: Vec<InspectionFollowUp>,
+}
+
+/// One follow-up read suggested by a session inspection, as a library call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InspectionFollowUp {
+    /// [`CatalogService::transcript`](crate::service::CatalogService::transcript)`(session_id,
+    /// lines)`; `lines` is -40, the last 40 lines.
+    #[non_exhaustive]
+    TranscriptWindow { session_id: String, lines: i64 },
+    /// [`MessageService::context`](crate::service::MessageService::context)`(session_id, seq,
+    /// before, after)` around the first intent or tool message.
+    #[non_exhaustive]
+    MessageContext {
+        session_id: String,
+        seq: i64,
+        before: i64,
+        after: i64,
+    },
+    /// [`MessageService::read_session`](crate::service::MessageService::read_session) with
+    /// `filters.session_id = session_id`: the whole message timeline.
+    #[non_exhaustive]
+    SessionMessages { session_id: String },
+    /// [`FileService::cross_reference`](crate::service::FileService::cross_reference) with
+    /// `query.session_id = session_id`: the files this session edited.
+    #[non_exhaustive]
+    FileCrossReference { session_id: String },
 }
 
 /// A compact-summary evidence category for which additional indexed entries are available.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum EvidenceSection {
     /// Additional user messages classified as session intent are available.
     UserIntent,
@@ -73,12 +110,26 @@ impl EvidenceSection {
     }
 }
 
+/// How much [`CatalogService::inspect`](crate::service::CatalogService::inspect) returns.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct InspectionOptions {
+    /// Maximum Unicode scalar values (Rust `char`s) kept in each preview; longer text is cut
+    /// and marked. Default [`DEFAULT_PREVIEW_CHARS`] (220). 0 keeps no preview text.
     pub preview_chars: usize,
+    /// Which evidence records to keep from the session. Default: the last 12
+    /// ([`DEFAULT_EVIDENCE_LIMIT`]).
     pub evidence_window: EvidenceWindow,
+    /// Also compute message counts, first and last timestamps, and the longest gap. Default
+    /// `false`.
     pub include_time_profile: bool,
 }
+
+chainable_setters!(InspectionOptions {
+    with_preview_chars(preview_chars: usize) value;
+    with_evidence_window(evidence_window: EvidenceWindow) value;
+    with_include_time_profile(include_time_profile: bool) value;
+});
 
 impl Default for InspectionOptions {
     fn default() -> Self {
@@ -91,6 +142,7 @@ impl Default for InspectionOptions {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct MessagePreview {
     pub seq: i64,
     pub ts: Option<String>,
@@ -100,6 +152,7 @@ pub struct MessagePreview {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ToolActivity {
     pub seq: i64,
     pub ts: Option<String>,
@@ -111,6 +164,7 @@ pub struct ToolActivity {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct RefEvidence {
     pub seq: i64,
     pub role: String,
@@ -122,6 +176,7 @@ pub struct RefEvidence {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ChangedFileEvidence {
     pub file_path: String,
     pub provider: String,
@@ -130,6 +185,7 @@ pub struct ChangedFileEvidence {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct InspectionRow {
     pub section: String,
     pub key: String,
@@ -356,6 +412,26 @@ pub fn inspect_session(
         .into_iter()
         .map(|parts| render_posix_shell_command(&parts))
         .collect::<Result<Vec<_>>>()?;
+    let mut follow_ups = vec![InspectionFollowUp::TranscriptWindow {
+        session_id: exact.clone(),
+        lines: -40,
+    }];
+    if let Some(seq) = selected_seq {
+        follow_ups.push(InspectionFollowUp::MessageContext {
+            session_id: exact.clone(),
+            seq,
+            before: 10,
+            after: 10,
+        });
+    }
+    follow_ups.extend([
+        InspectionFollowUp::SessionMessages {
+            session_id: exact.clone(),
+        },
+        InspectionFollowUp::FileCrossReference {
+            session_id: exact.clone(),
+        },
+    ]);
 
     let mut inspection = SessionInspection {
         session,
@@ -369,6 +445,7 @@ pub fn inspect_session(
             .then(|| db.session_time_profile(&exact))
             .transpose()?,
         next_commands,
+        follow_ups,
     };
     apply_evidence_budget(&mut inspection, options.evidence_window);
     Ok(inspection)
@@ -730,6 +807,7 @@ mod tests {
                 new_content: None,
                 edits: Vec::new(),
             }],
+            retracted: Default::default(),
         };
         db.upsert_session(&parsed, 0, 0).unwrap();
 
@@ -834,6 +912,7 @@ mod tests {
             transcript_text: String::new(),
             messages,
             file_edits: Vec::new(),
+            retracted: Default::default(),
         };
         db.upsert_session(&parsed, 0, 0).unwrap();
 
@@ -881,6 +960,7 @@ mod tests {
 /// Message-derived evidence is always rendered chronologically after selection. Changed-file
 /// evidence is an aggregate ordered by its file-summary query rather than message chronology.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum EvidenceWindow {
     /// Retain at most this many aggregate evidence records from the start of the session.
     First(NonZeroUsize),

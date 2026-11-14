@@ -12,6 +12,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -21,11 +22,111 @@ from scripts.verify_harness_discovery import environment as isolated_environment
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
+@pytest.mark.parametrize("surface", ["python", "cli", "mcp"])
+def test_released_index_user_role_search_preserves_stored_rows(tmp_path: Path, surface: str) -> None:
+    database = tmp_path / "index.db"
+    fixture = Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/tests/fixtures/v1_0_0_populated.sql"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(fixture.read_text())
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    expected = [("claude:upgrade-claude", 0), ("codex:upgrade-codex", 0)]
+    env = isolated_environment(tmp_path / "runtime")
+    env["AI_SESSION_SEARCH_DATABASE"] = str(database)
+    if surface == "python":
+        with native.SessionSearch(database, index_refresh="existing-only") as search:
+            response = search.search_messages("question", native.MessageSearchRequest(role="user"))
+            results = response.results
+    elif surface == "cli":
+        result = subprocess.run(
+            [sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+             "--index-refresh", "existing-only", "messages", "search", "question", "--role", "user", "--format", "json"],
+            env=env, capture_output=True, text=True, check=False, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        results = json.loads(result.stdout)["results"]
+    else:
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "synthetic-test", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "search_messages", "arguments": {"query": "question", "role": "user", "index_refresh": "existing-only"}}},
+        ]
+        result = subprocess.run(
+            [sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+             "--index-refresh", "existing-only", "mcp", "serve"],
+            input="".join(json.dumps(request) + "\n" for request in requests),
+            env=env, capture_output=True, text=True, check=True, timeout=30,
+        )
+        response = next(json.loads(line) for line in result.stdout.splitlines() if json.loads(line).get("id") == 2)
+        assert "error" not in response, response
+        assert not response["result"].get("isError"), response
+        results = response["result"]["structuredContent"]["results"]
+    assert [(hit["message_ref"]["session_id"], hit["message_ref"]["message_seq"]) for hit in results] == expected
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+
+
+def test_legacy_input_sentinels_return_none_without_selecting_current_unknown_input(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    search = native.SessionSearch(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+            insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+            values ('claude:legacy', 'claude', 'legacy', '', '/legacy', 'test', 'test');
+            insert into messages(session_id, provider, seq, role, kind, content, authorship, record_relation, input_origin, input_delivery_state)
+            values ('claude:legacy', 'claude', 0, 'user', 'conversation', 'needle', 'unknown', 'original', 'unknown', 'unknown'),
+                   ('claude:legacy', 'claude', 1, 'user', 'conversation', 'needle', 'unknown', 'original', null, 'unknown');
+        """)
+    results = search.search_messages("needle", native.MessageSearchRequest(role="user")).results
+    assert [hit["message_ref"]["message_seq"] for hit in results] == [0]
+    assert results[0]["message_metadata"]["provenance"] == {
+        "authorship": "unknown",
+        "record_relation": "original",
+        "input_origin": None,
+        "input_delivery_state": None,
+    }
+    ranged = search.read_session_messages("claude:legacy", role="user")
+    assert [hit.seq for hit in ranged] == [0]
+    assert ranged[0].provenance == results[0]["message_metadata"]["provenance"]
+    assert all(hit.provenance is None for hit in search.read_session_messages("claude:legacy"))
+
+
+def test_human_content_selection_changes_membership_and_preserves_coordinates(tmp_path: Path) -> None:
+    db_path = tmp_path / "index.db"
+    search = native.SessionSearch(db_path)
+    with sqlite3.connect(db_path) as connection:
+        connection.executescript("""
+            insert into sessions(id, provider, provider_session_id, preview_text, source_path, parse_version, discovery_source)
+            values ('claude:human', 'claude', 'human', '', '/human', 'test', 'test');
+            insert into messages(id, session_id, provider, seq, role, kind, content, authorship, record_relation)
+            values (1, 'claude:human', 'claude', 0, 'tool', 'tool_result', 'needle generated', 'generated', 'original'),
+                   (2, 'claude:human', 'claude', 1, 'tool', 'tool_result', 'needle wrapper éneedle', 'mixed', 'original');
+            insert into message_content_parts(message_id, ordinal, start_char, end_char, authorship, origin)
+            values (2, 0, 0, 15, 'generated', 'tool_payload'),
+                   (2, 1, 15, 22, 'human', 'direct_input');
+        """)
+    response = search.search_messages("needle", native.MessageSearchRequest(role="user", limit=1, receipt_level="full"))
+    assert len(response.results) == 1
+    result = response.results[0]
+    assert result["message_ref"]["message_seq"] == 1
+    assert result["message_metadata"]["role"] == "tool"
+    assert result["match"]["literal_occurrence"]["field_start_char"] == 16
+    assert result["message_metadata"]["provenance"]["authorship"] == "mixed"
+    ranged = search.read_session_messages("claude:human", role="user")
+    assert [hit.seq for hit in ranged] == [1]
+    assert ranged[0].provenance == result["message_metadata"]["provenance"]
+    assert set(ranged[0].provenance) == {
+        "authorship", "record_relation", "input_origin", "input_delivery_state",
+    }
+    assert "input_scope" not in response.effective_request
+    assert "input_scope" not in response.receipt["parameter_origins"]
+    assert len(search.search_messages("needle").results) == 2
+    assert len(search.search_messages("needle", native.MessageSearchRequest(role="user")).results) == 1
+
+
 def test_message_search_request_exposes_only_final_presentation_and_include_controls() -> None:
     parameters = inspect.signature(native.MessageSearchRequest).parameters
     for name in ("detail", "field_view", "match_view", "include"):
         assert name in parameters
-    for removed in ("include_refs", "match_evidence_max_chars"):
+    for removed in ("include_refs", "match_evidence_max_chars", "input_scope"):
         assert removed not in parameters
 
 
@@ -187,7 +288,7 @@ def test_message_classification_public_result_names_and_fields_are_pinned() -> N
     assert hasattr(native, "CapabilityReceipt")
     assert hasattr(native, "MessageClassificationReport")
 
-    fields = {name for name in dir(native.MessageClassificationMatch) if not name.startswith("_")}
+    fields = {name for name in dir(native.MessageClassificationMatch) if not name.startswith("_") and name != "to_dict"}
     assert fields == {
         "session_id",
         "provider",
@@ -202,8 +303,13 @@ def test_message_classification_public_result_names_and_fields_are_pinned() -> N
     }
     assert "ts" not in fields, "Rust's `ts` must stay renamed to `timestamp` on this surface"
     assert "matched_pattern" not in fields, "the field names the matched text, not the rule"
-    assert {name for name in dir(native.CapabilityReceipt) if not name.startswith("_")} == {"name", "version", "sha256"}
-    assert {name for name in dir(native.MessageClassificationReport) if not name.startswith("_")} == {"policies", "matches"}
+    assert {name for name in dir(native.CapabilityReceipt) if not name.startswith("_") and name != "to_dict"} == {"name", "version", "sha256"}
+    assert {name for name in dir(native.MessageClassificationReport) if not name.startswith("_") and name != "to_dict"} == {
+        "policies",
+        "matches",
+        "unattributed_input_count",
+        "unattributed_input_included",
+    }
 
 
 def test_advanced_facade_exports_every_session_search_result_type() -> None:
@@ -268,6 +374,12 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
     assert package.CapabilityReceipt is native.CapabilityReceipt
     assert package.MessageClassificationReport is native.MessageClassificationReport
     assert package.__all__ == [
+        "NotFoundError",
+        "AmbiguousPrefixError",
+        "AlreadyExistsError",
+        "InvalidArgumentError",
+        "IndexNotRefreshedError",
+
         "SessionSearch",
         "AnalysisPublicationPlan",
         "AnalysisRequest",
@@ -306,6 +418,59 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         "MatchView",
         "MatchViewMaxChars",
         "MatchViewMinimalSpan",
+        "AnalysisArtifact",
+        "AnalysisCursor",
+        "AnalysisDocument",
+        "AnalysisDocumentPage",
+        "AnalysisPublicationReceipt",
+        "AnalysisResult",
+        "AnalyzedSession",
+        "CapabilityExecutionSource",
+        "ChangedFileEvidence",
+        "ClassificationMatch",
+        "CompactOutcome",
+        "DiagnosticStatus",
+        "ExportDocument",
+        "ExportPublicationReceipt",
+        "FileCrossRef",
+        "FileEditSummary",
+        "FileVersion",
+        "IndexReadinessStatus",
+        "IndexRefreshStatus",
+        "IndexStatus",
+        "MessageClassificationResult",
+        "MessageHit",
+        "MessagePreview",
+        "MessageRef",
+        "ParserHealth",
+        "PhraseFrequency",
+        "PlanningCount",
+        "ProviderHealth",
+        "ProviderParserHealth",
+        "ProviderSourceStatus",
+        "PublishedAnalysisArtifact",
+        "PublishedFileVersion",
+        "ReconstructedFile",
+        "ReconstructedFileVersions",
+        "RecoveryPublicationReceipt",
+        "RefEvidence",
+        "RefreshOutcome",
+        "ReindexOutcome",
+        "RelationshipHint",
+        "ResolvedSkillReceipt",
+        "RoleStat",
+        "SearchHit",
+        "SelectedSkillLocation",
+        "SessionGraph",
+        "SessionGraphEdge",
+        "SessionGraphGroup",
+        "SessionGraphNode",
+        "SessionInspection",
+        "SessionRecord",
+        "SessionTimeProfile",
+        "SkillRunReport",
+        "ToolActivity",
+        "UnrecognizedRecordType",
     ]
     for name in package.__all__:
         doc = getattr(package, name).__doc__
@@ -332,9 +497,10 @@ def test_package_root_promotes_rust_application_and_query_types() -> None:
         ("7d", "2026-06-08T12:00:00Z", "2026-06-15T12:00:00Z"),
         ("2d", "2026-06-13T12:00:00Z", "2026-06-15T12:00:00Z"),
         ("2h", "2026-06-15T10:00:00Z", "2026-06-15T12:00:00Z"),
-        ("30m", "2026-06-15T11:30:00Z", "2026-06-15T12:00:00Z"),
+        ("30m", "2023-12-28T12:00:00Z", "2026-06-15T12:00:00Z"),
         ("30min", "2026-06-15T11:30:00Z", "2026-06-15T12:00:00Z"),
-        ("1M", "2026-05-15T12:00:00Z", "2026-06-15T12:00:00Z"),
+        ("1m", "2026-05-16T12:00:00Z", "2026-06-15T12:00:00Z"),
+        ("1M", "2026-05-16T12:00:00Z", "2026-06-15T12:00:00Z"),
         ("1mo", "2026-05-15T12:00:00Z", "2026-06-15T12:00:00Z"),
         ("1y", "2025-06-15T12:00:00Z", "2026-06-15T12:00:00Z"),
     ],
@@ -357,8 +523,13 @@ def test_native_date_resolution_reads_zones_from_values_and_reference_times() ->
     new_york_nov_7 = ("2026-11-07T05:00:00Z", "2026-11-08T04:59:59.999999999Z")
     # An RFC 9557 reference time names the zone values without an offset are read in.
     assert resolve("today", "2026-11-08T01:00:00Z[America/New_York]") == new_york_nov_7
-    # An RFC 3339 reference keeps its offset as the zone.
-    assert resolve("2026-11-07", "2026-11-07T20:00:00-05:00") == new_york_nov_7
+    # Equivalent RFC 3339 reference instants preserve UTC calendar membership.
+    for when in ["2026-11-07", "today", "2026-11", "1mo"]:
+        for reference in ["2026-11-07T20:00:00-05:00", "2026-11-08T10:00:00+09:00", "2026-11-08T06:30:00+05:30"]:
+            assert resolve(when, reference) == resolve(when, "2026-11-08T01:00:00Z")
+    assert resolve("2026-11-07", "2026-11-07T20:00:00-05:00") == (
+        "2026-11-07T00:00:00Z", "2026-11-07T23:59:59.999999999Z",
+    )
     # A trailing zone on the value overrides it.
     assert resolve("2026-11-07[America/New_York]", "2026-11-07T20:00:00Z") == new_york_nov_7
     # EDTF open intervals leave a side unbounded.
@@ -508,6 +679,69 @@ def test_native_session_search_serves_concurrent_readers_from_several_threads(
         # being swallowed by the pool.
         for future in futures:
             future.result()
+
+
+@pytest.mark.parametrize("reader", ["db_path", "message_search_spec", "__enter__"])
+@pytest.mark.parametrize("operation", ["missing_session", "invalid_date"])
+def test_native_errors_do_not_deadlock_concurrent_readers(
+    tmp_path: Path, reader: str, operation: str,
+) -> None:
+    script = """
+import sys
+import threading
+import time
+from pathlib import Path
+from ai_session_search import _native as native
+
+root, reader, operation = sys.argv[1:]
+search = native.SessionSearch(Path(root) / 'index.db')
+entered = threading.Event()
+reading = threading.Event()
+errors = []
+reads = []
+error_name = 'NotFoundError' if operation == 'missing_session' else 'InvalidArgumentError'
+original = getattr(native, error_name)
+
+class PausedError(original):
+    def __init__(self, message):
+        entered.set()
+        assert reading.wait(5)
+        time.sleep(0.2)  # Let the reader contend while error conversion owns the mutex.
+        super().__init__(message)
+
+setattr(native, error_name, PausedError)
+
+def fail():
+    try:
+        if operation == 'missing_session':
+            search.export_session('missing')
+        else:
+            search.search_sessions('needle', native.SessionQuery(dates=native.DateRange(when='invalid')))
+    except original as error:
+        errors.append(str(error))
+
+def read():
+    assert entered.wait(5)
+    reading.set()
+    result = getattr(search, reader)
+    if reader != 'db_path':
+        result()
+    reads.append(reader)
+
+threads = [threading.Thread(target=fail), threading.Thread(target=read)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+assert len(errors) == 1, errors
+assert reads == [reader], reads
+assert search.db_path == Path(root) / 'index.db'
+"""
+    subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), reader, operation],
+        env=isolated_environment(tmp_path / "runtime"), check=True,
+        capture_output=True, text=True, timeout=10,
+    )
 
 
 def test_query_exclusions_are_explicit_and_shared() -> None:
@@ -779,6 +1013,81 @@ def test_native_lifecycle_services_return_typed_rust_outcomes(
     assert compact.before_bytes >= 0
     assert compact.after_bytes >= 0
     assert compact.reclaimed_bytes == max(0, compact.before_bytes - compact.after_bytes)
+
+
+HARNESS_RECORDS = Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/tests/fixtures/claude_harness_records.jsonl"
+
+
+def test_run_skill_and_search_read_only_what_people_typed_in_claude_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Claude Code request copies (`api-request-blob`), mid-turn wrappers, compaction summaries,
+    # Stop-hook notices and instruction attachments sit beside the real turns in this fixture. A
+    # prompt typed while the agent worked exists only in a `queued_command` attachment.
+    project = tmp_path / "projects" / "-tmp-harness-proj"
+    project.mkdir(parents=True)
+    (project / "cafe0002-cafe-cafe-cafe-000000000001.jsonl").write_bytes(HARNESS_RECORDS.read_bytes())
+    disabled = ["claude-desktop", "codex", "cursor", "antigravity", "pi", "prime-agent", "aistudio", "gemini-cli"]
+    config = tmp_path / "config.toml"
+    config.write_text(
+        f"[providers.claude]\nenabled = true\npaths = [{json.dumps(str(tmp_path / 'projects'))}]\n"
+        + "\n".join(f"[providers.{provider}]\nenabled = false" for provider in disabled),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("AI_SESSION_SEARCH_CONFIG", str(config))
+    search = native.SessionSearch(tmp_path / "index.db", config_path=config, cache_dir=tmp_path / "cache")
+    assert search.reindex().sessions_updated == 1
+
+    def corrections(include_unattributed_input: bool) -> Any:
+        return search.run_skill(
+            native.SkillRunQuery(
+                skill=native.SkillSelector(name="corrections"),
+                input=native.MessageClassificationQuery(
+                    limit=50, include_unattributed_input=include_unattributed_input
+                ),
+            )
+        ).output.report
+
+    # A queued prompt whose attachment names a human origin is read; one with no recorded sender
+    # is left out and counted unless asked for; a queued harness notification is never read.
+    report = corrections(False)
+    assert search.classify_messages(include_unattributed_input=False) == report.matches
+    assert [match.content for match in report.matches] == [
+        "you missed the second directory",
+        "you forgot to check the tests",
+    ]
+    assert (report.unattributed_input_count, report.unattributed_input_included) == (1, False)
+    report = corrections(True)
+    assert search.classify_messages(include_unattributed_input=True) == report.matches
+    assert [match.content for match in report.matches] == [
+        "you missed the second directory",
+        "you forgot to check the second directory",
+        "you forgot to check the tests",
+    ]
+    assert (report.unattributed_input_count, report.unattributed_input_included) == (1, True)
+
+    user_rows = search.search_messages("", native.MessageSearchRequest(role="user", limit=50)).results
+    texts = [hit["presentation"]["field_view"]["text"] for hit in user_rows]
+    assert "also rename the output folder" in texts
+    assert texts.count("you forgot to check the tests") == 1
+    for needle in (
+        "while you were working",
+        "being continued",
+        "Stop hook feedback",
+        "contributing guide",
+        "future record",
+        "Background job report",
+    ):
+        assert not any(needle in text for text in texts), (needle, texts)
+
+    health = search.diagnostics().index_status.parser_health
+    assert health.parse_warnings == 1
+    unrecognized = health.unrecognized_record_types
+    assert [(item.provider, item.record_type, item.records, item.sessions) for item in unrecognized] == [
+        ("claude", "attachment/instructions (files not array; keys: files,type)", 1, 1),
+        ("claude", "future-record", 1, 1),
+    ]
 
 
 def test_native_full_reindex_promotes_v3_and_releases_exclusive_lock(
@@ -1963,7 +2272,7 @@ def test_native_read_session_messages_orders_ranges_and_paginates(tmp_path: Path
     assert seqs(search.read_session_messages("reads", order="newest", limit=2)) == [2, 3]
     assert seqs(search.read_session_messages("reads", order="oldest", limit=2)) == [0, 1]
     # role composes with the newest-N window.
-    assert seqs(search.read_session_messages("reads", order="newest", role="user", limit=1)) == [2]
+    assert seqs(search.read_session_messages("reads", order="newest", role="user", limit=1)) == [3]
     # inclusive seq range is the non-overlapping chunked-read primitive.
     assert seqs(search.read_session_messages("reads", seq_from=1, seq_to=2)) == [1, 2]
     # offset paginates the oldest-first window.
@@ -2341,7 +2650,7 @@ def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
     database = tmp_path / "index.db"
     native.SessionSearch(database)
     session = spec["session_id"]
-    rows = [(m["seq"], m["role"], m["content"], None, "conversation") for m in spec["messages"]]
+    rows = [(m["seq"], m["role"], m["content"], None, m.get("kind", "conversation")) for m in spec["messages"]]
     bulk = spec["bulk"]
     rows += [(bulk["first_seq"] + i, bulk["role"], f"{bulk['content_prefix']} {i}", None, "conversation") for i in range(bulk["count"])]
     twins = spec["twins"]
@@ -2364,9 +2673,27 @@ def _parity_database(tmp_path: Path) -> tuple[Path, dict]:
             "insert into messages (session_id, provider, seq, role, kind, content, tool_name) values (?, 'claude', ?, ?, ?, ?, ?)",
             [(session, seq, role, kind, content, tool_name) for seq, role, content, tool_name, kind in rows],
         )
+        connection.execute("update messages set authorship=case when role='user' then 'human' else 'agent' end, record_relation='original'")
+        for message in spec["messages"]:
+            if "provenance" not in message:
+                continue
+            provenance = message["provenance"]
+            connection.execute(
+                "update messages set authorship=?,record_relation=?,input_origin=?,input_delivery_state=? where session_id=? and seq=? and role=?",
+                (provenance["authorship"], provenance["record_relation"], provenance["input_origin"], provenance["input_delivery_state"], session, message["seq"], message["role"]),
+            )
+            message_id = connection.execute("select id from messages where session_id=? and seq=? and role=?", (session, message["seq"], message["role"])).fetchone()[0]
+            connection.executemany(
+                "insert into message_content_parts(message_id,ordinal,start_char,end_char,authorship,origin) values(?,?,?,?,?,?)",
+                [(message_id, part["ordinal"], part["start_char"], part["end_char"], part["authorship"], part["origin"]) for part in provenance["content_parts"]],
+            )
         connection.commit()
+        # Fixture inserts use Python's SQLite, whose older trigram tokenizer stops at NUL.
+        # Rebuild the derived index with the product's bundled SQLite before testing parity.
+        connection.execute("drop table messages_trigram")
     finally:
         connection.close()
+    native.SessionSearch(database)
     return database, spec
 
 
@@ -2393,6 +2720,7 @@ def _binding_search(database: Path, spec: dict, case: dict, offset: int = 0, lim
         all_results=case.get("all_results", False),
         match_window=case.get("match_window"),
         field=case.get("field", "content"),
+        role=case.get("role"),
     )
     return native.SessionSearch(database).search_messages(case["query"], request, query_mode=case["mode"])
 
@@ -2419,6 +2747,8 @@ def _entry_point_search(database: Path, spec: dict, case: dict, tmp_path: Path, 
         str(offset),
     ]
     limit = limit if limit is not None else case.get("limit")
+    if case.get("role"):
+        command += ["--role", case["role"]]
     if case.get("field"):
         command += ["--field", case["field"].replace("_", "-")]
     if case.get("all_results"):
@@ -2531,9 +2861,24 @@ def test_python_interfaces_read_every_row_of_a_shared_seq_in_one_order(tmp_path:
         ranged = search.read_session_messages(session, seq_from=seq, seq_to=seq)
         assert [(hit.seq, hit.role) for hit in ranged] == want, read["name"]
         assert _parity_entry_point_read(database, spec, ["--seq", str(seq)], tmp_path) == want, read["name"]
+    for read in spec["context_reads"]:
+        want = _parity_expected(spec, read["expected"])
+        rows = search.message_context(session, read["seq"], context_before=read["before"], context_after=read["after"])
+        assert [(hit.seq, hit.role) for hit in rows] == want, read["name"]
+        selector = ["--seq", str(read["seq"]), "--context-before", str(read["before"]), "--context-after", str(read["after"])]
+        assert _parity_entry_point_read(database, spec, selector, tmp_path) == want, read["name"]
     for read in spec["newest_reads"]:
         want = _parity_expected(spec, read["expected"])
         newest = search.read_session_messages(session, order="newest", limit=read["limit"])
         assert [(hit.seq, hit.role) for hit in newest] == want, read["name"]
         selector = ["--limit", str(read["limit"]), "--order", "newest"]
         assert _parity_entry_point_read(database, spec, selector, tmp_path) == want, read["name"]
+
+
+def test_doctor_names_full_health_report_and_preserves_diagnostics(tmp_path: Path) -> None:
+    search = native.SessionSearch(tmp_path / "index.db")
+    current = search.doctor()
+    with pytest.deprecated_call(match="doctor"):
+        previous = search.diagnostics()
+    assert current.index_status.parser_health.indexed_sessions == previous.index_status.parser_health.indexed_sessions
+    assert current.db_path == previous.db_path

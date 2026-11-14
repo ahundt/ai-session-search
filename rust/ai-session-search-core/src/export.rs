@@ -19,6 +19,7 @@ const EXPORT_ID_HASH_HEX_CHARS: usize = 16;
 
 /// Supported session export representations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExportFormat {
     /// Human-readable title followed by the transcript.
     Text,
@@ -76,6 +77,7 @@ pub struct ExportDocument {
 
 /// Receipt for one atomically published, immutable multi-session export directory.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[non_exhaustive]
 pub struct ExportPublicationReceipt {
     pub destination: PathBuf,
     pub format: String,
@@ -118,10 +120,14 @@ impl ExportPublicationPlan {
             bail!("export bundle destination must name a directory");
         }
         if entry_exists(&self.destination)? {
-            bail!(
-                "export bundle destination already exists: {}",
-                self.destination.display()
-            );
+            return Err(crate::ServiceError::destination_exists(
+                &self.destination,
+                format!(
+                    "export bundle destination already exists: {}",
+                    self.destination.display()
+                ),
+            )
+            .into());
         }
         Ok(())
     }

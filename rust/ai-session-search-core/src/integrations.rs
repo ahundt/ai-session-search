@@ -21,7 +21,7 @@ use crate::text_file_transaction::{
 };
 #[cfg(test)]
 use crate::text_file_transaction::{execute_text_file_transaction, publish_text_change};
-use crate::util::which;
+use crate::util::{expand_tilde_required as expand_tilde, which};
 // Only the `#[cfg(unix)]` executable-bit branch renders a shell command, so an unconditional
 // import is dead on Windows and warns there while Clippy's `-D warnings` job runs on Linux.
 #[cfg(unix)]
@@ -63,15 +63,17 @@ const LEGACY_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use
 /// The block for a harness that registers the MCP server (and the server's own `initialize`
 /// instructions). It names the same four steps as `CLI_INSTRUCTIONS_LINE` in the same order,
 /// with the MCP tool for each, so an agent reads one workflow whichever surface it holds.
-const INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) via the `ai-session-search` MCP server: `list_sessions(path_prefix, when, limit)` for recent sessions by directory or period, `search_sessions(query, when, limit)` for sessions by topic, `search_messages(query, context, limit)` for the exact turn, then read it with `get_session(session_id, message_seq)`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, path, context, and time range. The installed `ai-session-search` skill has the full workflow; without MCP, `aise` on the shell does the same (`aise <command> --help`).";
+const INSTRUCTIONS_LINE: &str = "Before guessing about prior work, use AI Session Search (`aise`) via `ai-session-search` MCP server: `list_sessions(path_prefix, when, limit)` for recent sessions; `search_sessions(query, when, limit)` by topic; `search_messages(query, context, limit)` for the exact turn; then read it with `get_session(session_id, seq)`. Providers: Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, Gemini CLI. CLI: file recovery `aise files extract`, export `aise export`, analysis `aise analyze`, reindexing `aise reindex`. The installed `ai-session-search` skill: full workflow; CLI fallback `aise <command> --help`.";
 /// Historical CLI-only guidance, retained verbatim to recognize and refresh owned blocks.
 const CLI_INSTRUCTIONS_LINE: &str = "Before guessing about prior AI work, use AI Session Search (`aise`) from the shell; on this harness the `aise` command and the installed skill are the whole integration. List recent sessions with `aise list --path <dir> --when 7d --limit 10`, find sessions by topic with `aise search \"<topic>\" --when 30d --limit 10`, find the exact turn with `aise messages search \"<phrase>\" --context 2 --limit 20`, then read it with `aise messages get <session-id> --seq <N> --context 3` or `aise show <session-id>`. It searches Claude Code, Claude Desktop local agent, Codex, Cursor, Antigravity, Pi coding agent, Prime Agent, Google AI Studio, and Gemini CLI by query, repo/path/file, message context, and time range. The installed `ai-session-search` skill documents the full workflow; `aise <command> --help` lists every current flag.";
 /// SHA-256 of each instruction line an earlier release wrote and this build no longer does:
 /// 1.0.0rc1's `INSTRUCTIONS_LINE`. The post-upgrade refresh replaces a block that still holds one
 /// of these, or any line above, because aise wrote it; any other text is the user's. When a line
 /// above changes, add the digest of its old text here.
-const EARLIER_INSTRUCTION_LINE_DIGESTS: [&str; 1] =
-    ["3efca133a9dfaf9e359dce78582c83601c4a31c832ebfd6ef1caf5aa4398cfc6"];
+const EARLIER_INSTRUCTION_LINE_DIGESTS: [&str; 2] = [
+    "3efca133a9dfaf9e359dce78582c83601c4a31c832ebfd6ef1caf5aa4398cfc6",
+    "80e00c44e12fb57a3ba7cebd804880a7ce28ebd004e7442a0415ea32cb5399ab",
+];
 const INSTRUCTIONS_START: &str = "<!-- aise-instructions";
 const INSTRUCTIONS_END: &str = "<!-- /aise-instructions -->";
 const INSTRUCTIONS_FILE_START: &str = "<!-- ai-session-search-managed-file v1 -->";
@@ -243,11 +245,11 @@ pub struct IntegrationTargetsArgs {
     /// manage only the discovered instruction files.
     #[arg(long = "claude-md")]
     pub claude_md_paths: Vec<PathBuf>,
-    /// Extra GEMINI.md path where the managed AI Session Search (`aise`) note is managed.
+    /// Extra GEMINI.md path for the managed AI Session Search (`aise`) note.
     /// Repeatable; omit to manage only the discovered instruction files.
     #[arg(long = "gemini-md")]
     pub gemini_md_paths: Vec<PathBuf>,
-    /// Extra AGENTS.md path where the managed AI Session Search (`aise`) note is managed.
+    /// Extra AGENTS.md path for the managed AI Session Search (`aise`) note.
     /// Repeatable; omit to manage only the discovered instruction files.
     #[arg(long = "agents-md")]
     pub agents_md_paths: Vec<PathBuf>,
@@ -1199,7 +1201,11 @@ impl RegistrationState {
             let path = absolutize(&expand_tilde(&path)?)?;
             let value = path.to_str().ok_or_else(|| anyhow!("MCP {flag} path {} is not valid UTF-8; pass a UTF-8 path before installing", path.display()))?.to_string();
             state.intended.insert(flag.to_string(), value.clone());
-            if origin.starts_with("cli ") || origin.starts_with("environment ") {
+            // An explicit choice from a flag, a library override, or the environment is pinned.
+            if origin.starts_with("cli ")
+                || origin.starts_with("ConfigOverrides.")
+                || origin.starts_with("environment ")
+            {
                 state.arguments.extend([flag.to_string(), value]);
             }
         }
@@ -2747,15 +2753,7 @@ fn instruction_targets_for_layout(
 }
 
 fn instruction_detected(target: &InstructionTarget) -> bool {
-    target.path.exists()
-        || target
-            .detect_paths
-            .iter()
-            .any(|path| path.exists() && path.is_dir())
-        || target
-            .detect_binaries
-            .iter()
-            .any(|binary| which(binary).is_some())
+    client_detected(&target.path, &target.detect_paths, &target.detect_binaries)
 }
 
 fn skill_targets_for_layout(client: McpClient, layout: &ClientLayout) -> Vec<SkillTarget> {
@@ -2879,16 +2877,16 @@ fn custom_skill_targets(paths: &[PathBuf]) -> Result<Vec<SkillTarget>> {
         .collect()
 }
 
-fn target_detected(target: &Target) -> bool {
-    target.path.exists()
-        || target
-            .detect_paths
+fn client_detected(path: &Path, detect_paths: &[PathBuf], detect_binaries: &[&str]) -> bool {
+    path.exists()
+        || detect_paths
             .iter()
             .any(|path| path.exists() && path.is_dir())
-        || target
-            .detect_binaries
-            .iter()
-            .any(|binary| which(binary).is_some())
+        || detect_binaries.iter().any(|binary| which(binary).is_some())
+}
+
+fn target_detected(target: &Target) -> bool {
+    client_detected(&target.path, &target.detect_paths, &target.detect_binaries)
 }
 
 fn custom_instruction_targets(
@@ -3977,9 +3975,9 @@ pub(crate) fn write_owned_skills_with_harness_home(
 /// What the post-upgrade refresh did, so the caller can say so in one line.
 #[derive(Debug)]
 pub(crate) enum UpgradeRefresh {
-    /// Already refreshed for this version, or no aise-owned skill is recorded as installed.
+    /// Already refreshed for this version, or no owned integration needs refreshing.
     NotNeeded,
-    /// Every recorded skill root and every client instruction file was checked once.
+    /// Owned integration components were checked for this version.
     Checked {
         skills: Vec<SkillWriteOutcome>,
         instructions: Vec<InstructionRefresh>,
@@ -4019,6 +4017,9 @@ pub(crate) fn refresh_integrations_after_upgrade(
     config: &IntegrationsConfig,
     harness_home: Option<&Path>,
 ) -> Result<UpgradeRefresh> {
+    if !is_newer_than_refreshed(receipt_path, env!("CARGO_PKG_VERSION")) {
+        return Ok(UpgradeRefresh::NotNeeded);
+    }
     refresh_integrations_for_version(
         receipt_path,
         env!("CARGO_PKG_VERSION"),
@@ -4026,7 +4027,7 @@ pub(crate) fn refresh_integrations_after_upgrade(
     )
 }
 
-/// `layout` locates the client instruction files; `None` checks skills only.
+/// `layout` locates MCP and instruction files; `None` checks skills only.
 fn refresh_integrations_for_version(
     receipt_path: &Path,
     version: &str,
@@ -4039,19 +4040,18 @@ fn refresh_integrations_for_version(
     let manifest = crate::skill_manifest::load_manifest(&manifest_path)?;
     let mut roots = manifest_recorded_skill_roots(&manifest)
         .with_context(|| format!("read the skill install record {}", manifest_path.display()))?;
-    // Instruction files hold no install record, so the recorded skill is the evidence that aise
-    // installed integrations with this configuration; without one there is nothing to refresh,
-    // and a process run with its own empty configuration never reads the user's client files.
-    if roots.is_empty() {
-        return Ok(UpgradeRefresh::NotNeeded);
-    }
+    // Skill and instruction refresh require a skill record; an MCP launch contract is its own
+    // ownership evidence, including installs that never selected a skill.
+    let has_skill_install = !roots.is_empty();
     // A recorded root whose directory is gone was removed by the user; an upgrade must not put it
     // back. `aise integrations install` restores it on request.
     roots.retain(|root| root.is_dir());
     let outcome = (|| {
         let mut skills = match layout {
-            Some(layout) => refresh_gemini_skill_discovery(receipt_path, layout)?,
-            None => Vec::new(),
+            Some(layout) if has_skill_install => {
+                refresh_gemini_skill_discovery(receipt_path, layout)?
+            }
+            _ => Vec::new(),
         };
         // Migration may retire recorded copies and add the canonical package.
         roots =
@@ -4069,7 +4069,11 @@ fn refresh_integrations_for_version(
                     resolve_mcp_binary(None)
                 })?;
                 (
-                    refresh_earlier_instruction_blocks(receipt_path, layout)?,
+                    if has_skill_install {
+                        refresh_earlier_instruction_blocks(receipt_path, layout)?
+                    } else {
+                        Vec::new()
+                    },
                     mcp,
                 )
             }
@@ -4093,6 +4097,9 @@ fn refresh_integrations_for_version(
     // reported once. A config directory that cannot hold the marker only costs repeating a check
     // that is safe to repeat, so failing to write it is not reported.
     record_refreshed_version(receipt_path, version);
+    if !has_skill_install && mcp.is_empty() {
+        return Ok(UpgradeRefresh::NotNeeded);
+    }
     Ok(UpgradeRefresh::Checked {
         skills,
         instructions,
@@ -4208,6 +4215,7 @@ fn refresh_superseded_mcp_entries(
                             })
                 });
         let existing_binary = superseded_entry(&target)
+            .filter(|entry| entry_arguments(entry).is_some_and(mcp_serve_arguments))
             .as_ref()
             .and_then(entry_command)
             .or_else(|| codex_entry_without_marketplace(&target));
@@ -4220,7 +4228,10 @@ fn refresh_superseded_mcp_entries(
             }
             None => continue,
         };
-        let planned = plan_upsert_target(&target, Path::new(&binary));
+        let planned = plan_upsert_target(&target, Path::new(&binary)).and_then(|planned| {
+            validate_automatic_mcp_ownership(&target, &planned)?;
+            Ok(planned)
+        });
         if was_cli_only {
             mutations.extend(planned?);
             moved.push(target.path.clone());
@@ -4236,29 +4247,79 @@ fn refresh_superseded_mcp_entries(
     Ok(moved)
 }
 
+/// Automatic migration needs launch-contract evidence for every named entry in the affected
+/// files, including duplicates. Validate the plan's snapshots so concurrent edits cannot grant
+/// removal authority; explicit install and uninstall retain their name-based selection.
+fn validate_automatic_mcp_ownership(
+    target: &Target,
+    mutations: &[PlannedFileMutation],
+) -> Result<()> {
+    for mutation in mutations {
+        let path = mutation.path();
+        if path != target.path && !target.superseded_paths.iter().any(|old| old == path) {
+            continue;
+        }
+        let text = match mutation {
+            PlannedFileMutation::Write { original, .. } => original.as_deref(),
+            PlannedFileMutation::Remove { original, .. } => Some(original.as_str()),
+        };
+        let Some(text) = text else { continue };
+        let (root, containers): (Map<String, Value>, Vec<&[&str]>) = match target.format {
+            ConfigFormat::CodexToml => {
+                let root = serde_json::to_value(toml::from_str::<toml::Value>(text)?)?;
+                (
+                    root.as_object().cloned().unwrap_or_default(),
+                    vec![&["mcp_servers"]],
+                )
+            }
+            format => {
+                let layout = json_layout_for(format)?;
+                (
+                    parse_json_object_or_empty(path, Some(text), layout.syntax)?,
+                    std::iter::once(layout.container)
+                        .chain(layout.superseded.iter().copied())
+                        .collect(),
+                )
+            }
+        };
+        for keys in containers {
+            let Some(servers) = json_container(&root, keys) else {
+                continue;
+            };
+            for name in std::iter::once(SERVER_NAME).chain(LEGACY_SERVER_NAMES) {
+                if let Some(entry) = servers.get(name) {
+                    if entry_command(entry).is_none()
+                        || !entry_arguments(entry).is_some_and(mcp_serve_arguments)
+                    {
+                        bail!("{} server {name} has an unrecognized launch contract; duplicate entries left unchanged", path.display());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The executable of aise's current Codex `[mcp_servers]` entry when aise's plugin marketplace is
 /// missing or outdated beside it, as after an upgrade from a release that registered only the
 /// server. `None` when the target has no marketplace root or no current aise entry.
 fn codex_entry_without_marketplace(target: &Target) -> Option<String> {
     let root = target.codex_marketplace.as_deref()?;
-    if status_codex_mcp_server(&target.path).ok()? != "configured"
-        || codex_marketplace_is_current(&target.path, root)
-    {
+    if codex_marketplace_is_current(&target.path, root) {
         return None;
     }
     let text = read_optional_utf8_regular_file(&target.path)
         .ok()
         .flatten()?;
-    let document = text.parse::<toml_edit::DocumentMut>().ok()?;
-    document
-        .get("mcp_servers")?
-        .get(SERVER_NAME)?
-        .get("command")?
-        .as_str()
-        .map(str::to_string)
+    let document: toml::Value = toml::from_str(&text).ok()?;
+    let entry = serde_json::to_value(document.get("mcp_servers")?.get(SERVER_NAME)?).ok()?;
+    entry_arguments(&entry)
+        .is_some_and(mcp_serve_arguments)
+        .then(|| entry_command(&entry))
+        .flatten()
 }
 
-/// An aise entry left in a superseded place or entry shape, including its state and extensions.
+/// The entry to retain during migration, preferring the current location over obsolete duplicates.
 fn superseded_entry(target: &Target) -> Option<Value> {
     let layout = json_server_layout(target.format)?;
     let read = |path: &Path| {
@@ -4271,23 +4332,29 @@ fn superseded_entry(target: &Target) -> Option<Value> {
             .chain(layout.superseded.iter().copied())
             .find_map(|keys| owned_entry(&root, keys).cloned())
     });
-    in_old_files.or_else(|| {
-        let root = read(&target.path)?;
-        layout
-            .superseded
-            .iter()
-            .find_map(|keys| owned_entry(&root, keys).cloned())
-            .or_else(|| {
-                let entry = json_container(&root, layout.container)?.get(SERVER_NAME)?;
-                // Earlier aise omitted the transport tag. Repair only that known shape;
-                // explicit transports and custom argument lists remain the user's choice.
-                (entry.get("type").is_none()
-                    && json_entry_is_current(entry, ConfigFormat::JsonMcpServers)
-                    && !json_entry_is_current(entry, target.format))
-                .then(|| owned_entry(&root, layout.container).cloned())
-                .flatten()
-            })
-    })
+    let root = read(&target.path);
+    let current = root
+        .as_ref()
+        .and_then(|root| owned_entry(root, layout.container));
+    in_old_files
+        .or_else(|| {
+            layout
+                .superseded
+                .iter()
+                .find_map(|keys| owned_entry(root.as_ref()?, keys).cloned())
+        })
+        .map(|obsolete| current.cloned().unwrap_or(obsolete))
+        .or_else(|| {
+            let root = root.as_ref()?;
+            let entry = json_container(root, layout.container)?.get(SERVER_NAME)?;
+            // Earlier aise omitted the transport tag. Repair only that known shape;
+            // explicit transports and custom argument lists remain the user's choice.
+            (entry.get("type").is_none()
+                && json_entry_is_current(entry, ConfigFormat::JsonMcpServers)
+                && !json_entry_is_current(entry, target.format))
+            .then(|| owned_entry(root, layout.container).cloned())
+            .flatten()
+        })
 }
 
 fn entry_command(entry: &Value) -> Option<String> {
@@ -4297,6 +4364,14 @@ fn entry_command(entry: &Value) -> Option<String> {
         .or_else(|| command.as_array()?.first()?.as_str())
         .filter(|command| !command.is_empty())
         .map(str::to_string)
+}
+
+fn entry_arguments(entry: &Value) -> Option<&[Value]> {
+    entry
+        .get("args")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .or_else(|| entry.get("command")?.as_array()?.get(1..))
 }
 
 fn owned_entry<'a>(root: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Value> {
@@ -4471,7 +4546,11 @@ fn is_newer_than_refreshed(receipt_path: &Path, version: &str) -> bool {
 fn record_refreshed_version(receipt_path: &Path, version: &str) {
     if is_newer_than_refreshed(receipt_path, version) {
         let marker = crate::skill_manifest::refreshed_version_path(receipt_path);
-        let _ = fs::write(marker, format!("{version}\n"));
+        let _ = crate::durable_fs::atomic_write_file(
+            &marker,
+            format!("{version}\n").as_bytes(),
+            crate::durable_fs::AtomicWriteMode::Replace,
+        );
     }
 }
 
@@ -5087,21 +5166,9 @@ fn merge_registration_arguments(
             }
         }
     }
-    let old_args = old
-        .and_then(|old| {
-            old.get("args")
-                .or_else(|| old.get("command").filter(|value| value.is_array()))
-        })
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let old_args = old.and_then(entry_arguments).unwrap_or_default();
     let mut selections = selected_arguments(old_args);
-    let entry_args = entry
-        .get("args")
-        .or_else(|| entry.get("command").filter(|value| value.is_array()))
-        .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
+    let entry_args = entry_arguments(entry).unwrap_or_default();
     for (flag, value) in selected_arguments(entry_args) {
         if !selections.iter().any(|(existing, _)| existing == &flag) {
             selections.push((flag, value));
@@ -5121,11 +5188,29 @@ fn merge_registration_arguments(
             selections.push((pair[0].clone(), pair[1].clone()));
         }
     }
-    let mut args: Vec<Value> = selections
-        .into_iter()
-        .flat_map(|(flag, value)| [Value::String(flag), Value::String(value)])
-        .collect();
-    args.extend([json!("mcp"), json!("serve")]);
+    // Explicit reinstall selects state; automatic migration retains the user's launch policy.
+    let mut args: Vec<Value> =
+        if state.is_none() && (!old_args.is_empty() || !entry_args.is_empty()) {
+            let retained = if old_args.is_empty() {
+                entry_args
+            } else {
+                old_args
+            };
+            if !mcp_serve_arguments(retained) {
+                bail!(
+                    "{} server {SERVER_NAME} has customized launch arguments; left unchanged",
+                    path.display()
+                );
+            }
+            retained.to_vec()
+        } else {
+            let mut args: Vec<_> = selections
+                .into_iter()
+                .flat_map(|(flag, value)| [Value::String(flag), Value::String(value)])
+                .collect();
+            args.extend([json!("mcp"), json!("serve")]);
+            args
+        };
     if entry["command"].is_array() {
         let binary = entry["command"][0].clone();
         args.insert(0, binary);
@@ -5397,11 +5482,21 @@ fn plan_upsert_json_server(
 fn plan_upsert_json_server_with_state(
     path: &Path,
     format: ConfigFormat,
-    mut entry: Value,
+    entry: Value,
     state: Option<&RegistrationState>,
 ) -> Result<Vec<PlannedFileMutation>> {
-    let layout = json_layout_for(format)?;
     let original = read_optional_utf8_regular_file(path)?;
+    plan_upsert_json_server_from_snapshot(path, format, entry, state, original)
+}
+
+fn plan_upsert_json_server_from_snapshot(
+    path: &Path,
+    format: ConfigFormat,
+    mut entry: Value,
+    state: Option<&RegistrationState>,
+    original: Option<String>,
+) -> Result<Vec<PlannedFileMutation>> {
+    let layout = json_layout_for(format)?;
     let parsed = parse_json_object_or_empty(path, original.as_deref(), layout.syntax)?;
     let old = json_container(&parsed, layout.container)
         .and_then(|servers| servers.get(SERVER_NAME))
@@ -5554,6 +5649,11 @@ fn plan_upsert_codex_mcp_server(
     server.insert("args", toml_edit::value(args));
     let mut mutations = Vec::new();
     if let Some(root) = marketplace {
+        let CheckedCodexMarketplace {
+            original: record_original,
+            mut record,
+            contents,
+        } = checked_codex_marketplace_record(root, &document)?;
         let source = root.to_str().ok_or_else(|| {
             anyhow!(
                 "the aise Codex marketplace path {} is not valid UTF-8 and cannot be written to {}",
@@ -5578,17 +5678,46 @@ fn plan_upsert_codex_mcp_server(
         marketplaces.insert(SERVER_NAME, toml_edit::Item::Table(marketplace_entry));
         for (file, content) in codex_marketplace_files(root, binary)? {
             if file.file_name().is_some_and(|name| name == ".mcp.json") {
-                mutations.extend(plan_upsert_json_server_with_state(
+                mutations.extend(plan_upsert_json_server_from_snapshot(
                     &file,
                     ConfigFormat::JsonMcpServers,
                     entry.clone(),
                     state,
+                    contents.get(&file).cloned(),
                 )?);
                 continue;
             }
-            let original = read_optional_utf8_regular_file(&file)?;
+            let original = contents.get(&file).cloned();
             mutations.push(planned_write(&file, &original, content));
         }
+        let registration =
+            codex_marketplace_registration(&parse_codex_document(path, &document.to_string())?)
+                .expect("the marketplace was inserted above");
+        let mut files: Vec<_> = mutations
+            .iter()
+            .filter_map(|mutation| {
+                let PlannedFileMutation::Write { path, content, .. } = mutation else {
+                    return None;
+                };
+                Some((
+                    path.strip_prefix(root)
+                        .ok()?
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                    content.as_str(),
+                ))
+            })
+            .collect();
+        files.push((
+            CODEX_MARKETPLACE_REGISTRATION.to_string(),
+            registration.as_str(),
+        ));
+        record.record(root, &files);
+        mutations.push(planned_write(
+            &root.with_extension("install-manifest.json"),
+            &record_original,
+            record.to_json()?,
+        ));
     }
 
     let content = document.to_string();
@@ -5615,26 +5744,49 @@ fn plan_remove_codex_mcp_server(
     marketplace: Option<&Path>,
 ) -> Result<Vec<PlannedFileMutation>> {
     let mut mutations = Vec::new();
-    if let Some(root) = marketplace {
-        for (file, _) in codex_marketplace_files(root, "")? {
-            if let Some(original) = read_optional_utf8_regular_file(&file)? {
-                mutations.push(PlannedFileMutation::Remove {
-                    path: file,
-                    original,
-                });
+    let original = read_optional_utf8_regular_file(path)?;
+    let text = original.as_deref().unwrap_or_default();
+    let mut document = parse_codex_document(path, text)?;
+    let owned_marketplace = if let Some(root) = marketplace {
+        match checked_codex_marketplace_record(root, &document) {
+            Ok(CheckedCodexMarketplace {
+                original: record_original,
+                record,
+                contents,
+            }) if record.installation(root).is_some() => {
+                for (file, _) in codex_marketplace_files(root, "")? {
+                    if let Some(original) = contents.get(&file) {
+                        mutations.push(PlannedFileMutation::Remove {
+                            path: file,
+                            original: original.clone(),
+                        });
+                    }
+                }
+                if let Some(original) = record_original {
+                    mutations.push(PlannedFileMutation::Remove {
+                        path: root.with_extension("install-manifest.json"),
+                        original,
+                    });
+                }
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                eprintln!(
+                    "aise: preserved Codex marketplace {}: {error:#}",
+                    root.display()
+                );
+                false
             }
         }
-    }
-    let original = read_optional_utf8_regular_file(path)?;
-    let Some(text) = original.as_deref() else {
-        return Ok(mutations);
+    } else {
+        false
     };
-    let mut document = parse_codex_document(path, text)?;
     let mut removed = document
         .get_mut("mcp_servers")
         .and_then(toml_edit::Item::as_table_mut)
         .is_some_and(remove_owned_toml_server_entries);
-    if marketplace.is_some() {
+    if owned_marketplace {
         // The marketplace aise registered, and the install record Codex adds when the user
         // installs its plugin, which would otherwise point at a marketplace that no longer exists.
         let installed = format!("{SERVER_NAME}@{SERVER_NAME}");
@@ -5665,6 +5817,81 @@ fn plan_remove_codex_mcp_server(
         mutations.insert(0, planned_write(path, &original, content));
     }
     Ok(mutations)
+}
+
+const CODEX_MARKETPLACE_REGISTRATION: &str = "@marketplace-registration";
+
+/// Serialize the named table with its header comments, as it will be read after publication.
+fn codex_marketplace_registration(document: &toml_edit::DocumentMut) -> Option<String> {
+    let entry = document.get("marketplaces")?.get(SERVER_NAME)?.clone();
+    let mut registration = toml_edit::DocumentMut::new();
+    registration["marketplaces"] = toml_edit::Item::Table(toml_edit::Table::new());
+    registration["marketplaces"][SERVER_NAME] = entry;
+    Some(registration.to_string())
+}
+
+#[cfg(test)]
+thread_local! {
+    static MARKETPLACE_CHECKED_EDIT: std::cell::RefCell<Option<(PathBuf, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+struct CheckedCodexMarketplace {
+    original: Option<String>,
+    record: crate::skill_manifest::SkillInstallManifest,
+    contents: std::collections::BTreeMap<PathBuf, String>,
+}
+
+/// Keep marketplace ownership separate from skills, using the same durable digest format.
+fn checked_codex_marketplace_record(
+    root: &Path,
+    document: &toml_edit::DocumentMut,
+) -> Result<CheckedCodexMarketplace> {
+    let path = root.with_extension("install-manifest.json");
+    let original = read_optional_utf8_regular_file(&path)?;
+    let record = original
+        .as_deref()
+        .map(crate::skill_manifest::parse_manifest)
+        .unwrap_or(crate::skill_manifest::ManifestState::Absent)
+        .writable_manifest(&path)
+        .with_context(|| {
+            format!(
+                "cannot verify Codex marketplace ownership at {}",
+                path.display()
+            )
+        })?;
+    let mut contents = Vec::new();
+    for relative in skill_tree_entries(root)? {
+        if let Some(text) = read_optional_utf8_regular_file(&root.join(&relative))? {
+            contents.push((relative, text));
+        }
+    }
+    if let Some(registration) = codex_marketplace_registration(document) {
+        contents.push((CODEX_MARKETPLACE_REGISTRATION.to_string(), registration));
+    }
+    for (relative, text) in &contents {
+        let owned = record
+            .installation(root)
+            .and_then(|installation| installation.file(relative));
+        if !owned.is_some_and(|file| {
+            file.bytes == text.len() && file.sha256 == crate::hashing::sha256(text.as_bytes())
+        }) {
+            bail!("Codex marketplace file {} is unrecorded or modified; inspect or move it before reinstalling", root.join(relative).display());
+        }
+    }
+    #[cfg(test)]
+    MARKETPLACE_CHECKED_EDIT.with(|edit| {
+        if let Some((path, text)) = edit.borrow_mut().take() {
+            std::fs::write(path, text).unwrap();
+        }
+    });
+    Ok(CheckedCodexMarketplace {
+        original,
+        record,
+        contents: contents
+            .into_iter()
+            .map(|(relative, text)| (root.join(relative), text))
+            .collect(),
+    })
 }
 
 /// The developer name Codex shows for the plugin; Cargo.toml carries no `authors`.
@@ -5840,30 +6067,10 @@ fn json_array_is_strings(value: Option<&Value>, expected: &[&str]) -> bool {
 }
 
 fn mcp_serve_arguments(args: &[Value]) -> bool {
-    let mut remaining = Vec::new();
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let Some(arg) = arg.as_str() else {
-            return false;
-        };
-        if STATE_OPTIONS.iter().any(|(flag, _)| arg == *flag) {
-            if !args
-                .next()
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-            {
-                return false;
-            }
-        } else if STATE_OPTIONS.iter().any(|(flag, _)| {
-            arg.strip_prefix(&format!("{flag}="))
-                .is_some_and(|value| !value.is_empty())
-        }) {
-            continue;
-        } else {
-            remaining.push(arg);
-        }
-    }
-    remaining == ["mcp", "serve"]
+    args.iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .is_some_and(|args| crate::cli::is_mcp_serve_arguments(&args))
 }
 
 fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
@@ -5926,7 +6133,13 @@ fn status_json_server(path: &Path, format: ConfigFormat) -> Result<&'static str>
             .is_some_and(|old| old.contains_key(SERVER_NAME) || has_legacy_name(old))
     });
     Ok(match servers.and_then(|servers| servers.get(SERVER_NAME)) {
-        Some(entry) if json_entry_is_current(entry, format) && !left_in_superseded => "configured",
+        Some(entry)
+            if json_entry_is_current(entry, format)
+                && !left_in_superseded
+                && !servers.is_some_and(has_legacy_name) =>
+        {
+            "configured"
+        }
         Some(_) => "stale",
         None if left_in_superseded || servers.is_some_and(has_legacy_name) => "stale",
         None => "not configured",
@@ -5945,7 +6158,11 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
         .and_then(toml_edit::Item::as_table);
     Ok(match entry {
         Some(entry)
-            if entry
+            if !servers.is_some_and(|servers| {
+                LEGACY_SERVER_NAMES
+                    .iter()
+                    .any(|name| servers.contains_key(name))
+            }) && entry
                 .get("command")
                 .and_then(toml_edit::Item::as_value)
                 .and_then(toml_edit::Value::as_str)
@@ -6382,14 +6599,6 @@ fn absolutize(path: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Expand `~` for an install destination, refusing when no home directory exists.
-///
-/// One definition, shared with skill discovery and scaffolding, so the three places that decide
-/// where a file lands cannot disagree about what `~/skills` means.
-fn expand_tilde(path: &Path) -> Result<PathBuf> {
-    crate::util::expand_tilde_required(path)
-}
-
 fn missing_home_error() -> anyhow::Error {
     anyhow!(
         "cannot determine the home directory for MCP client configuration; set HOME or USERPROFILE"
@@ -6541,9 +6750,11 @@ mod tests {
         value["mcpServers"][SERVER_NAME]["env"] = json!({"TEAM":"keep"});
         value["mcpServers"][SERVER_NAME]["extension"] = json!(42);
         fs::write(&plugin, serde_json::to_string(&value).unwrap()).unwrap();
-        publish_planned_mutations(&plan_upsert_target(&target, Path::new("/bin/aise")).unwrap())
-            .unwrap();
-        let kept: Value = serde_json::from_str(&fs::read_to_string(&plugin).unwrap()).unwrap();
+        // Reinstall must not adopt edited plugin files and later authorize deleting them.
+        let edited = fs::read_to_string(&plugin).unwrap();
+        assert!(plan_upsert_target(&target, Path::new("/bin/aise")).is_err());
+        assert_eq!(fs::read_to_string(&plugin).unwrap(), edited);
+        let kept: Value = serde_json::from_str(&edited).unwrap();
         assert_eq!(kept["mcpServers"][SERVER_NAME]["env"]["TEAM"], "keep");
         assert_eq!(kept["mcpServers"][SERVER_NAME]["extension"], 42);
         fs::remove_file(&plugin).unwrap();
@@ -6569,8 +6780,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains(plugin.to_str().unwrap())
-                && error.contains("env.AI_SESSION_SEARCH_DATABASE"),
+            error
+                .replace('\\', "/")
+                .contains(&plugin.to_string_lossy().replace('\\', "/"))
+                && error.contains("unrecorded or modified"),
             "{error}"
         );
         assert_eq!(fs::read_to_string(&target.path).unwrap(), before);
@@ -7629,6 +7842,13 @@ mod tests {
                 }
                 "upgrade" => {
                     refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap();
+                    assert_eq!(fs::read_to_string(&legacy).unwrap(), original);
+                    assert_eq!(status_target(target).unwrap(), "stale");
+                    assert!(
+                        !target.path.exists(),
+                        "unrecognized duplicates prevent migration"
+                    );
+                    continue;
                 }
                 "uninstall" => {
                     assert!(remove_target(target).unwrap());
@@ -8207,6 +8427,7 @@ mod tests {
             marketplace.clone(),
             plugin.join(".codex-plugin/plugin.json"),
             plugin.join(".mcp.json"),
+            root.with_extension("install-manifest.json"),
         ];
         let first = snapshot(&files);
         upsert_target(&target, Path::new("/bin/aise")).unwrap();
@@ -8257,7 +8478,51 @@ mod tests {
         assert!(!left.contains(SERVER_NAME), "{left}");
         assert!(left.contains("# mine") && left.contains("[existing]"));
         assert!(!marketplace.exists() && !plugin.join(".mcp.json").exists());
+        assert!(!root.with_extension("install-manifest.json").exists());
         assert_eq!(status_target(&target).unwrap(), "not configured");
+    }
+
+    #[test]
+    fn codex_marketplace_plans_reject_edits_after_ownership_check() {
+        for uninstall in [false, true] {
+            for index in 0..3 {
+                let dir = tempdir().unwrap();
+                let config = dir.path().join("config.toml");
+                let root = dir.path().join("codex-marketplace");
+                let receipt = dir.path().join("transaction.json");
+                let initial =
+                    plan_upsert_codex_mcp_server(&config, "/synthetic/aise", Some(&root), None)
+                        .unwrap();
+                execute_planned_transaction(&receipt, &initial).unwrap();
+                let before = fs::read_to_string(&config).unwrap();
+                let file = codex_marketplace_files(&root, "").unwrap()[index].0.clone();
+                let checked = fs::read_to_string(&file).unwrap();
+                let edited = format!("{checked}\n");
+                MARKETPLACE_CHECKED_EDIT
+                    .with(|edit| *edit.borrow_mut() = Some((file.clone(), edited.clone())));
+                let plan = if uninstall {
+                    plan_remove_codex_mcp_server(&config, Some(&root))
+                } else {
+                    plan_upsert_codex_mcp_server(&config, "/synthetic/new-aise", Some(&root), None)
+                }
+                .unwrap();
+                let mutation = plan
+                    .iter()
+                    .find(|mutation| mutation.path() == file)
+                    .unwrap();
+                let original = match mutation {
+                    PlannedFileMutation::Write { original, .. } => original.as_deref().unwrap(),
+                    PlannedFileMutation::Remove { original, .. } => original.as_str(),
+                };
+                assert_eq!(
+                    original, checked,
+                    "the plan must use the ownership-checked bytes"
+                );
+                assert!(execute_planned_transaction(&receipt, &plan).is_err(), "an edit after ownership validation must refuse publication: uninstall={uninstall}, file={file:?}");
+                assert_eq!(fs::read_to_string(&file).unwrap(), edited);
+                assert_eq!(fs::read_to_string(&config).unwrap(), before);
+            }
+        }
     }
 
     #[test]
@@ -8906,7 +9171,8 @@ mod tests {
         assert!(skill_content.contains("Literal is the default: the query text as typed"));
         assert!(skill_content.contains("List recent sessions by metadata, then read them"));
         assert!(skill_content.contains("aise list --path ~/source/project --when 7d --limit 10"));
-        assert!(skill_content.contains("one-significant-figure measurements"));
+        assert!(skill_content.contains("small starter set of fixed phrasings"));
+        assert!(!skill_content.contains("on this machine"));
         assert!(skill_content.contains("Recover an edited file"));
         assert!(skill_content
             .contains("aise messages search \"foreign key\" --workspace-path ~/source/project"));
@@ -9821,13 +10087,15 @@ mod tests {
         // `EARLIER_INSTRUCTION_LINE_DIGESTS`, then update the pin here.
         assert_eq!(
             crate::hashing::sha256(INSTRUCTIONS_LINE.as_bytes()),
-            "80e00c44e12fb57a3ba7cebd804880a7ce28ebd004e7442a0415ea32cb5399ab"
+            "6b824ac87aadc3fce7156ebdf72cca29d5f4a70ec88416bba759b82128f2f4d3"
         );
         assert_eq!(
             crate::hashing::sha256(CLI_INSTRUCTIONS_LINE.as_bytes()),
             "a7bfbb5efc4fd40b0268ce38c0091e17844e2edddd9b8cdfbf7be91588c54442"
         );
         assert!(is_aise_instruction_line(RC1_INSTRUCTIONS_LINE));
+        assert!(EARLIER_INSTRUCTION_LINE_DIGESTS
+            .contains(&"80e00c44e12fb57a3ba7cebd804880a7ce28ebd004e7442a0415ea32cb5399ab"));
     }
 
     /// The line 1.0.0rc1 wrote into every instruction block, including Pi's.
@@ -10054,9 +10322,8 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_reads_no_client_file_without_a_recorded_install() {
-        // A process that runs with its own empty configuration, as every test does, must not
-        // rewrite the client files of whoever runs it.
+    fn an_upgrade_preserves_instructions_without_a_recorded_skill() {
+        // Instruction refresh still requires a skill record for this configuration.
         let dir = tempdir().unwrap();
         let (_, layout) = home_with_rc1_instructions(dir.path());
         let receipt = default_transaction_receipt(&dir.path().join("other/config.toml"));
@@ -10130,7 +10397,7 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_with_no_installed_skill_writes_nothing() {
+    fn an_upgrade_with_no_installed_skill_records_only_the_checked_version() {
         let dir = tempdir().unwrap();
         let receipt = default_transaction_receipt(&dir.path().join("config.toml"));
 
@@ -10140,8 +10407,12 @@ mod tests {
         ));
         assert_eq!(
             fs::read_dir(dir.path()).unwrap().count(),
-            0,
-            "a user who never installed integrations gets no files"
+            1,
+            "an empty check creates only its version marker"
+        );
+        assert_eq!(
+            fs::read_to_string(crate::skill_manifest::refreshed_version_path(&receipt)).unwrap(),
+            "9.9.9\n"
         );
     }
 

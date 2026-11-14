@@ -63,6 +63,7 @@ fn provider_parse_contract_fingerprint_from<'a>(
 
 /// Effective discovery configuration and current file count for one provider.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct ProviderSourceStatus {
     /// Provider represented by this status.
     pub provider: Provider,
@@ -78,6 +79,7 @@ pub struct ProviderSourceStatus {
 
 /// One non-fatal filesystem or provider-sidecar discovery failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct ProviderDiscoveryWarning {
     pub provider: Provider,
     pub path: String,
@@ -170,6 +172,13 @@ impl ProviderSet {
             Provider::AiStudio => read_snapshot_until(source, should_cancel, |raw| {
                 self.aistudio.parse_raw(&source.path, raw)
             }),
+            Provider::GeminiCli
+                if source.path.extension().and_then(|value| value.to_str()) == Some("jsonl") =>
+            {
+                parse_jsonl_until(source, should_cancel, |reader| {
+                    self.gemini_cli.parse_reader(reader, &source.path)
+                })
+            }
             Provider::GeminiCli => read_snapshot_until(source, should_cancel, |raw| {
                 self.gemini_cli.parse_raw(&source.path, raw)
             }),
@@ -587,6 +596,7 @@ mod tests {
         );
         std::fs::write(&path, content).unwrap();
         let source = SourceFile {
+            sidecar: None,
             provider: Provider::Claude,
             path: path.clone(),
             mtime_ns: 0,
@@ -617,6 +627,7 @@ mod tests {
         let path = dir.path().join("large.md");
         std::fs::write(&path, "x".repeat(128 * 1024)).unwrap();
         let source = SourceFile {
+            sidecar: None,
             provider: Provider::AiStudio,
             path: path.clone(),
             mtime_ns: 0,
@@ -638,11 +649,44 @@ mod tests {
     }
 
     #[test]
+    fn gemini_jsonl_uses_streaming_native_parser_and_cancellation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-native.jsonl");
+        std::fs::write(
+            &path,
+            "{\"sessionId\":\"native\"}\n{\"id\":\"u1\",\"type\":\"user\",\"content\":\"native prompt\"}\n",
+        )
+        .unwrap();
+        let source = SourceFile {
+            sidecar: None,
+            provider: Provider::GeminiCli,
+            path: path.clone(),
+            mtime_ns: 0,
+            size_bytes: std::fs::metadata(&path).unwrap().len() as i64,
+        };
+        let providers = ProviderSet::new(&Config::default());
+        let parsed = providers.parse(&source).unwrap();
+        assert_eq!(parsed.session.discovery_source, "jsonl");
+        assert_eq!(parsed.messages[0].content, "native prompt");
+
+        let checks = std::cell::Cell::new(0usize);
+        let cancelled = providers
+            .parse_until(&source, &|| {
+                checks.set(checks.get() + 1);
+                checks.get() >= 3
+            })
+            .unwrap();
+        assert!(cancelled.is_none());
+    }
+
+    #[test]
     fn valid_metadata_record_is_not_a_total_failure_when_another_line_is_malformed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metadata-only.jsonl");
-        std::fs::write(&path, "{\"type\":\"metadata\"}\n{partial\n").unwrap();
+        // A known metadata record; an unrecognized type would add its own warning.
+        std::fs::write(&path, "{\"type\":\"custom-title\"}\n{partial\n").unwrap();
         let source = SourceFile {
+            sidecar: None,
             provider: Provider::Claude,
             path: path.clone(),
             mtime_ns: 0,
@@ -673,13 +717,13 @@ mod tests {
     #[test]
     fn parser_contract_fingerprint_changes_with_membership_order_or_version() {
         let baseline = provider_parse_contract_fingerprint_from([
-            (Provider::Claude, "claude-v4"),
+            (Provider::Claude, "claude-v5"),
             (Provider::Codex, "codex-v5"),
         ]);
         assert_ne!(
             baseline,
             provider_parse_contract_fingerprint_from([
-                (Provider::Claude, "claude-v5"),
+                (Provider::Claude, "claude-v4"),
                 (Provider::Codex, "codex-v5"),
             ])
         );
@@ -687,7 +731,7 @@ mod tests {
             baseline,
             provider_parse_contract_fingerprint_from([
                 (Provider::Codex, "codex-v5"),
-                (Provider::Claude, "claude-v4"),
+                (Provider::Claude, "claude-v5"),
             ])
         );
     }

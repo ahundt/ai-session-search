@@ -145,6 +145,11 @@ fn consider_more_selective(
 /// a candidate set built from the others would miss that pattern's matches. (Note: `corrections`
 /// no longer uses this — it scans the small `role='user'` slice directly; see `Db::find_corrections`
 /// — but this stays as a general public utility for multi-pattern prefiltering over a wide corpus.)
+/// Compile and retain safe prefilters for every supplied regex; output grows with all required terms.
+#[deprecated(
+    since = "1.1.0",
+    note = "use MessageService::search with MessageQuery::regex for verified results"
+)]
 pub fn trigram_prefilter_all<I, S>(patterns: I) -> Option<String>
 where
     I: IntoIterator<Item = S>,
@@ -171,9 +176,11 @@ where
 /// ordinary written form is the uppercase syllabary; Georgian Mtavruli; Osage; Adlam; and Latin
 /// letters added in later Unicode versions). Stored text keeps the uppercase scalar while a query
 /// trigram carries the lowercase one, so a trigram containing one of these would exclude rows
-/// the verifier accepts. 445 scalars in 60 inclusive ranges, sorted.
-/// `the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes this from the
-/// SQLite this crate links and fails if a SQLite upgrade changes it.
+/// the verifier accepts. The union covers the case pairs recognized by supported Rust
+/// toolchains; literal matching uses that toolchain's `char::to_lowercase`, while regex uses
+/// the locked regex crate's Unicode tables. Older compilers may not recognize every pair.
+/// `the_unfolded_lowercase_table_matches_the_linked_fts5_tokenizer` recomputes the required
+/// entries from Rust's case mappings and the linked SQLite tokenizer.
 const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
     (0x019B, 0x019B),
     (0x025C, 0x025C),
@@ -181,6 +188,8 @@ const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
     (0x0264, 0x0264),
     (0x026A, 0x026A),
     (0x026C, 0x026C),
+    (0x0277, 0x0277),
+    (0x027C, 0x027C),
     (0x0282, 0x0282),
     (0x0287, 0x0287),
     (0x029D, 0x029E),
@@ -222,6 +231,7 @@ const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
     (0xA7D9, 0xA7D9),
     (0xA7DB, 0xA7DB),
     (0xA7F6, 0xA7F6),
+    (0xAB4B, 0xAB4C),
     (0xAB53, 0xAB53),
     (0xAB70, 0xABBF),
     (0x104D8, 0x104FB),
@@ -234,6 +244,22 @@ const FTS5_UNFOLDED_LOWERCASE: &[(u32, u32)] = &[
     (0x118C0, 0x118DF),
     (0x16E60, 0x16E7F),
     (0x16EBB, 0x16ED3),
+    (0x1DF41, 0x1DF41),
+    (0x1DF49, 0x1DF49),
+    (0x1DF4B, 0x1DF4B),
+    (0x1DF4E, 0x1DF4E),
+    (0x1DF52, 0x1DF52),
+    (0x1DF69, 0x1DF69),
+    (0x1DF6B, 0x1DF6B),
+    (0x1DF6D, 0x1DF6D),
+    (0x1DF6F, 0x1DF6F),
+    (0x1DF73, 0x1DF73),
+    (0x1DF75, 0x1DF75),
+    (0x1DF77, 0x1DF77),
+    (0x1DF79, 0x1DF79),
+    (0x1DF7B, 0x1DF7B),
+    (0x1DF7D, 0x1DF7D),
+    (0x1DF7F, 0x1DF7F),
     (0x1E922, 0x1E943),
 ];
 
@@ -258,13 +284,14 @@ fn fts5_leaves_uppercase_unfolded(lowercase: char) -> bool {
 ///
 /// A row containing the literal contains every trigram of it, so requiring them all selects a
 /// SUPERSET of matching rows (non-adjacent occurrences are fine; the caller verifies). That holds
-/// only for trigrams FTS5 tokenizes the same way on both sides, so three kinds of position are
+/// only for trigrams FTS5 tokenizes the same way on both sides, so unsafe positions are
 /// left out, and the trigrams of every remaining run of at least three characters are required:
 ///
 /// - a grapheme whose lowercase spans several scalars (U+0130 lowercases to `i` + U+0307), which
 ///   FTS5 folds one scalar at a time;
 /// - a lowercase form whose uppercase FTS5 does not fold to it ([`FTS5_UNFOLDED_LOWERCASE`]);
 /// - a leading U+0307, which a stored U+0130 can supply as the second half of its fold.
+/// - NUL, which terminates FTS5 query strings; usable runs on either side remain selective.
 ///
 /// A final `i` can be supplied by a stored U+0130 too, which FTS5 keeps as itself, so the
 /// trigram ending there becomes two alternatives, one spelled with each. Leaving it out instead
@@ -283,11 +310,12 @@ fn literal_to_trigrams(text: &str) -> Option<Vec<Vec<String>>> {
     let mut chars: Vec<(char, bool)> = Vec::with_capacity(lowercase.len());
     for grapheme in lowercase.graphemes(true) {
         let expands = grapheme.chars().count() > 1;
-        chars.extend(
-            grapheme
-                .chars()
-                .map(|c| (c, !expands && !fts5_leaves_uppercase_unfolded(c))),
-        );
+        chars.extend(grapheme.chars().map(|c| {
+            (
+                c,
+                c != '\0' && !expands && !fts5_leaves_uppercase_unfolded(c),
+            )
+        }));
     }
     if let Some(first) = chars.first_mut() {
         if first.0 == '\u{307}' {
@@ -367,6 +395,16 @@ fn seq_to_groups(seq: &Seq) -> Option<(usize, Vec<Vec<String>>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nul_is_not_rendered_into_fts_queries_but_safe_runs_stay_indexed() {
+        for pattern in ["\0abc", r"\x00abc", "abc\0def"] {
+            let prefilter = trigram_prefilter(pattern).unwrap();
+            assert!(!prefilter.contains('\0'));
+            assert!(prefilter.contains("abc"));
+        }
+        assert!(trigram_prefilter("a\0b").is_none());
+    }
 
     /// Parse the `"..."`-quoted terms back out of an OR query (test helper).
     fn quoted_literals(query: &str) -> Vec<String> {
@@ -673,6 +711,22 @@ mod tests {
             "FTS5_UNFOLDED_LOWERCASE disagrees with the linked tokenizer: \
              missing {missing:?}, extra {extra:?}"
         );
+    }
+
+    #[test]
+    fn newer_case_pairs_cannot_constrain_the_fts5_candidates() {
+        for code in [
+            0x0277, 0x027C, 0xAB4B, 0xAB4C, 0x1DF41, 0x1DF49, 0x1DF4B, 0x1DF4E, 0x1DF52, 0x1DF69,
+            0x1DF6B, 0x1DF6D, 0x1DF6F, 0x1DF73, 0x1DF75, 0x1DF77, 0x1DF79, 0x1DF7B, 0x1DF7D,
+            0x1DF7F,
+        ] {
+            let lower = char::from_u32(code).unwrap();
+            assert_eq!(literal_to_trigrams(&format!("a{lower}b")), None);
+            assert_eq!(
+                literal_to_trigrams(&format!("safe{lower}run")),
+                Some(vec![vec!["afe".into(), "run".into(), "saf".into()]])
+            );
+        }
     }
 
     #[test]

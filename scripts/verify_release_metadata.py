@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import pathlib
 import re
 import sys
@@ -45,14 +46,16 @@ _CHANGELOG_SECTION = re.compile(r"^## \[(?P<version>[^]]+)\](?: - (?P<date>\d{4}
 # A released section reads top to bottom for someone deciding whether and how to upgrade: a short
 # summary, then Keep a Changelog headings in this order. "Highlights" names the few changes most
 # readers came for; "For contributors" keeps build and test work out of the user-facing sections.
-# There is no upgrading heading: upgrading is one command, and the generated footer gives it.
+# Upgrade notes precede features because data formats and API contracts can need migration.
 NOTES_HEADINGS = (
+    "Upgrade notes",
     "Highlights",
     "Added",
     "Changed",
     "Deprecated",
     "Removed",
     "Fixed",
+    "Performance",
     "Security",
     "For contributors",
 )
@@ -186,8 +189,8 @@ def check_notes_shape(notes: str, version: str) -> None:
     unknown = [heading for heading in headings if heading not in NOTES_HEADINGS]
     if unknown:
         raise ReleaseMetadataError(
-            f"{where} uses {unknown}; release headings are {list(NOTES_HEADINGS)}. Upgrading is "
-            "one command, which the generated footer gives, so there is no upgrade section"
+            f"{where} uses {unknown}; release headings are {list(NOTES_HEADINGS)}; "
+            "use Upgrade notes for migration steps"
         )
     order = [NOTES_HEADINGS.index(heading) for heading in headings]
     if order != sorted(order) or len(set(order)) != len(order):
@@ -255,6 +258,15 @@ def previous_release(root: pathlib.Path, version: str) -> str | None:
     return versions[index + 1] if index + 1 < len(versions) else None
 
 
+def _verify_registry_versions(root: pathlib.Path, cargo_version: str) -> None:
+    registry = json.loads((root / "server.json").read_text(encoding="utf-8"))
+    if registry["version"] != cargo_version:
+        raise ReleaseMetadataError(f"server.json version must equal {cargo_version!r}")
+    for package in registry["packages"]:
+        if package["version"] != cargo_version:
+            raise ReleaseMetadataError(f"server.json package version must equal {cargo_version!r}")
+
+
 def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
     project = _manifest(root / "pyproject.toml")
     core = _manifest(root / "rust/ai-session-search-core/Cargo.toml")
@@ -290,6 +302,7 @@ def verify_release_metadata(root: pathlib.Path, tag: str) -> str:
                 f"{relative} declares {skill_version!r} "
                 f"instead of the release version {cargo_version!r}"
             )
+    _verify_registry_versions(root, cargo_version)
     _verify_documented_requirements(root, cargo_version)
     release_body(root, version)
     return version
@@ -340,7 +353,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.notes_out is not None:
             args.notes_out.write_text(body, encoding="utf-8")
         print(version)
-    except (KeyError, OSError, ReleaseMetadataError, tomllib.TOMLDecodeError) as error:
+    except (KeyError, OSError, ReleaseMetadataError, tomllib.TOMLDecodeError, json.JSONDecodeError) as error:
         print(f"release metadata verification failed: {error}", file=sys.stderr)
         return 1
     return 0

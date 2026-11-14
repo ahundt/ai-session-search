@@ -8,6 +8,7 @@ use serde::Serialize;
 use url::Url;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MessageRef {
     pub kind: String,
     pub value: String,

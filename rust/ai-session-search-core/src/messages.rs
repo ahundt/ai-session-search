@@ -31,7 +31,9 @@ use crate::models::{
     MessageFilters, MessageHit, MessageKind, MessageSearchMode, Provider, Role, SearchField,
 };
 use crate::refs::{extract_refs_from_text, ref_summary, MessageRef};
-use crate::render::{render, OutputFormat, Row, RowBatchRenderer};
+#[cfg(test)]
+use crate::render::render;
+use crate::render::{emit, OutputFormat, Row, RowBatchRenderer};
 use crate::service::{CatalogService, MessageService};
 use crate::util::{select_message_lines, truncate_for_display};
 
@@ -48,6 +50,7 @@ const CLI_MESSAGE_SEARCH_BATCH_ROWS: usize = 256;
 /// NOT used: a negative count is a CLI parser hazard and unprecedented among leading tools;
 /// the sign convention is reserved for per-item depth (--lines-per-message, --summary-items).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum ReadOrder {
     #[default]
     Oldest,
@@ -501,6 +504,7 @@ impl ContextBatchRow for ContextRowWithRefs {
 }
 
 #[derive(Debug, Subcommand)]
+#[non_exhaustive]
 pub enum MessagesCmd {
     /// Search messages by content / role / date across sessions.
     Search(Box<MessageSearchArgs>),
@@ -515,6 +519,7 @@ pub enum MessagesCmd {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum CliMessageQueryMode {
     #[default]
     Literal,
@@ -523,6 +528,7 @@ pub enum CliMessageQueryMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CliFieldViewChars {
     NoCharLimit,
     MaxChars(NonZeroUsize),
@@ -543,6 +549,7 @@ impl std::str::FromStr for CliFieldViewChars {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CliMatchViewChars {
     Minimal,
     MaxChars(NonZeroUsize),
@@ -563,6 +570,7 @@ impl std::str::FromStr for CliMatchViewChars {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CliMessageSearchInclude {
     None,
     Value(MessageSearchInclude),
@@ -574,16 +582,14 @@ impl std::str::FromStr for CliMessageSearchInclude {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         let include = match value {
             "none" => return Ok(Self::None),
-            "normalized_session_metadata" => MessageSearchInclude::NormalizedSessionMetadata,
-            "parsed_references" => MessageSearchInclude::ParsedReferences,
-            "raw_provider_metadata" => MessageSearchInclude::RawProviderMetadata,
-            "runtime_diagnostics" => MessageSearchInclude::RuntimeDiagnostics,
-            _ => {
-                return Err(
-                    "expected none, normalized_session_metadata, parsed_references, raw_provider_metadata, or runtime_diagnostics"
-                        .to_string(),
-                )
-            }
+            "raw-metadata" => MessageSearchInclude::RawProviderMetadata,
+            "raw_provider_metadata" => {
+                eprintln!("aise: --include raw_provider_metadata is deprecated; use --include raw-metadata");
+                MessageSearchInclude::RawProviderMetadata
+            },
+            _ => value.parse().map_err(|_| {
+                "expected none, normalized_session_metadata, parsed_references, raw-metadata, or runtime_diagnostics".to_string()
+            })?,
         };
         Ok(Self::Value(include))
     }
@@ -645,6 +651,7 @@ const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-descri
         ])
         .multiple(true)
 ))]
+#[non_exhaustive]
 pub struct MessageSearchArgs {
     /// Text to find in the selected field. Literal mode is the default; choose regex or fuzzy with
     /// --query-mode. Punctuation is significant in literal mode. Omit the query to list all. Pass
@@ -661,8 +668,8 @@ pub struct MessageSearchArgs {
         allow_hyphen_values = true
     )]
     pub query_arg: Option<String>,
-    /// Filter by role: user (non-command prompts), assistant, tool (calls/results),
-    /// slash (human-entered commands), or compaction. Omit for every role.
+    /// user selects recorded prompts, commands, queued inputs and answers across source roles;
+    /// other values select stored assistant, tool, slash or compaction records. Omit for all content.
     #[arg(help_heading = FILTER_HEADING, long = "role", value_enum)]
     pub role: Option<Role>,
     /// Restrict by semantic message kind; tool calls and results are distinct. One-value alias
@@ -764,7 +771,8 @@ pub struct MessageSearchArgs {
     /// deterministic relevance order on the complete eligible corpus.
     #[arg(help_heading = RESULTS_HEADING, long, default_value_t = 0)]
     pub offset: usize,
-    /// Optional payload groups. Repeat or comma-delimit names; --include none requests only the
+    /// Optional payload groups. --include raw-metadata adds verbatim provider metadata;
+    /// raw_provider_metadata is a deprecated alias. Repeat or comma-delimit names; --include none requests only the
     /// semantic core and cannot be combined with another name. Omit for no optional group on this
     /// surface, which is where the CLI differs from MCP: MCP adds normalized session metadata by
     /// default because it answers across arbitrary sessions, while a CLI caller can see the paths
@@ -842,12 +850,26 @@ pub struct MessageGetArgs {
     /// selected seq; 0 (the default) shows only the selected message.
     #[arg(long, default_value_t = 0, value_parser = parse_context_count)]
     pub context: i64,
+    /// With --seq, override the number of messages before the anchor (0 or greater).
+    /// Omit to use --context.
+    #[arg(long, requires = "seq", value_parser = parse_context_count)]
+    pub context_before: Option<i64>,
+    /// With --seq, override the number of messages after the anchor (0 or greater).
+    /// Omit to use --context.
+    #[arg(long, requires = "seq", value_parser = parse_context_count)]
+    pub context_after: Option<i64>,
     /// Include extracted URL references in output for the focused --seq window or whole session.
     #[arg(long)]
     pub refs: bool,
-    /// Filter by role. Omit for every role.
+    /// user selects recorded input across source roles; other values select stored roles.
+    /// Omit for complete records of every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
+    /// Message classes for a range read. Omit for every class except harness-notice.
+    /// Pass conversation,harness-notice to include both. With --seq, context already includes
+    /// every class, so omit --kinds.
+    #[arg(long, value_enum, value_delimiter = ',', num_args = 1..)]
+    pub kinds: Option<Vec<MessageKind>>,
     #[command(flatten)]
     pub dates: DateRange,
     /// Maximum messages to return; 0 (the default) returns all. Selection is oldest-first by
@@ -887,20 +909,27 @@ pub struct MessageGetArgs {
 
 #[derive(Debug, Args)]
 #[non_exhaustive]
+#[command(
+    after_help = "Unlike messages search, timeline ignores message-search operation limits and purpose defaults: omitted --limit reads every selected message. --order newest selects the final N, then prints them chronologically."
+)]
 pub struct TimelineArgs {
     /// Session id or prefix.
     pub id: String,
-    /// Filter by role. Omit for every role.
+    /// user selects recorded input across source roles; other values select stored roles.
+    /// Omit for complete records of every role.
     #[arg(long = "role", value_enum)]
     pub role: Option<Role>,
-    /// Keep only messages containing this literal substring. Omit to keep every message the other
-    /// filters select. Mutually exclusive with `--regex` (which would otherwise silently win).
+    /// Text to match literally by default; --query-mode regex selects a Rust regex.
+    /// Omit for every message the other filters select. Conflicts with --regex.
     #[arg(long, conflicts_with = "regex")]
     pub grep: Option<String>,
-    /// Keep only messages matching this Rust regex. Omit to keep every message the other filters
-    /// select.
+    /// Deprecated: use --grep PATTERN --query-mode regex.
+    /// Keep messages matching this Rust regex. Omit for no regex filter.
     #[arg(long)]
     pub regex: Option<String>,
+    /// Matching model for --grep: literal (default) or regex. Requires a text filter.
+    #[arg(long, value_parser = ["literal", "regex"])]
+    pub query_mode: Option<String>,
     /// Include extracted URL references in output for timeline rows.
     #[arg(long)]
     pub refs: bool,
@@ -969,11 +998,21 @@ pub struct MessageEvidenceArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[non_exhaustive]
 pub enum EvidenceInclude {
     TimeProfile,
 }
 
+/// Render a parsed messages command to standard output; cost follows the selected service operation.
+#[deprecated(
+    since = "1.1.0",
+    note = "use MessageService::search or read_session, or CatalogService::inspect"
+)]
 pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
+    run_command(db, cmd, config)
+}
+
+pub(crate) fn run_command(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
     let cli = &config.cli;
     match cmd {
         MessagesCmd::Search(args) => run_search(db, args, config),
@@ -982,6 +1021,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
             let session = db.resolve_session_record(&args.id)?;
             if let Some(seq) = args.seq {
                 if args.role.is_some()
+                    || args.kinds.is_some()
                     || args.limit > 0
                     || args.order != ReadOrder::Oldest
                     || args.offset > 0
@@ -993,14 +1033,19 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
                 {
                     bail!(
                         "--seq selects one sequence number, so it takes only --context; \
-                         drop --role, --limit, --order, --offset, --seq-from, --seq-to, --since, \
+                         drop --role, --kinds, --limit, --order, --offset, --seq-from, --seq-to, --since, \
                          --until, and --when, or omit --seq to read a range of messages"
                     );
                 }
                 let context = args.context;
                 let matched_rows: HashSet<(String, i64)> =
                     HashSet::from([(session.id.clone(), seq)]);
-                let rows = db.message_context(&session.id, seq, context, context)?;
+                let rows = db.message_context(
+                    &session.id,
+                    seq,
+                    args.context_before.unwrap_or(context),
+                    args.context_after.unwrap_or(context),
+                )?;
                 if args.refs {
                     let rows = rows
                         .into_iter()
@@ -1023,6 +1068,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
             let (since, until) = args.dates.resolve_now()?;
             let filters = MessageFilters {
                 role: args.role,
+                kinds: args.kinds.clone(),
                 session_id: Some(session.id),
                 since,
                 until,
@@ -1036,6 +1082,17 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
             emit_message_hits(&hits, args.refs, args.format, lines_per_message)
         }
         MessagesCmd::Timeline(args) => {
+            if args.regex.is_some() {
+                eprintln!(
+                    "aise: timeline --regex is deprecated; use --grep PATTERN --query-mode regex"
+                );
+                if args.query_mode.as_deref() == Some("literal") {
+                    bail!("--regex conflicts with --query-mode literal; pass --grep PATTERN with one --query-mode");
+                }
+            }
+            if args.query_mode.is_some() && args.grep.is_none() && args.regex.is_none() {
+                bail!("--query-mode requires a text filter; pass --grep PATTERN");
+            }
             let session = db.resolve_session_record(&args.id)?;
             validate_seq_bounds(args.seq_from, args.seq_to)?;
             let (since, until) = args.dates.resolve_now()?;
@@ -1049,7 +1106,7 @@ pub fn run(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result<()> {
                 seq_to: args.seq_to,
                 limit: args.limit,
                 offset: args.offset,
-                match_mode: if args.regex.is_some() {
+                match_mode: if args.regex.is_some() || args.query_mode.as_deref() == Some("regex") {
                     MessageSearchMode::Regex
                 } else {
                     MessageSearchMode::Literal
@@ -1137,13 +1194,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     if args.argument_path.is_some() && args.field != SearchField::ToolArgument {
         bail!("argument_path requires field='tool_argument'");
     }
-    let target = match args.field {
-        SearchField::Content => MessageTarget::content(),
-        SearchField::ToolName => MessageTarget::tool_name(),
-        SearchField::ToolArgument => {
-            MessageTarget::tool_argument(args.argument_path.clone().unwrap_or_default())?
-        }
-    };
+    let target = MessageTarget::new(args.field, args.argument_path.as_deref())?;
     let mut builder = MessageSearchRequest::builder(query, target)
         .time(RequestedTimeRange::new(since, until)?)
         .include_compaction(args.include_compaction)
@@ -1287,6 +1338,11 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         return emit_message_search_machine_response(&response, format);
     }
     let hits = response.hits();
+    if hits.is_empty() && matches!(format, OutputFormat::Table | OutputFormat::Plain) {
+        for hint in response.request().empty_result_hints(SearchSurface::Cli) {
+            eprintln!("[hint] {hint}");
+        }
+    }
     let include_refs = response.presentation().include_refs();
     let lines_per_message = response.presentation().message_lines().to_signed()?;
     if response.context_windows().is_empty() {
@@ -1551,6 +1607,13 @@ fn write_message_search_human_batches<W: Write>(
     }
 
     let completion = batches.completion()?;
+    if completion.page().returned() == 0
+        && matches!(format, OutputFormat::Table | OutputFormat::Plain)
+    {
+        for hint in batches.request().empty_result_hints(SearchSurface::Cli) {
+            eprintln!("[hint] {hint}");
+        }
+    }
     if let Some(explain) = completion.search_explanation() {
         eprintln!(
             "{}",
@@ -1734,14 +1797,6 @@ fn parse_context_count(raw: &str) -> std::result::Result<i64, String> {
     Ok(value)
 }
 
-fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    render(rows, format, &mut out)?;
-    out.flush()?;
-    Ok(())
-}
-
 fn emit_message_search_hits(
     hits: &[MessageSearchHit],
     include_refs: bool,
@@ -1815,7 +1870,7 @@ fn emit_message_hits(
     emit(&rows, format)
 }
 
-fn emit_inspection(
+pub(crate) fn emit_inspection(
     inspection: &crate::inspect::SessionInspection,
     options: InspectionOptions,
     format: OutputFormat,
@@ -1926,6 +1981,7 @@ mod tests {
 
     fn sample_hit(seq: i64, content: &str) -> MessageHit {
         MessageHit {
+            provenance: None,
             session_id: "claude:s1".to_string(),
             provider: Provider::Claude,
             seq,
@@ -2358,6 +2414,37 @@ mod tests {
     }
 
     #[test]
+    fn message_search_accepts_canonical_raw_metadata_include() {
+        assert_parses(["sg", "search", "needle", "--include", "raw-metadata"]);
+        assert_parses([
+            "sg",
+            "search",
+            "needle",
+            "--include",
+            "raw_provider_metadata",
+        ]);
+        assert_eq!(
+            "raw-metadata".parse::<CliMessageSearchInclude>().unwrap(),
+            CliMessageSearchInclude::Value(MessageSearchInclude::RawProviderMetadata)
+        );
+    }
+
+    #[test]
+    fn focused_read_accepts_asymmetric_context() {
+        assert_parses([
+            "sg",
+            "get",
+            "claude:s1",
+            "--seq",
+            "2",
+            "--context-before",
+            "0",
+            "--context-after",
+            "3",
+        ]);
+    }
+
+    #[test]
     fn get_accepts_focused_seq_window() {
         assert_parses(["sg", "get", "claude:s1", "--seq", "2", "--context", "1"]);
     }
@@ -2521,6 +2608,7 @@ mod tests {
     #[test]
     fn structured_context_rows_reuse_complete_message_hit_metadata() {
         let hit = MessageHit {
+            provenance: None,
             session_id: "codex:context-contract".to_string(),
             provider: Provider::Codex,
             seq: 7,

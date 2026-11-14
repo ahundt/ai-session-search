@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -43,6 +44,10 @@ def _write_manifests(
 ) -> None:
     cargo_version = cargo_version or python_version
     _write_changelog(root, python_version)
+    (root / "server.json").write_text(json.dumps({
+        "version": cargo_version,
+        "packages": [{"version": cargo_version}],
+    }), encoding="utf-8")
     (root / "skills/ai-session-search").mkdir(parents=True)
     (root / "rust/ai-session-search-core").mkdir(parents=True)
     (root / "rust/ai-session-search-core/skills/ai-session-search").mkdir(parents=True)
@@ -248,7 +253,7 @@ def test_previous_release_is_the_dated_section_below_the_version(tmp_path: Path)
     ("notes", "complaint"),
     [
         ("### Fixed\n\n1. A fix.\n", "must open with a short summary"),
-        ("Summary.\n\n### Upgrading from 1.0.0rc1\n\n1. Rename a key.\n", "no upgrade section"),
+        ("Summary.\n\n### Upgrading from 1.0.0rc1\n\n1. Rename a key.\n", "use Upgrade notes"),
         ("Summary.\n\n### Fixed\n\n1. A.\n\n### Added\n\n1. B.\n", "in the order"),
         ("Summary.\n\n### Fixed\n\n- A fix.\n", "number the items"),
         ("Summary.\n\n### Fixed\n\n1. A fix:\n   + nested.\n", "number the items"),
@@ -345,3 +350,28 @@ def test_release_versions_sort_the_way_pep_440_orders_them() -> None:
     versions = ["1.0.1", "1.0.0", "1.0.0rc10", "1.0.0rc2", "1.0.0b1", "1.0.0a3"]
 
     assert sorted(versions, key=release_sort_key) == ["1.0.0a3", "1.0.0b1", "1.0.0rc2", "1.0.0rc10", "1.0.0", "1.0.1"]
+
+
+def test_release_notes_put_migration_before_features_and_measured_performance() -> None:
+    check_notes_shape(
+        "Summary.\n\n### Upgrade notes\n\n1. Preserve the index before downgrading.\n"
+        "\n### Added\n\n1. A typed service.\n\n### Fixed\n\n1. A released defect.\n"
+        "\n### Performance\n\n1. A generated-fixture measurement.\n",
+        "1.1.0",
+    )
+    with pytest.raises(ReleaseMetadataError, match="headings must appear"):
+        check_notes_shape("Summary.\n\n### Added\n\n1. Feature.\n\n### Upgrade notes\n\n1. Migration.\n", "1.1.0")
+
+
+@pytest.mark.parametrize("package", [False, True])
+def test_registry_metadata_version_tracks_the_release(tmp_path: Path, package: bool) -> None:
+    _write_manifests(tmp_path)
+    path = tmp_path / "server.json"
+    metadata = json.loads(path.read_text())
+    if package:
+        metadata["packages"][0]["version"] = "0.9.0"
+    else:
+        metadata["version"] = "0.9.0"
+    path.write_text(json.dumps(metadata))
+    with pytest.raises(ReleaseMetadataError, match=r"server\.json.*version"):
+        verify_release_metadata(tmp_path, "v1.0.0")

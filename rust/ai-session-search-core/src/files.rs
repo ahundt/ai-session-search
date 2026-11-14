@@ -43,7 +43,7 @@ use crate::durable_fs::{entry_exists, StagedDirectory};
 use crate::models::{
     EditOp, FileCrossRef, FileEdit, FileEditSummary, FileQuery, FileVersion, Provider,
 };
-use crate::render::{render, OutputFormat, Row};
+use crate::render::{emit, OutputFormat, Row};
 
 pub(crate) type FileMutationPayload = (String, Option<String>, Vec<EditOp>);
 
@@ -135,39 +135,55 @@ impl PendingFileMutations {
 /// range. A path-only edit or replay mismatch invalidates known content until a later full
 /// snapshot; recovery never invents a successful file state from an unapplied mutation.
 pub fn reconstruct(edits: &[FileEdit], version: usize) -> Option<String> {
-    if version == 0 || version > edits.len() {
-        return None;
-    }
-    let target = version - 1;
-    // Latest full snapshot (a `Write`, which sets `new_content`) at or before target.
-    let base = (0..=target)
-        .rev()
-        .find(|&i| edits[i].new_content.is_some())?;
-    let mut content = edits[base].new_content.clone();
-    for edit in &edits[base + 1..=target] {
-        advance_reconstruction(&mut content, edit);
-    }
-    content
+    reconstruct_version(edits, version).ok()
 }
 
-/// Apply replacements in order. Returns false when any requested replacement cannot be replayed.
-fn apply_edits(content: &mut String, edits: &[EditOp]) -> bool {
+/// Recover one version or name the first blocking version since its latest full snapshot.
+/// Time O(E + L), memory O(L), for E edits and L content bytes scanned/copied during replay.
+fn reconstruct_version(edits: &[FileEdit], version: usize) -> Result<String> {
+    if version == 0 || version > edits.len() {
+        bail!("version {version} is out of range (1..={})", edits.len());
+    }
+    let target = version - 1;
+    let base = (0..=target)
+        .rev()
+        .find(|&i| edits[i].new_content.is_some())
+        .ok_or_else(|| anyhow!("version {version} has no preceding full-content snapshot"))?;
+    let mut content = edits[base]
+        .new_content
+        .clone()
+        .expect("selected full snapshot");
+    for (index, edit) in edits.iter().enumerate().take(version).skip(base + 1) {
+        if edit.edits.is_empty() {
+            bail!(
+                "version {} is path-only: no replacement content was recorded",
+                index + 1
+            );
+        }
+        apply_edits(&mut content, &edit.edits)
+            .map_err(|reason| anyhow!("version {} cannot be rebuilt: {reason}", index + 1))?;
+    }
+    Ok(content)
+}
+
+/// Apply replacements in order; an error names why a requested replacement cannot be replayed.
+fn apply_edits(content: &mut String, edits: &[EditOp]) -> std::result::Result<(), &'static str> {
     for op in edits {
         if op.old.is_empty() {
-            return false;
+            return Err("replacement old text is empty");
         }
         if op.replace_all {
             if !content.contains(op.old.as_str()) {
-                return false;
+                return Err("replacement old text is absent from the preceding content");
             }
             *content = content.replace(op.old.as_str(), &op.new);
         } else if let Some(pos) = content.find(op.old.as_str()) {
             content.replace_range(pos..pos + op.old.len(), &op.new);
         } else {
-            return false;
+            return Err("replacement old text is absent from the preceding content");
         }
     }
-    true
+    Ok(())
 }
 
 /// Advance one reconstruction state without inventing bytes for an unreplayable event.
@@ -178,7 +194,7 @@ fn advance_reconstruction(content: &mut Option<String>, edit: &FileEdit) {
     } else if edit.edits.is_empty()
         || !content
             .as_mut()
-            .is_some_and(|current| apply_edits(current, &edit.edits))
+            .is_some_and(|current| apply_edits(current, &edit.edits).is_ok())
     {
         *content = None;
     }
@@ -364,12 +380,31 @@ fn version_line_counts(edits: &[FileEdit]) -> Vec<i64> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ReconstructedFile {
     pub session_id: String,
     pub provider: Provider,
     pub version: usize,
     pub file_path: String,
     pub content: String,
+}
+
+impl ReconstructedFile {
+    pub fn new(
+        session_id: impl Into<String>,
+        provider: Provider,
+        version: usize,
+        file_path: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            provider,
+            version,
+            file_path: file_path.into(),
+            content: content.into(),
+        }
+    }
 }
 
 /// One published version: which session and version it was reconstructed from, where it landed,
@@ -380,6 +415,7 @@ pub struct ReconstructedFile {
 /// `name_vN` files whose provenance could be re-derived only by searching the index again, while
 /// the single-version restore beside it had always printed all four facts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct PublishedFileVersion {
     pub source_session_id: String,
     pub version: usize,
@@ -389,6 +425,7 @@ pub struct PublishedFileVersion {
 
 /// Receipt for an atomically published, non-replacing directory of reconstructed versions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
 pub struct RecoveryPublicationReceipt {
     pub destination: PathBuf,
     pub files: Vec<PublishedFileVersion>,
@@ -422,10 +459,14 @@ fn recovery_publication_parent(destination: &Path) -> Result<&Path> {
             destination.display()
         )
     })? {
-        bail!(
-            "recovery publication destination already exists: {}",
-            destination.display()
-        );
+        return Err(crate::ServiceError::destination_exists(
+            destination,
+            format!(
+                "recovery publication destination already exists: {}",
+                destination.display()
+            ),
+        )
+        .into());
     }
     let parent = destination.parent().ok_or_else(|| {
         anyhow!(
@@ -491,16 +532,12 @@ pub fn reconstruct_query(
     let (session_id, provider, edits) = selected_edit_group(db, file, query)?;
     let selected = version.unwrap_or(edits.len());
     if selected == 0 || selected > edits.len() {
-        bail!(
-            "version {selected} is out of range for '{file}'; expected 1..={}",
-            edits.len()
+        return Err(
+            crate::ServiceError::file_version_out_of_range(file, selected, edits.len()).into(),
         );
     }
-    let content = reconstruct(&edits, selected).ok_or_else(|| {
-        anyhow!(
-            "cannot reconstruct version {selected} of '{file}': no complete replay path exists; a full-content base may be missing or an intervening edit may be path-only"
-        )
-    })?;
+    let content = reconstruct_version(&edits, selected)
+        .with_context(|| format!("cannot reconstruct version {selected} of '{file}'"))?;
     Ok(ReconstructedFile {
         session_id,
         provider,
@@ -517,7 +554,7 @@ fn selected_edit_group(
 ) -> Result<(String, Provider, Vec<FileEdit>)> {
     let mut groups = group_by_session(db.file_edits_for_query(file, query)?);
     if groups.is_empty() {
-        bail!("no file edits found for '{file}'");
+        return Err(crate::ServiceError::file_not_found(file).into());
     }
     if groups.len() > 1 {
         bail!(
@@ -613,7 +650,7 @@ pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion
         }
     }
     if versions.is_empty() {
-        bail!("no file edits found for '{file}'");
+        return Err(crate::ServiceError::file_not_found(file).into());
     }
     let page = versions
         .into_iter()
@@ -676,6 +713,7 @@ impl Row for FileCrossRef {
 }
 
 #[derive(Debug, Subcommand)]
+#[non_exhaustive]
 pub enum FilesCmd {
     /// List files edited via tool calls, with edit/session counts.
     Search(FilesSearchArgs),
@@ -772,8 +810,8 @@ pub struct FilesCrossRefArgs {
     /// every edited file.
     #[arg(value_name = "PATTERN")]
     pub pattern_arg: Option<String>,
-    /// Glob over the basename, or the full path when it contains `/`. Omit to cross-reference
-    /// every edited file.
+    /// Deprecated: use the positional PATTERN (aise files cross-ref PATTERN).
+    /// Glob over the basename, or full path when it contains `/`. Omit for every edited file.
     #[arg(long)]
     pub pattern: Option<String>,
     #[command(flatten)]
@@ -813,7 +851,8 @@ pub struct FilesExtractArgs {
     #[arg(long, conflicts_with = "output_dir")]
     pub restore: bool,
     /// For one version, a directory to write into. With --all, the new directory to atomically
-    /// publish; it must not already exist. Omit to write to the current directory.
+    /// publish; it must not already exist. Omit for stdout, or for a `.recovered` sibling with
+    /// --restore.
     #[arg(long, short)]
     pub output_dir: Option<PathBuf>,
     /// Report what would happen without printing content or writing files.
@@ -821,7 +860,16 @@ pub struct FilesExtractArgs {
     pub dry_run: bool,
 }
 
+/// Render a parsed files command to standard output; cost follows the selected service operation.
+#[deprecated(
+    since = "1.1.0",
+    note = "use FileService::search, history, cross_reference, or reconstruct"
+)]
 pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
+    run_command(db, cmd)
+}
+
+pub(crate) fn run_command(db: &Db, cmd: &FilesCmd) -> Result<()> {
     match cmd {
         FilesCmd::Search(args) => {
             let (since, until) = args.dates.resolve_now()?;
@@ -838,6 +886,9 @@ pub fn run(db: &Db, cmd: &FilesCmd) -> Result<()> {
             emit(&db.file_search(&query)?, args.format)
         }
         FilesCmd::CrossRef(args) => {
+            if args.pattern.is_some() {
+                eprintln!("aise: files cross-ref --pattern is deprecated; use aise files cross-ref PATTERN");
+            }
             let (since, until) = args.dates.resolve_now()?;
             let pattern = match (&args.pattern_arg, &args.pattern) {
                 (Some(positional), Some(flag)) if positional != flag => {
@@ -893,7 +944,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
     }
     let mut groups = group_by_session(file_edits_for_scope(db, &args.file, &args.scope)?);
     let (session_id, provider, edits) = match groups.len() {
-        0 => bail!("no file edits found for '{}'", args.file),
+        0 => return Err(crate::ServiceError::file_not_found(&args.file).into()),
         1 => groups.remove(0),
         n => {
             let ids: Vec<String> = groups.into_iter().map(|(sid, _, _)| sid).collect();
@@ -913,12 +964,8 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
             edits.len()
         );
     }
-    let content = reconstruct(&edits, version).ok_or_else(|| {
-        anyhow!(
-            "cannot reconstruct '{}' v{version}: no complete replay path exists (missing full snapshot or intervening path-only edit)",
-            args.file
-        )
-    })?;
+    let content = reconstruct_version(&edits, version)
+        .with_context(|| format!("cannot reconstruct '{}' v{version}", args.file))?;
     let original_path = edits[version - 1].file_path.clone();
     let original = PathBuf::from(&original_path);
     let lines = count_lines(&content);
@@ -1071,6 +1118,7 @@ fn run_extract_all(db: &Db, args: &FilesExtractArgs) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
+#[non_exhaustive]
 pub enum ReconstructedVersionsFormat {
     #[default]
     Framed,
@@ -1118,17 +1166,22 @@ where
     Ok(count)
 }
 
-fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
-    render(rows, format, &mut out)?;
-    out.flush()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constructed_edits_replay_like_parsed_ones() {
+        use crate::models::EditOp;
+        let mut write = FileEdit::new(0, "Write", "src/app.py");
+        write.new_content = Some("print('one')\n".into());
+        let mut edit = FileEdit::new(1, "Edit", "src/app.py");
+        edit.edits.push(EditOp::new("one", "two"));
+        assert_eq!(edit.file_name, "app.py");
+        let edits = [write, edit];
+        assert_eq!(reconstruct(&edits, 1).as_deref(), Some("print('one')\n"));
+        assert_eq!(reconstruct(&edits, 2).as_deref(), Some("print('two')\n"));
+    }
     use clap::Parser;
 
     #[derive(Parser)]
@@ -1299,7 +1352,7 @@ mod tests {
             offset: 0,
             format: OutputFormat::Json,
         };
-        assert!(run(&db, &FilesCmd::CrossRef(args)).is_err());
+        assert!(run_command(&db, &FilesCmd::CrossRef(args)).is_err());
     }
 
     #[test]

@@ -1,8 +1,7 @@
 # Releasing: design decisions behind the machinery
 
-**This is background. To run a release, use [RELEASING.md](../../RELEASING.md), which is
-the whole procedure.** Nothing here is a step, and no release needs this document to
-succeed.
+For the complete release procedure, use [RELEASING.md](../../RELEASING.md).
+This background document contains no release steps and is never required for a release.
 
 Read it in two situations:
 
@@ -13,7 +12,7 @@ Read it in two situations:
 
 It records the supported target matrix, the install pathways that must keep working, the
 trusted-publishing and provenance policy, why publication is ordered the way it is, and
-the tool adoptions and rejections behind all of it.
+the tools used by the release workflows.
 
 ## Version spellings in each ecosystem
 
@@ -155,13 +154,8 @@ python -m pip install ai-session-search
 cargo install ai-session-search --locked
 ```
 
-The Cargo invocation carried `--version '^1.0.0-rc'` while every published version was a release
-candidate, because `cargo install` declines a pre-release unless one is asked for and a bare
-invocation failed against the registry. Publishing 1.0.0 retired the range, and left a second
-reason not to bring it back: a reader cannot tell an explicit candidate range from an
-instruction to install a candidate. CI exercises the `--path` and `--git` shapes, which resolve
-no registry version and cannot catch either form breaking, which leaves the post-publish check
-in [RELEASING.md](../../RELEASING.md) as the gate.
+Test the documented unqualified Cargo install against the newly published stable version. Path
+and Git installs do not exercise registry version selection.
 
 `uv` is the preferred Python project and tool manager. `pip` remains supported
 because it is Python's baseline installer. Cargo path and Git installs are
@@ -215,31 +209,22 @@ and [GitHub artifact attestations](https://docs.github.com/en/actions/how-tos/se
 
 PyPI, crates.io, and GitHub do not provide a cross-registry transaction. The
 workflow orders irreversible operations so a GitHub release is never announced
-before both package registries accept the version. What to do when a stage
-fails is in [RELEASING.md](../../RELEASING.md#post-release-and-recovery), which
-holds the per-failure actions.
+before both package registries accept the version. For per-failure actions, use
+[RELEASING.md](../../RELEASING.md#post-release-and-recovery).
 
 Record a post-mortem with the failing job, artifact hashes, affected targets,
 registry state, user impact, and the exact prevention test. A yanked release is
 still part of history and must remain documented.
 
-## Standard tooling decision record
+## Release tools
 
-Prefer maintained ecosystem tools when they remove project-specific code and
-make failures more actionable. Do not layer two tools over the same responsibility.
-
-| Tool | Decision | Reason and re-evaluation trigger |
-|---|---|---|
-| `uv` | Adopted | One lock, Python provisioning, isolated execution, builds, and uv/pip-compatible install tests. Dependabot has a native `uv` ecosystem: [uv Dependabot guidance](https://docs.astral.sh/uv/guides/integration/dependabot/). |
-| `maturin-action` | Adopted | Direct PyO3/abi3 and manylinux support with one wheel per platform/architecture. |
-| `cibuildwheel` | Not added | It solves broad per-interpreter wheel matrices, but would duplicate the current abi3 maturin matrix. Re-evaluate for free-threaded, PyPy, musllinux, or additional Python ABI wheels: [cibuildwheel](https://cibuildwheel.pypa.io/en/latest/). |
-| `cargo-deny` | Adopted | Central advisory, license, source, and duplicate-dependency policy for the Rust graph. CI runs `check advisories licenses sources bans`, so a RustSec security advisory fails the build and blocks a tag even when no file changed. `deny.toml` records each unmaintained or yanked exception individually with its removal condition, and no exception may cover a security vulnerability: [RustSec advisory database](https://rustsec.org/). |
-| `actionlint` | Adopted | Fast workflow syntax and expression validation. The `workflow-security` CI job installs the pinned version and runs it with no file arguments, so every file under `.github/workflows` is checked and a new workflow cannot escape by not being named. The local gate runs it too but prints SKIPPED when it is absent, which is why the blocking copy lives in CI: [actionlint](https://github.com/rhysd/actionlint). |
-| `zizmor` | Adopted | Adds GitHub Actions security diagnostics beyond syntax checking. Its exact version is pinned and it runs offline so CI does not require a broad GitHub token: [zizmor](https://docs.zizmor.sh/). |
-| `cargo-semver-checks` | Planned after the first public baseline | Detects public Rust API changes. A first major release has no valid registry baseline, so do not manufacture one: [cargo-semver-checks](https://docs.rs/crate/cargo-semver-checks/latest). |
-| `cargo-binstall` | Planned after repository URLs stabilize | Can install the existing native archives without compilation. Add manifest metadata only when release URLs and signature policy are final: [cargo-binstall](https://github.com/cargo-bins/cargo-binstall). |
-| `dist`, formerly `cargo-dist` | Evaluation only | It may replace native archive, installer, checksum, and GitHub release code. Adopt only if an experiment preserves Python artifacts, SBOMs, exact-artifact tests, attestations, and protected registry ordering while deleting custom code: [the dist book](https://axodotdev.github.io/cargo-dist/book/). The former `opensource.axo.dev` documentation host no longer resolves, so weigh maintenance continuity in the decision. |
-| `release-plz` | Not added | Its release PR/tag/crates.io authority overlaps the protected mixed-registry workflow and requires broader repository permissions. Re-evaluate only if release volume makes manual version preparation the dominant failure source: [release-plz](https://release-plz.dev/). |
+| Tool | Responsibility |
+| --- | --- |
+| `uv` | Python provisioning, the locked environment, isolated builds, and install tests. |
+| `maturin-action` | PyO3/abi3 and manylinux wheel builds. |
+| `cargo-deny` | Advisory, license, source, and duplicate-dependency policy; security advisories block release. |
+| `actionlint` | Workflow syntax and expression validation across `.github/workflows`. |
+| `zizmor` | Pinned offline GitHub Actions security checks. |
 
 `.github/dependabot.yml` requests weekly, reviewable updates for the `uv`, Cargo,
 and GitHub Actions ecosystems. It does not auto-merge. Every update must pass the

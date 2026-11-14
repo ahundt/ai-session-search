@@ -1,6 +1,31 @@
 #![recursion_limit = "256"]
+// Unit tests retain coverage of deprecated storage/provider compatibility paths.
+#![cfg_attr(test, allow(deprecated))]
 // SPDX-FileCopyrightText: 2026 Andrew Hundt
 // SPDX-License-Identifier: Apache-2.0
+
+/// Generate chainable `with_<field>` setters for a `#[non_exhaustive]` request struct, which a
+/// downstream crate cannot build with a struct literal. `some` wraps the argument in `Some`;
+/// `value` assigns it as is. Field assignment keeps working beside the setters.
+macro_rules! chainable_setters {
+    ($ty:ident { $($setter:ident($field:ident: $arg:ty) $mode:ident;)* }) => {
+        impl $ty {
+            $(
+                #[doc = concat!(
+                    "Return `self` with [`", stringify!($ty), "::", stringify!($field),
+                    "`] set. The field's documentation states its meaning and default."
+                )]
+                #[must_use]
+                pub fn $setter(mut self, value: $arg) -> Self {
+                    chainable_setters!(@set self.$field, value, $mode);
+                    self
+                }
+            )*
+        }
+    };
+    (@set $place:expr, $value:ident, some) => { $place = Some($value.into()) };
+    (@set $place:expr, $value:ident, value) => { $place = $value.into() };
+}
 
 pub mod analysis_pipeline;
 pub mod analysis_publication;
@@ -14,6 +39,7 @@ pub mod db;
 pub mod diagnostics;
 mod durable_fs;
 pub(crate) mod durable_path;
+mod error;
 mod executable_alias;
 pub mod export;
 pub mod files;
@@ -68,8 +94,13 @@ pub use analysis_pipeline::{
 pub use analysis_publication::{
     AnalysisPublicationFormat, AnalysisPublicationPlan, AnalysisPublicationReceipt,
 };
+/// The error crate every service method returns through `anyhow::Result`, re-exported so a caller
+/// can name `anyhow::Error` and downcast to [`ServiceError`] or [`MessageSearchError`] without
+/// adding a version-matched dependency of its own.
+pub use anyhow;
 pub use cli::run_from as run_cli_from;
-pub use corrections::{CapabilityReceipt, MessageClassificationReport};
+pub use corrections::{CapabilityReceipt, CorrectionCategorySpec, MessageClassificationReport};
+pub use error::ServiceError;
 pub use export::{ExportFormat, ExportPublicationPlan};
 pub use inspect::{EvidenceWindow, InspectionOptions};
 pub use message_search::{
@@ -92,19 +123,61 @@ pub use message_search_batches::{
 pub use models::{AnalysisRequest, AnalysisSessionSelection};
 pub use models::{
     FileQuery, MessageClassificationMatch, MessageFilters, MessageSearchMode, SearchFilters,
-    SessionKind,
+    SessionKind, SessionQuery,
 };
+/// The SQLite binding used by the deprecated [`trigram_index`] helpers, re-exported so callers
+/// can construct their exact `Connection` type without a separate version-matched dependency.
+pub use rusqlite;
 pub use search_scope::{
     AccessRoot, AccessRootOrigin, AccessRootSource, EffectiveAccessScope, TrustedAccessInputs,
 };
 pub use service::SessionSearch;
 pub use service::{AnalysisReceipt, ReceiptedAnalysis};
-pub use skill_catalog::{SkillName, SkillNameSelector, SkillPathSelector, SkillSelector};
+pub use skill_catalog::{SkillName, SkillSelector};
+
+/// Deprecated root name for [`skill_catalog::SkillNameSelector`]. Build selectors with
+/// [`SkillSelector::name`]; the struct itself has no public constructor.
+#[deprecated(since = "1.1.0", note = "use SkillSelector::name")]
+pub type SkillNameSelector = skill_catalog::SkillNameSelector;
+/// Deprecated root name for [`skill_catalog::SkillPathSelector`]. Build selectors with
+/// [`SkillSelector::path`]; the struct itself has no public constructor.
+#[deprecated(since = "1.1.0", note = "use SkillSelector::path")]
+pub type SkillPathSelector = skill_catalog::SkillPathSelector;
+
+// Types a caller passes to or receives from the documented service calls, so a program never
+// imports from the storage, indexer, or configuration modules to name them.
+pub use analytics::{
+    RepeatExample, RepeatGroup, RepeatsQuery, RepeatsReport, RoleStat, TermFrequency,
+    VocabularyQuery,
+};
+/// The date and time crate used by every timestamp field (`since`, `until`, `ts`,
+/// `updated_at`), re-exported so a caller builds `chrono::DateTime<chrono::Utc>` values with the
+/// exact version this crate compiles against instead of adding its own `chrono` dependency.
+pub use chrono;
+pub use config::{Config, ConfigOverrides, IndexRefresh, ResolvedConfig, ScoringConfig};
+pub use db::MessageOrder;
+pub use export::{ExportDocument, ExportPublicationReceipt};
+pub use files::{ReconstructedFile, ReconstructedFileVersions, RecoveryPublicationReceipt};
+pub use indexer::{AutoReindexOutcome, ExplicitReindexOutcome};
+pub use inspect::{InspectionFollowUp, SessionInspection};
+pub use message_search::MessageSearchPlan;
+pub use models::{
+    AnalysisCursor, AnalysisDocumentPage, DiagnosticStatus, FileCrossRef, FileEditSummary,
+    FileVersion, IndexStatus, MessageHit, MessageKind, PlanningCount, Provider, Role,
+    SearchExplain, SearchHit, SessionMeta, SessionRecord,
+};
+pub use service::{
+    AnalysisService, CatalogService, CompactOutcome, ExportService, FileService, IndexService,
+    MaintenanceService, MessageService, ResumeCommand, SourceService, SqlService, TranscriptEdge,
+    TranscriptWindow,
+};
 pub use skill_run::{
     CapabilityExecutionSource, MessageClassificationDefinition, MessageClassificationQuery,
     MessageClassificationResult, ResolvedSkillReceipt, SelectedSkillLocation, SkillCapabilityInput,
     SkillCapabilityOutput, SkillRunQuery, SkillRunReport,
 };
+pub use source::ProviderSourceStatus;
+pub use sql_query::{QueryResult, SqlQuery, SqlSchemaQuery};
 
 /// Execute the canonical CLI after recording that this process entered through the Python binding.
 ///
@@ -267,3 +340,10 @@ mod storage_pressure_tests {
         }
     }
 }
+
+// Compile the Rust examples in the crate README, which ships in the package, so an API change that
+// breaks one fails `cargo test --doc`. The repository README and library guide are compiled by the
+// unpublished `tests/rust-api-consumer` crate, because their paths do not exist in the package.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct CrateReadmeExamples;

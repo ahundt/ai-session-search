@@ -1,7 +1,11 @@
+from datetime import date, datetime
+from os import PathLike
 from pathlib import Path
-from typing import Literal, NotRequired, Self, TypedDict, final
+from typing import Any, Literal, NotRequired, Self, TypedDict, final
 
 from .types import FieldView, MatchView, MessageClassificationDefinition
+
+_PathInput = str | PathLike[str]
 
 _ProviderId = Literal["claude", "claude-desktop", "codex", "cursor", "antigravity", "pi", "prime-agent", "aistudio", "gemini-cli"]
 _MessageRole = Literal["user", "assistant", "tool", "slash", "compaction"]
@@ -14,92 +18,98 @@ _DetailLevel = Literal["compact", "full"]
 _ReceiptLevel = Literal["none", "summary", "full"]
 _MessageSearchInclude = Literal["normalized_session_metadata", "parsed_references", "raw_provider_metadata", "runtime_diagnostics"]
 
-__all__ = [  # noqa: RUF022 - match the extension module's canonical export order
-    "serve_mcp",
-    "_run_cli_command",
-    "SessionSearch",
-    "SessionRecord",
+__all__ = [
+    "AlreadyExistsError",
+    "AmbiguousPrefixError",
+    "AnalysisArtifact",
     "AnalysisCursor",
     "AnalysisDocument",
     "AnalysisDocumentPage",
-    "ClassificationRule",
-    "RelationshipRule",
-    "PhraseVocabulary",
     "AnalysisPolicy",
-    "AnalysisRequest",
-    "AnalysisReceipt",
-    "ReceiptedAnalysis",
-    "ClassificationMatch",
-    "RelationshipHint",
-    "AnalyzedSession",
-    "PhraseFrequency",
-    "AnalysisResult",
-    "AnalysisArtifact",
-    "PublishedAnalysisArtifact",
-    "AnalysisPublicationReceipt",
     "AnalysisPublicationPlan",
-    "SessionGraphNode",
-    "SessionGraphEdge",
-    "SessionGraphGroup",
-    "SessionGraph",
-    "SearchHit",
-    "MessagePreview",
-    "ToolActivity",
-    "MessageRef",
-    "RefEvidence",
+    "AnalysisPublicationReceipt",
+    "AnalysisQuery",
+    "AnalysisReceipt",
+    "AnalysisRequest",
+    "AnalysisResult",
+    "AnalyzedSession",
+    "CapabilityExecutionSource",
+    "CapabilityReceipt",
     "ChangedFileEvidence",
-    "SessionTimeProfile",
-    "SessionInspection",
-    "FileEditSummary",
-    "FileVersion",
-    "FileCrossRef",
-    "ReconstructedFile",
-    "ReconstructedFileVersions",
-    "PublishedFileVersion",
-    "RecoveryPublicationReceipt",
+    "ClassificationMatch",
+    "ClassificationRule",
+    "CompactOutcome",
+    "DateRange",
+    "DiagnosticStatus",
     "ExportDocument",
     "ExportPublicationReceipt",
-    "ProviderSourceStatus",
-    "MessageClassificationMatch",
-    "CapabilityReceipt",
-    "MessageClassificationReport",
-    "SelectedSkillLocation",
-    "CapabilityExecutionSource",
-    "ResolvedSkillReceipt",
-    "MessageClassificationResult",
-    "SkillRunReport",
-    "PlanningCount",
-    "RoleStat",
-    "SessionQuery",
-    "QueryExclusions",
-    "DateRange",
-    "ResolvedDateRange",
-    "QueryScope",
-    "MessageExclusions",
-    "MessageScope",
-    "MessageSearchRequest",
-    "AnalysisQuery",
-    "SkillSelector",
-    "MessageClassificationQuery",
-    "SkillRunQuery",
+    "FileCrossRef",
+    "FileEditSummary",
     "FileQuery",
-    "MessageHit",
-    "MessageSearchResponse",
-    "MessageSearchRuntimeDiagnostics",
-    "MessageSearchBatch",
-    "MessageSearchCompletion",
-    "MessageSearchBatches",
-    "RefreshOutcome",
-    "ReindexOutcome",
-    "ProviderParserHealth",
-    "ParserHealth",
-    "IndexStatus",
+    "FileVersion",
+    "IndexNotRefreshedError",
     "IndexReadinessStatus",
     "IndexRefreshStatus",
-    "ProviderHealth",
-    "DiagnosticStatus",
+    "IndexStatus",
+    "InvalidArgumentError",
+    "MessageClassificationMatch",
+    "MessageClassificationQuery",
+    "MessageClassificationReport",
+    "MessageClassificationResult",
+    "MessageExclusions",
+    "MessageHit",
+    "MessagePreview",
+    "MessageRef",
+    "MessageScope",
+    "MessageSearchBatch",
+    "MessageSearchBatches",
+    "MessageSearchCompletion",
+    "MessageSearchRequest",
+    "MessageSearchResponse",
+    "MessageSearchRuntimeDiagnostics",
+    "NotFoundError",
+    "ParserHealth",
+    "PhraseFrequency",
+    "PhraseVocabulary",
+    "PlanningCount",
     "ProviderDiscoveryWarning",
-    "CompactOutcome",
+    "ProviderHealth",
+    "ProviderParserHealth",
+    "ProviderSourceStatus",
+    "PublishedAnalysisArtifact",
+    "PublishedFileVersion",
+    "QueryExclusions",
+    "QueryScope",
+    "ReceiptedAnalysis",
+    "ReconstructedFile",
+    "ReconstructedFileVersions",
+    "RecoveryPublicationReceipt",
+    "RefEvidence",
+    "RefreshOutcome",
+    "ReindexOutcome",
+    "RelationshipHint",
+    "RelationshipRule",
+    "ResolvedDateRange",
+    "ResolvedSkillReceipt",
+    "RoleStat",
+    "SearchHit",
+    "SelectedSkillLocation",
+    "SessionGraph",
+    "SessionGraphEdge",
+    "SessionGraphGroup",
+    "SessionGraphNode",
+    "SessionInspection",
+    "SessionQuery",
+    "SessionRecord",
+    "SessionSearch",
+    "SessionTimeProfile",
+    "SkillRunQuery",
+    "SkillRunReport",
+    "SkillSelector",
+    "ToolActivity",
+    "UnrecognizedRecordType",
+    "_run_cli_command",
+    "serve_mcp",
 ]
 
 def serve_mcp() -> None: ...
@@ -109,9 +119,16 @@ def _run_cli_command(args: list[str]) -> int: ...
 class SessionRecord:
     """Canonical indexed session metadata and source provenance."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     id: str
     provider: str
     provider_session_id: str
+    discovery_source: str
+    parse_version: str
     title: str | None
     summary: str | None
     cwd: str | None
@@ -130,11 +147,21 @@ class SessionRecord:
 class AnalysisCursor:
     """Opaque keyset cursor for the next non-overlapping analysis document page."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     ...
 
 @final
 class AnalysisDocument:
     """One indexed session and its normalized user-message text for analysis."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     session: SessionRecord
     user_text: str
@@ -146,12 +173,22 @@ class AnalysisDocument:
 class AnalysisDocumentPage:
     """Bounded analysis document page with an optional continuation cursor."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     documents: list[AnalysisDocument]
     next_cursor: AnalysisCursor | None
 
 @final
 class ClassificationRule:
     """One weighted regex classification applied to a selected session text field."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     dimension: str
     label: str
@@ -173,6 +210,11 @@ class ClassificationRule:
 class RelationshipRule:
     """One regex rule identifying a branch, copy, or version relationship."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     id: str
     kind: Literal["branch", "copy", "version"]
     pattern: str
@@ -187,6 +229,11 @@ class RelationshipRule:
 @final
 class PhraseVocabulary:
     """Bounded recurring-phrase extraction policy for analyzed user messages."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     widths: list[int]
     max_unique_phrases: int
@@ -209,6 +256,11 @@ class PhraseVocabulary:
 @final
 class AnalysisPolicy:
     """Validated classification, relationship, and optional phrase-analysis policy."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
     def __new__(
         cls,
         *,
@@ -222,6 +274,11 @@ class AnalysisPolicy:
 class ClassificationMatch:
     """One classification label and weight matched in a session."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     dimension: str
     label: str
     target: Literal["title", "summary", "first_user_text", "user_text", "any"]
@@ -230,6 +287,11 @@ class ClassificationMatch:
 @final
 class RelationshipHint:
     """Resolved, ambiguous, or unresolved relationship inferred for a session."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     rule_id: str
     kind: Literal["branch", "copy", "version"]
@@ -241,6 +303,11 @@ class RelationshipHint:
 @final
 class AnalyzedSession:
     """One session with its analysis score, classifications, and relationship hints."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     session: SessionRecord
     classifications: list[ClassificationMatch]
@@ -254,6 +321,11 @@ class AnalyzedSession:
 class PhraseFrequency:
     """Recurring normalized phrase with document and occurrence counts."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     phrase: str
     words: int
     documents: int
@@ -263,6 +335,11 @@ class PhraseFrequency:
 class AnalysisResult:
     """Typed classifications, relationships, vocabulary, and graph for analyzed sessions."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     sessions: dict[str, AnalyzedSession]
     vocabulary: list[PhraseFrequency]
     graph: SessionGraph
@@ -270,6 +347,11 @@ class AnalysisResult:
 @final
 class AnalysisReceipt:
     """Same-snapshot selection, count, and digest facts for one analysis result."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     selection_kind: Literal["all_eligible", "first_canonical_sessions"]
     max_selected_sessions: int | None
@@ -288,12 +370,22 @@ class AnalysisReceipt:
 class ReceiptedAnalysis:
     """Analysis data paired with the exact same-snapshot selection and digest receipt."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     result: AnalysisResult
     receipt: AnalysisReceipt
 
 @final
 class AnalysisArtifact:
     """Rendered analysis artifact held in memory before publication."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     name: str
     content: str
@@ -304,6 +396,11 @@ class AnalysisArtifact:
 class PublishedAnalysisArtifact:
     """Name, byte count, and SHA-256 digest of one published artifact."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     name: str
     bytes: int
     sha256: str
@@ -311,6 +408,11 @@ class PublishedAnalysisArtifact:
 @final
 class AnalysisPublicationReceipt:
     """Receipt for an atomically published immutable analysis bundle."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     destination: Path
     artifacts: list[PublishedAnalysisArtifact]
@@ -322,17 +424,29 @@ class AnalysisPublicationPlan:
     Every bundle includes format-independent ``analysis-receipt.v1.json`` and
     ``manifest.v1.json`` control artifacts.
     """
-    def __new__(cls, destination: str | Path, formats: list[Literal["json", "markdown"]] | None = None) -> Self: ...
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    def __new__(cls, destination: _PathInput, formats: list[Literal["json", "markdown"]] | None = None) -> Self: ...
     @property
     def destination(self) -> Path: ...
     @property
     def formats(self) -> list[Literal["json", "markdown"]]: ...
-    def render(self, analysis: ReceiptedAnalysis) -> list[AnalysisArtifact]: ...
-    def publish(self, analysis: ReceiptedAnalysis) -> AnalysisPublicationReceipt: ...
+    def render(self, analysis: ReceiptedAnalysis) -> list[AnalysisArtifact]:
+        """Render the requested analysis artifacts in memory without writing files. Use publish to create the immutable bundle."""
+    def publish(self, analysis: ReceiptedAnalysis) -> AnalysisPublicationReceipt:
+        """Publish one immutable analysis bundle and return its receipt. The destination must not exist; an existing bundle is preserved and raises AlreadyExistsError."""
 
 @final
 class SessionGraphNode:
     """Graph node containing one analyzed session identity and classifications."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     session_id: str
     provider: str
@@ -348,6 +462,11 @@ class SessionGraphNode:
 class SessionGraphEdge:
     """One resolved directed relationship between two session IDs."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     source_session_id: str
     target_session_id: str
     kind: Literal["branch", "copy", "version"]
@@ -357,6 +476,11 @@ class SessionGraphEdge:
 class SessionGraphGroup:
     """Session IDs sharing one classification dimension and label."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     dimension: Literal["working_directory", "repository"]
     key: str
     session_ids: list[str]
@@ -365,6 +489,11 @@ class SessionGraphGroup:
 class SessionGraph:
     """Deterministic nodes, resolved edges, and classification groups for analyzed sessions."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     nodes: dict[str, SessionGraphNode]
     edges: list[SessionGraphEdge]
     groups: list[SessionGraphGroup]
@@ -372,6 +501,11 @@ class SessionGraph:
 @final
 class SearchHit:
     """Ranked session search result with score and matched-field preview."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     session: SessionRecord
     score: int
@@ -382,6 +516,11 @@ class SearchHit:
 class MessagePreview:
     """Bounded message preview with its exact expansion command."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     seq: int
     timestamp: str | None
     chars: int
@@ -391,6 +530,11 @@ class MessagePreview:
 @final
 class ToolActivity:
     """Bounded tool-call or tool-result evidence with an exact expansion command."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     seq: int
     timestamp: str | None
@@ -403,6 +547,11 @@ class ToolActivity:
 @final
 class MessageRef:
     """One normalized URL-like reference extracted from a message."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     kind: str
     value: str
@@ -418,6 +567,11 @@ class MessageRef:
 class RefEvidence:
     """Message preview and normalized references used as session evidence."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     seq: int
     role: str
     tool_name: str | None
@@ -430,6 +584,11 @@ class RefEvidence:
 class ChangedFileEvidence:
     """Aggregate edit count and expansion command for one changed file."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     file_path: str
     provider: str
     edits: int
@@ -438,6 +597,11 @@ class ChangedFileEvidence:
 @final
 class SessionTimeProfile:
     """Observed timestamp span, gaps, and tool/message counts for one session."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     messages: int
     timestamped_messages: int
@@ -452,6 +616,11 @@ class SessionTimeProfile:
 @final
 class SessionInspection:
     """Compact purpose, activity, reference, file, and optional timing evidence for one session."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     session: SessionRecord
     user_intent: list[MessagePreview]
@@ -474,6 +643,11 @@ class SessionInspection:
 class FileEditSummary:
     """Aggregate edit and session counts for one indexed file path."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     file_path: str
     file_name: str
     edits: int
@@ -483,6 +657,11 @@ class FileEditSummary:
 @final
 class FileVersion:
     """One causally ordered historical file version reconstructed from an edit."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     session_id: str
     provider: str
@@ -496,6 +675,11 @@ class FileVersion:
 class FileCrossRef:
     """One session-to-file edit relationship from indexed tool activity."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     file_path: str
     session_id: str
     provider: str
@@ -505,12 +689,22 @@ class FileCrossRef:
 class ReconstructedFile:
     """One reconstructed historical file with provenance and complete content."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     session_id: str
     provider: str
     version: int
     file_path: str
     content: str
-    def restore(self, *, output_dir: str | Path | None = None) -> Path: ...
+    def restore(self, *, output_dir: _PathInput | None = None) -> Path:
+        """Write a collision-safe .recovered copy and return its path; preserve existing files.
+
+        Omit output_dir to write beside the recorded original; otherwise use only its basename
+        inside output_dir. Existing copies add _2, _3, and so on.
+        """
 
 @final
 class ReconstructedFileVersions:
@@ -522,6 +716,11 @@ class ReconstructedFileVersions:
 class PublishedFileVersion:
     """One published file version, with its source session, version, path, and content digest."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     source_session_id: str
     version: int
     path: Path
@@ -531,6 +730,11 @@ class PublishedFileVersion:
 class RecoveryPublicationReceipt:
     """Receipt for an atomically published directory of recovered file versions."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     destination: Path
     files: list[PublishedFileVersion]
 
@@ -538,12 +742,22 @@ class RecoveryPublicationReceipt:
 class ExportDocument:
     """Complete rendered session export in the requested format."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     format: Literal["markdown", "text", "json"]
     content: str
 
 @final
 class ExportPublicationReceipt:
     """Receipt for an atomically published session export bundle."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     destination: Path
     format: Literal["markdown", "text", "json"]
@@ -554,6 +768,11 @@ class ExportPublicationReceipt:
 class ProviderSourceStatus:
     """Enabled roots and discovered session-file count for one provider."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     provider: str
     enabled: bool
     roots: list[str]
@@ -563,6 +782,11 @@ class ProviderSourceStatus:
 @final
 class MessageClassificationMatch:
     """One message classified by a named capability rule category."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     session_id: str
     message_seq: int
@@ -584,6 +808,11 @@ class MessageClassificationMatch:
 class CapabilityReceipt:
     """Identity of one message-classification capability evaluated for a report."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     name: str
     version: str
     sha256: str
@@ -598,6 +827,11 @@ class CapabilityReceipt:
 class MessageClassificationReport:
     """Classified messages and the capabilities evaluated to produce them."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     policies: list[CapabilityReceipt]
     """Every evaluated capability, in evaluation order, including any that matched nothing.
 
@@ -606,10 +840,25 @@ class MessageClassificationReport:
     """
     matches: list[MessageClassificationMatch]
     """Matches newest first, after ``offset`` is skipped and ``limit`` taken."""
+    unattributed_input_count: int
+    """Messages in scope typed while the agent was working whose transcript does not record
+    who sent them (Claude Code versions that wrote no sender for queued input).
+
+    Counted whether or not they were read. A queued message also delivered as its own prompt
+    is read once, as that prompt, and not counted here.
+    """
+    unattributed_input_included: bool
+    """Whether :attr:`matches` read those messages. ``False`` unless the query set
+    ``include_unattributed_input=True``."""
 
 @final
 class SelectedSkillLocation:
     """Where the selected skill package was resolved."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     kind: Literal["embedded", "path"]
     canonical_skill_md: Path | None
@@ -618,12 +867,22 @@ class SelectedSkillLocation:
 class CapabilityExecutionSource:
     """Where the deterministic capability bytes executed by a skill came from."""
 
-    kind: Literal["embedded", "path"]
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
+    kind: Literal["embedded", "path", "inline"]
     canonical_capability_toml: Path | None
 
 @final
 class ResolvedSkillReceipt:
     """Provenance for the package and capability selected by one skill run."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     name: str
     package_version: str | None
@@ -633,6 +892,11 @@ class ResolvedSkillReceipt:
 @final
 class MessageClassificationResult:
     """Typed message-classification output nested inside a skill-run report."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     receipt: CapabilityReceipt
     """Primary selected skill's policy receipt.
@@ -646,6 +910,11 @@ class MessageClassificationResult:
 class SkillRunReport:
     """Result and provenance from one deterministic skill invocation."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     requested_selector: SkillSelector
     resolved_skill: ResolvedSkillReceipt
     output: MessageClassificationResult
@@ -653,6 +922,11 @@ class SkillRunReport:
 @final
 class PlanningCount:
     """Slash-command usage count with distinct session and project counts."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     command: str
     count: int
@@ -663,12 +937,22 @@ class PlanningCount:
 class RoleStat:
     """Exact indexed message count for one normalized role."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     role: str
     count: int
 
 @final
 class DateRange:
     """Date bounds parsed by the same Rust grammar used by the CLI and MCP server."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     since: str | None
     until: str | None
@@ -677,9 +961,9 @@ class DateRange:
     def __new__(
         cls,
         *,
-        since: str | None = None,
-        until: str | None = None,
-        when: str | None = None,
+        since: str | date | datetime | None = None,
+        until: str | date | datetime | None = None,
+        when: str | date | datetime | None = None,
     ) -> Self: ...
     def resolve_bounds(
         self,
@@ -690,6 +974,11 @@ class DateRange:
 @final
 class ResolvedDateRange:
     """Concrete inclusive UTC bounds produced by resolving a DateRange."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     since: str | None
     until: str | None
@@ -702,19 +991,29 @@ class QueryExclusions:
     ``session_ids`` exclude exact canonical session IDs.
     """
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     path_prefixes: list[str]
     session_ids: list[str]
 
     def __new__(
         cls,
         *,
-        path_prefixes: list[str] | None = None,
+        path_prefixes: list[_PathInput] | None = None,
         session_ids: list[str] | None = None,
     ) -> Self: ...
 
 @final
 class QueryScope:
     """Shared provider, session, path, exclusion, and date scope for typed queries."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     provider: _ProviderId | None
     session_id: str | None
@@ -727,14 +1026,14 @@ class QueryScope:
         *,
         provider: _ProviderId | None = None,
         session_id: str | None = None,
-        path_prefix: str | None = None,
+        path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
         dates: DateRange | None = None,
     ) -> Self: ...
 
 @final
 class SessionQuery:
-    """Session list/search filters; limit=0 explicitly selects every match.
+    """Session list/search filters; None uses search.default_limit, 0 selects every match.
 
     ``dates`` intersects an inclusive query period with each known indexed session span from
     ``created_at`` through ``updated_at``. The span can contain gaps and does not assert continuous
@@ -743,6 +1042,11 @@ class SessionQuery:
     repository from the working directory.
     """
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     provider: _ProviderId | None
     path_prefix: str | None
     exclusions: QueryExclusions
@@ -750,19 +1054,22 @@ class SessionQuery:
     parent_session_id: str | None
     current_repo: str | None
     dates: DateRange
-    limit: int
+    limit: int | None
+    offset: int
 
     def __new__(
         cls,
         *,
         provider: _ProviderId | None = None,
-        path_prefix: str | None = None,
+        path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
         session_kinds: list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
-        current_repo: str | None = None,
+        current_repo: _PathInput | None = None,
         dates: DateRange | None = None,
-        limit: int = 50,
+        limit: int | None = None,
+        offset: int = 0,
+        scope: QueryScope | None = None,
     ) -> Self: ...
 
 @final
@@ -773,6 +1080,11 @@ class AnalysisRequest:
     the first N eligible sessions in canonical session-ID order; it is not a recency sample,
     representative sample, or message limit.
     """
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     provider: _ProviderId | None
     path_prefix: str | None
@@ -786,7 +1098,7 @@ class AnalysisRequest:
         cls,
         *,
         provider: _ProviderId | None = None,
-        path_prefix: str | None = None,
+        path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
         session_kinds: list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
@@ -798,6 +1110,11 @@ class AnalysisRequest:
 class MessageExclusions:
     """Workspace, transcript, and session exclusions for message search."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     workspace_path_prefixes: list[str]
     transcript_path_prefixes: list[str]
     session_ids: list[str]
@@ -805,14 +1122,19 @@ class MessageExclusions:
     def __new__(
         cls,
         *,
-        workspace_path_prefixes: list[str] | None = None,
-        transcript_path_prefixes: list[str] | None = None,
+        workspace_path_prefixes: list[_PathInput] | None = None,
+        transcript_path_prefixes: list[_PathInput] | None = None,
         session_ids: list[str] | None = None,
     ) -> Self: ...
 
 @final
 class MessageScope:
     """Message-only scope with distinct workspace and transcript path domains."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     providers: list[_ProviderId] | None
     session_id: str | None
@@ -826,8 +1148,8 @@ class MessageScope:
         *,
         providers: list[_ProviderId] | None = None,
         session_id: str | None = None,
-        workspace_path_prefix: str | None = None,
-        transcript_path_prefix: str | None = None,
+        workspace_path_prefix: _PathInput | None = None,
+        transcript_path_prefix: _PathInput | None = None,
         exclusions: MessageExclusions | None = None,
         dates: DateRange | None = None,
     ) -> Self: ...
@@ -835,6 +1157,12 @@ class MessageScope:
 @final
 class MessageSearchRequest:
     """Canonical message predicates, match window, presentation, extent, purpose, and receipt.
+
+    ``role="user"`` searches recorded user input across source roles, including queued
+    submissions and linked answers. Known parent-agent prompts sent to spawned sessions are excluded
+    from this selector. Omit ``role`` to search complete content. Sender/delivery uncertainty
+    remains in provenance; views/context may include generated text. Coordinates refer to the
+    selected field.
 
     The query searches only ``field``: ``content``, ``tool_name``, or ``tool_argument``. Tool
     arguments use an RFC 6901 ``argument_path``. ``tool_name_contains`` is an additional
@@ -845,6 +1173,12 @@ class MessageSearchRequest:
     request explicitly and conflicts with ``limit``. MCP separately uses a bounded default.
     """
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
+    query_mode: _MessageQueryMode | None
     scope: MessageScope
     role: _MessageRole | None
     kind: _MessageKind | None
@@ -874,7 +1208,7 @@ class MessageSearchRequest:
     def __new__(
         cls,
         *,
-        scope: MessageScope | None = None,
+        scope: MessageScope | QueryScope | None = None,
         role: _MessageRole | None = None,
         kind: _MessageKind | None = None,
         kinds: list[_MessageKind] | None = None,
@@ -899,11 +1233,21 @@ class MessageSearchRequest:
         purpose: str | None = None,
         purpose_version: int | None = None,
         receipt_level: _ReceiptLevel | None = None,
+        query_mode: _MessageQueryMode | None = None,
+        provider: _ProviderId | None = None,
+        session_id: str | None = None,
+        path_prefix: _PathInput | None = None,
+        dates: DateRange | None = None,
     ) -> Self: ...
 
 @final
 class AnalysisQuery:
-    """Session scope and maximum document count for aggregate analysis operations."""
+    """Scope and maximum returned aggregate rows for planning and role_statistics; 50 by default, 0 for all."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     scope: QueryScope
     limit: int
@@ -919,6 +1263,11 @@ class AnalysisQuery:
 class SkillSelector:
     """Exactly one deterministic skill selected by standard name or package path."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     name: str | None
     path: Path | None
 
@@ -926,12 +1275,17 @@ class SkillSelector:
         cls,
         *,
         name: str | None = None,
-        path: str | Path | None = None,
+        path: _PathInput | None = None,
     ) -> Self: ...
 
 @final
 class MessageClassificationQuery:
     """Typed arguments for the message-classification skill capability."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     scope: QueryScope
     session_kinds: list[str] | None
@@ -952,6 +1306,13 @@ class MessageClassificationQuery:
     """
     offset: int
     """Matches to skip before ``limit`` applies, newest first. ``0`` starts at the newest."""
+    include_unattributed_input: bool
+    """Also classify messages typed while the agent was working whose transcript does not
+    record who sent them.
+
+    ``False`` by default because a program may have sent them; the report counts them in
+    :attr:`MessageClassificationReport.unattributed_input_count` either way.
+    """
 
     def __new__(
         cls,
@@ -961,11 +1322,17 @@ class MessageClassificationQuery:
         additional_skills: list[SkillSelector] | None = None,
         limit: int | None = None,
         offset: int = 0,
+        include_unattributed_input: bool = False,
     ) -> Self: ...
 
 @final
 class SkillRunQuery:
     """One typed deterministic skill invocation."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     skill: SkillSelector
     definition: MessageClassificationDefinition | None
@@ -983,6 +1350,11 @@ class SkillRunQuery:
 class FileQuery:
     """File filters with deterministic ``limit``/``offset`` pages; zero limit means unlimited."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     scope: QueryScope
     min_edits: int | None
     max_edits: int | None
@@ -995,14 +1367,28 @@ class FileQuery:
         scope: QueryScope | None = None,
         min_edits: int | None = None,
         max_edits: int | None = None,
-        limit: int = 50,
+        limit: int = 0,
         offset: int = 0,
+        provider: _ProviderId | None = None,
+        session_id: str | None = None,
+        path_prefix: _PathInput | None = None,
+        exclusions: QueryExclusions | None = None,
+        dates: DateRange | None = None,
     ) -> Self: ...
 
 @final
 class MessageHit:
-    """One indexed message with canonical session, role, kind, tool, and content fields."""
+    """One indexed message with canonical session, role, kind, tool, and content fields.
 
+    Provenance origin and delivery are None when source evidence is absent.
+    """
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
+    provenance: dict[str, str | None] | None
     session_id: str
     provider: str
     seq: int
@@ -1039,6 +1425,7 @@ class _MessageSearchMessageRef(TypedDict):
     message_seq: int
 
 class _MessageSearchMessageMetadata(TypedDict):
+    provenance: NotRequired[dict[str, str | None]]
     provider: _ProviderId
     role: str
     kind: _MessageKind
@@ -1086,6 +1473,7 @@ class _MessageSearchResultIncluded(TypedDict):
     parsed_references: list[dict[str, object]]
 
 class _MessageSearchResult(TypedDict):
+    timestamp: str | None
     message_ref: _MessageSearchMessageRef
     message_metadata: _MessageSearchMessageMetadata
     match: NotRequired[_MessageSearchMatch]
@@ -1118,6 +1506,11 @@ class _MessageSearchReceipt(TypedDict, total=False):
 class MessageSearchResponse:
     """Canonical version-1 response; ``results`` is the ordinary materialized Python list."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     response_schema_version: int
     coordinate_unit: Literal["unicode_scalar"]
     effective_request: _MessageSearchEffectiveRequest
@@ -1130,6 +1523,11 @@ class MessageSearchResponse:
 class MessageSearchRuntimeDiagnostics:
     """Package, database, response-contract, surface, and configuration identity for one request."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     package_version: str
     database_schema_version: int
     response_schema_version: int
@@ -1140,12 +1538,22 @@ class MessageSearchRuntimeDiagnostics:
 class MessageSearchBatch:
     """One owned canonical result batch with newly encountered included data."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     results: list[_MessageSearchResult]
     included: _MessageSearchIncluded
 
 @final
 class MessageSearchCompletion:
     """Canonical terminal page and optional receipt after natural batch-stream exhaustion."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     page: _MessageSearchPage
     receipt: _MessageSearchReceipt | None
@@ -1170,6 +1578,11 @@ class MessageSearchBatches:
 class RefreshOutcome:
     """Outcome of an opportunistic incremental index refresh."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     status: str
     files_seen: int | None
     sessions_updated: int | None
@@ -1179,6 +1592,11 @@ class RefreshOutcome:
 class ReindexOutcome:
     """Session-file and changed-session counts from an explicit reindex."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     files_seen: int
     sessions_updated: int
     discovery_warnings: list[ProviderDiscoveryWarning]
@@ -1186,6 +1604,11 @@ class ReindexOutcome:
 @final
 class ProviderParserHealth:
     """Expected parser version and current/stale counts for one provider."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     provider: str
     expected_parse_version: str
@@ -1197,6 +1620,11 @@ class ProviderParserHealth:
 class ParserHealth:
     """Aggregate schema and parser-version freshness across indexed sessions."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     schema_version: int
     expected_schema_version: int
     schema_current: bool
@@ -1205,10 +1633,33 @@ class ParserHealth:
     stale_sessions: int
     parse_warnings: int
     providers: list[ProviderParserHealth]
+    unrecognized_record_types: list[UnrecognizedRecordType]
+
+@final
+class UnrecognizedRecordType:
+    """One record type a provider's parser did not recognize, across the sessions containing it.
+
+    ``records`` were not indexed; ``sessions`` counts indexed sessions holding at least one.
+    """
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
+    provider: str
+    record_type: str
+    records: int
+    sessions: int
 
 @final
 class IndexStatus:
     """Parser/schema freshness and applicable repair commands for the index."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     parser_health: ParserHealth
     repairable_stale_sessions: int
@@ -1220,6 +1671,11 @@ class IndexStatus:
 class IndexReadinessStatus:
     """Snapshot usability and automatic refresh state reported independently."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     snapshot_availability: Literal["unavailable", "usable"]
     last_successful_refresh_at: str | None
     refresh: IndexRefreshStatus
@@ -1227,6 +1683,11 @@ class IndexReadinessStatus:
 @final
 class IndexRefreshStatus:
     """Bounded durable progress and recovery for automatic index refresh."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     state: Literal["not_started", "indexing", "fresh", "postponed", "failed_with_recovery"]
     started_by: Literal["integration_install", "command_line", "mcp"] | None
@@ -1242,6 +1703,11 @@ class IndexRefreshStatus:
 @final
 class ProviderHealth:
     """Discovery, parser, index, CLI, and resume status for one provider."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     provider: str
     enabled: bool
@@ -1260,6 +1726,11 @@ class ProviderHealth:
 class DiagnosticStatus:
     """Database, parser, automatic-update, and provider health report."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     db_path: str
     index_status: IndexStatus
     discovery_warnings: list[ProviderDiscoveryWarning]
@@ -1268,6 +1739,11 @@ class DiagnosticStatus:
 @final
 class ProviderDiscoveryWarning:
     """One non-fatal provider traversal or metadata-sidecar discovery failure."""
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
     provider: str
     path: str
@@ -1281,6 +1757,11 @@ class ProviderDiscoveryWarning:
 class CompactOutcome:
     """Database byte counts before and after successful compaction."""
 
+    def to_dict(self) -> dict[str, Any]:
+        """Return a detached JSON-ready dictionary using structured-output field names."""
+    def __repr__(self) -> str: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
     before_bytes: int
     after_bytes: int
     reclaimed_bytes: int
@@ -1289,16 +1770,38 @@ class CompactOutcome:
 class SessionSearch:
     """Rust-backed search, recovery, export, and analysis service.
 
-    Methods accepting ``session_id`` accept a canonical provider-qualified ID or a unique ID
-    prefix. Ambiguous prefixes fail with the matching canonical IDs instead of selecting one.
+    Opening loads configuration and the database, not transcripts. Call refresh() or
+    prepare_for_read() before a first read; index_refresh="existing-only" requires an existing
+    index. Session IDs accept canonical IDs or unique prefixes. Use close() or a with block
+    to release the connection; independent iterators own their own resources.
     """
+    def close(self) -> None:
+        """Release the connection and owned workers; repeated calls are safe."""
+    def __enter__(self) -> Self: ...
+    def __exit__(self, exception_type: object, exception: object, traceback: object) -> bool: ...
+    def prepare_for_read(self) -> RefreshOutcome | None:
+        """Apply the configured refresh policy before reading; existing-only never refreshes."""
+    def classify_messages(self, *, skill: str = "corrections", request: MessageClassificationQuery | None = None, include_unattributed_input: bool | None = None, definition: MessageClassificationDefinition | None = None) -> list[MessageClassificationMatch]:
+        """Return classification match rows directly; run_skill also returns policy receipts."""
+    def vocabulary(self, *, prefix: str | None = None, trigram: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
+        """Report index-wide terms and counts; refused under allowed-roots."""
+    def repeats(self, query: str | None = None, *, scope: QueryScope | None = None, role: str | None = None, query_mode: str = "literal", limit: int = 0, include_unattributed_input: bool = False, max_groups: int | None = None, max_examples_per_group: int | None = None, min_matches: int | None = None, phrase_min_words: int | None = None, phrase_max_words: int | None = None, context: int = 0) -> dict[str, Any]:
+        """Mine recurring phrases with examples and unattributed-input counts."""
+    def query_sql(self, sql: str, *, limit: int | None = None, offset: int = 0, timeout_ms: int | None = None, max_cell_chars: int = 0) -> dict[str, Any]:
+        """Run one read-only SQL statement with configured access restrictions and bounds."""
+    def resume_command(self, session_id: str) -> dict[str, Any]:
+        """Return native resume argv and cwd, or the reason the session cannot be resumed."""
+    def transcript(self, session_id: str, *, lines: int = 0) -> dict[str, Any]:
+        """Read first N (positive), last N (negative), or all (0) transcript lines."""
+
     def __new__(
         cls,
-        db_path: str | Path | None = None,
+        db_path: _PathInput | None = None,
         *,
-        config_path: str | Path | None = None,
-        cache_dir: str | Path | None = None,
+        config_path: _PathInput | None = None,
+        cache_dir: _PathInput | None = None,
         threads: int | None = None,
+        index_refresh: Literal["auto", "before-query", "existing-only"] | None = None,
     ) -> Self: ...
     @property
     def db_path(self) -> Path: ...
@@ -1314,12 +1817,15 @@ class SessionSearch:
         query: str = "",
         request: MessageSearchRequest | None = None,
         *,
-        query_mode: _MessageQueryMode = "literal",
+        query_mode: _MessageQueryMode | None = None,
     ) -> MessageSearchResponse:
         """Search through the shared planner and return results, context, paging, and receipts.
 
+        Fuzzy mode matches query letters in order, allowing gaps; extra query letters can prevent
+        a match. It scores the eligible corpus before retaining the requested finite page.
+
         ``literal`` is the default case-insensitive substring match. ``regex`` uses Rust regex
-        syntax. ``fuzzy`` scores every structurally eligible row with Nucleo sequence matching,
+        syntax. ``fuzzy`` scores every structurally eligible row by matching letters in order,
         then applies a deterministic finite offset and limit. It requires at least three query
         characters and does not support all-results output. With no explicit, purpose, or
         operation limit, Python returns every literal, regex, or no-text match;
@@ -1331,7 +1837,7 @@ class SessionSearch:
         query: str = "",
         request: MessageSearchRequest | None = None,
         *,
-        query_mode: _MessageQueryMode = "literal",
+        query_mode: _MessageQueryMode | None = None,
         batch_rows: int = 256,
     ) -> MessageSearchBatches:
         """Open advanced exhaustive batches.
@@ -1366,6 +1872,7 @@ class SessionSearch:
         seq_from: int | None = None,
         seq_to: int | None = None,
         lines_per_message: int = 0,
+        kinds: list[_MessageKind] | None = None,
     ) -> list[MessageHit]:
         """Read one session's messages, selecting the oldest or newest ``limit`` by ``order``
         (``"oldest"``/``"newest"``), always returned chronologically. To page a long session,
@@ -1398,58 +1905,69 @@ class SessionSearch:
     ) -> list[SearchHit]:
         """Rank matching sessions after metadata and session-span filtering.
 
+        Empty queries are deprecated; use list_sessions(request) instead.
+
         A finite limit bounds retained top-K results, not eligible transcript bytes scored;
         ``request.limit=0`` can retain and return every match.
         """
         ...
     def search_files(
         self,
-        pattern: str | None = None,
+        pattern: _PathInput | None = None,
         request: FileQuery | None = None,
-    ) -> list[FileEditSummary]: ...
+    ) -> list[FileEditSummary]:
+        """List edited files matching a filename or glob pattern, with edit/session counts and last edit time. Omit the pattern for every file. FileQuery supplies scope and paging; its default limit=0 returns all matches."""
     def file_history(
         self,
-        file: str,
+        file: _PathInput,
         request: FileQuery | None = None,
-    ) -> list[FileVersion]: ...
+    ) -> list[FileVersion]:
+        """Return recorded versions of a file in stable session/version order. FileQuery narrows the source sessions and dates; limit=0 returns all versions, and offset skips versions."""
     def cross_reference_files(
         self,
-        pattern: str | None = None,
+        pattern: _PathInput | None = None,
         request: FileQuery | None = None,
-    ) -> list[FileCrossRef]: ...
+    ) -> list[FileCrossRef]:
+        """Count edits per file and session for a filename or glob pattern. FileQuery applies scope and paging; an omitted pattern selects every file."""
     def reconstruct_file(
         self,
-        file: str,
+        file: _PathInput,
         *,
         version: int | None = None,
         request: FileQuery | None = None,
-    ) -> ReconstructedFile: ...
+    ) -> ReconstructedFile:
+        """Replay recorded writes and edits and return complete file content in memory. version is 1-based; None selects the latest version. If the file matches several sessions, pass FileQuery(session_id=...) to select one. This call writes no file; use the result restore(output_dir=...) to publish a copy."""
     def reconstruct_file_versions(
         self,
-        file: str,
+        file: _PathInput,
         *,
         request: FileQuery | None = None,
-    ) -> ReconstructedFileVersions: ...
+    ) -> ReconstructedFileVersions:
+        """Iterate reconstructable historical versions of one file without writing them. If several sessions match, select one with FileQuery(session_id=...). The iterator owns its selected rows and does not hold the parent service lock while consumed."""
     def publish_file_versions(
         self,
-        file: str,
-        destination: str | Path,
+        file: _PathInput,
+        destination: _PathInput,
         *,
         request: FileQuery | None = None,
-    ) -> RecoveryPublicationReceipt: ...
+    ) -> RecoveryPublicationReceipt:
+        """Write reconstructable file versions to a new immutable destination directory and return paths and hashes. The destination must not exist; an existing directory is preserved and raises AlreadyExistsError. FileQuery selects the source session and history."""
     def export_session(
         self,
         session_id: str,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
-    ) -> ExportDocument: ...
+    ) -> ExportDocument:
+        """Render one complete session as markdown, json, or text and return an ExportDocument in memory. session_id accepts a canonical ID or unique prefix. This call writes no file."""
     def export_sessions(
         self,
-        destination: str | Path,
+        destination: _PathInput,
         request: SessionQuery | None = None,
         *,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
-    ) -> ExportPublicationReceipt: ...
-    def source_inventory(self) -> list[ProviderSourceStatus]: ...
+    ) -> ExportPublicationReceipt:
+        """Publish selected sessions to a new destination as json or text and return a receipt. The destination must not exist. SessionQuery supplies filters; its historical export default is 50 sessions, and an explicit limit=0 selects all."""
+    def source_inventory(self) -> list[ProviderSourceStatus]:
+        """Return configured provider roots, discovered file counts and non-fatal traversal warnings. Disabled providers are reported without scanning their transcript roots."""
     def analysis_documents(
         self,
         request: SessionQuery | None = None,
@@ -1477,7 +1995,7 @@ class SessionSearch:
     ) -> SkillRunReport:
         """Execute one deterministic skill capability.
 
-        Selected ``capability.toml`` documents share a 1 MiB aggregate parsing
+        Selected ``aise-capability.toml`` documents share a 1 MiB aggregate parsing
         safety ceiling. Exceeding it raises an actionable error with byte counts;
         rules and results are never truncated to fit.
         """
@@ -1486,13 +2004,38 @@ class SessionSearch:
         self,
         request: AnalysisQuery | None = None,
         command_patterns: list[str] | None = None,
-    ) -> list[PlanningCount]: ...
+    ) -> list[PlanningCount]:
+        """Count recorded slash commands with occurrence, distinct-session and distinct-project totals. AnalysisQuery supplies scope and a returned-row limit (50 by default, 0 for all). command_patterns adds Rust regex filters to the configured planning_commands patterns."""
     def role_statistics(
         self,
         request: AnalysisQuery | None = None,
-    ) -> list[RoleStat]: ...
-    def refresh(self) -> RefreshOutcome: ...
-    def index_status(self) -> IndexStatus: ...
-    def reindex(self, *, full: bool = False) -> ReindexOutcome: ...
-    def diagnostics(self) -> DiagnosticStatus: ...
-    def compact(self) -> CompactOutcome: ...
+    ) -> list[RoleStat]:
+        """Count indexed messages by their normalized storage role, in role order. AnalysisQuery supplies scope and a returned-row limit (50 by default, 0 for all)."""
+    def refresh(self) -> RefreshOutcome:
+        """Attempt an opportunistic incremental index refresh and return status, counts and a skip reason. A recent refresh or a busy writer can skip work. Use reindex() for a synchronous pass that waits for the writer lock."""
+    def index_status(self) -> IndexStatus:
+        """Return snapshot readiness, parser/schema freshness, indexed/current/stale session counts and applicable repair commands. doctor() also reports provider discovery and resume-tool availability."""
+    def reindex(self, *, full: bool = False) -> ReindexOutcome:
+        """Reindex enabled sources synchronously and return file/session counts and discovery warnings. full=False reads new or changed transcripts; full=True reparses every discoverable transcript. This call waits for the writer lock."""
+    def doctor(self) -> DiagnosticStatus:
+        """Return full index health, provider discovery and resume-tool availability, as aise doctor and MCP get_index_status do."""
+        ...
+    def diagnostics(self) -> DiagnosticStatus:
+        """Deprecated: use doctor() for full index health and provider discovery."""
+    def compact(self) -> CompactOutcome:
+        """Merge full-text segments, VACUUM the index and truncate its WAL. Return exact before_bytes, after_bytes and reclaimed_bytes. Requires a writable compatible index."""
+
+class NotFoundError(RuntimeError):
+    """The requested session, file, or existing index was not found."""
+
+class AmbiguousPrefixError(RuntimeError):
+    """The session prefix identifies more than one session."""
+
+class AlreadyExistsError(RuntimeError):
+    """The publication destination already exists and was preserved."""
+
+class InvalidArgumentError(RuntimeError, ValueError, OverflowError):
+    """An argument or combination of arguments is invalid."""
+
+class IndexNotRefreshedError(RuntimeError):
+    """Refresh or prepare_for_read before querying this index."""

@@ -8,7 +8,7 @@
 //! [`Row`] (for `table`/`csv`/`plain`) can be rendered uniformly via [`render`],
 //! so each command only describes its columns once.
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::marker::PhantomData;
 
 use anyhow::Result;
@@ -17,6 +17,7 @@ use serde::Serialize;
 /// Output formats (table, json, jsonl, csv, plain).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 #[clap(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum OutputFormat {
     #[default]
     Table,
@@ -53,6 +54,14 @@ impl std::str::FromStr for OutputFormat {
             )),
         }
     }
+}
+
+pub(crate) fn emit<T: Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    render(rows, format, &mut out)?;
+    out.flush()?;
+    Ok(())
 }
 
 /// A row that can present itself as fixed columns for tabular formats.

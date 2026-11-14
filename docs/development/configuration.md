@@ -6,8 +6,8 @@ provider shipping no default root, so it returns nothing until `[providers.aistu
 one. Otherwise create a file only to change a source path or a runtime setting.
 
 When one exists, `aise` resolves it once and the CLI, MCP server, and Python service all read
-that answer. Query filters and migration destinations go on the command that uses them. Result
-limits and line windows do have persistent defaults, under
+the resolved configuration. Query filters and migration destinations go on the command that uses
+them. Result limits and line windows do have persistent defaults, under
 [search extent](#search-extent-and-elapsed-time-defaults) and
 [output windowing](#output-windowing-defaults).
 
@@ -29,7 +29,10 @@ here can select an existing database without moving it.
    migration destinations on the command that uses them.
 4. Run `aise config show`, `aise config origins`, and `aise doctor`. The first
    command prints merged values, the second identifies each winning source,
-   and the third reports invalid or inaccessible runtime paths.
+   and the third reports invalid or inaccessible runtime paths. `aise doctor`
+   also names the config file in use and lists any other config file at a
+   discovery location; at most one file is read, so a setting in a listed file
+   has no effect.
 
 For automation, set a canonical `AI_SESSION_SEARCH_*` variable or pass the corresponding CLI/API
 argument instead of generating machine-specific TOML. A missing file is only an error when you
@@ -68,10 +71,16 @@ unknown server fields and the user's `env` block, including in the Codex plugin 
 If an existing state argument or environment value conflicts with the intended selection,
 preflight refuses before writing and names the file, key, both values, and how to resolve it.
 
-Five root CLI options feed the resolver: `--config`, `--database`, `--cache-dir`, `--threads`,
-and `--index-refresh`. Their canonical environment equivalents are `AI_SESSION_SEARCH_CONFIG`,
-`AI_SESSION_SEARCH_DATABASE`, `AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and
-`AI_SESSION_SEARCH_INDEX_REFRESH`.
+`aise` has seven root CLI options. Five of them select configuration values: `--config`,
+`--database`, `--cache-dir`, `--threads`, and `--index-refresh`. Their canonical environment
+equivalents are `AI_SESSION_SEARCH_CONFIG`, `AI_SESSION_SEARCH_DATABASE`,
+`AI_SESSION_SEARCH_CACHE_DIR`, `AI_SESSION_SEARCH_THREADS`, and `AI_SESSION_SEARCH_INDEX_REFRESH`.
+The other two are `--harness-home` (`AI_SESSION_SEARCH_HARNESS_HOME`, described above) and
+`--skip-release-notification` (`AI_SESSION_SEARCH_SKIP_RELEASE_NOTIFICATION`, see
+[stable-release notifications](#stable-release-notifications)). Two settings have an environment
+variable and no CLI option, because an MCP registration sets them in its `env` block:
+`AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS` (`[mcp].max_tool_result_chars`) and
+`AI_SESSION_SEARCH_CLIENT_LIMIT_<ROW>` (see [client limit budgets](#client-limit-budgets)).
 
 `aise config init` records the selected database and cache as absolute paths, including CLI and
 environment overrides, even when the destination config does not exist yet. Other settings stay
@@ -92,7 +101,7 @@ Run `aise config check` to validate settings without opening the index or changi
 nonzero for invalid settings or unknown keys, even though ordinary commands can use a file containing
 unknown ordinary keys. Correct a typo using the suggestion, or upgrade aise to apply a future setting.
 
-Access-restricting tables stay strict: `[providers]` and `[providers.<name>]` select source disables
+Access-restricting tables stay strict: `[providers]` and `[providers.<name>]` select provider disables
 and paths; `[search.scope]` authorizes reads; `[search.budgets]` limits exposed page/context content.
 Versioned `[search.purposes.<name>]` bundles and their `.preferences` tables also stay strict to
 preserve future restrictions; their current settings remain overridable preferences.
@@ -101,7 +110,7 @@ Future access restrictions must live in these strict namespaces so older binarie
 
 ## Config compatibility when upgrading
 
-From 1.0.1 onward, newer ordinary config keys do not prevent an older binary from loading the file.
+From 1.1.0 onward, newer ordinary config keys do not prevent an older binary from loading the file.
 Unknown access restrictions still require a binary that understands them. The released 1.0.0 binary
 remains strict, including ordinary tables. Automatic startup and upgrade refresh never add active
 keys to an existing config. `aise config init` keeps new defaults commented and refuses to replace
@@ -110,7 +119,7 @@ Manually activating a new key can therefore make that file incompatible with 1.0
 
 ## Resolver and write contract
 
-These hold for every surface, including settings added after this document.
+These rules apply to every surface, including future settings.
 
 All entry points use one typed Rust resolver with the precedence above. An omitted value falls
 through to the next source, while an empty path or an invalid number is an error, so neither
@@ -121,7 +130,7 @@ them. Config writes are atomic, preserve unrelated keys, use scoped locks, and c
 files on error. `aise config origins` names the winning source for each setting and never prints
 a secret value. [Atomic configuration initialization](#atomic-configuration-initialization)
 and [MCP client configuration transactions](#mcp-client-configuration-transactions) record how the
-current writers meet that.
+current writers meet these guarantees.
 
 ## Installed integrations after an upgrade
 
@@ -171,7 +180,7 @@ unchanged; explicit package commands report failures.
 
 ## Search access scope
 
-`[search.scope] mode = "all"` is the default: every configured source is searchable. To confine
+`[search.scope] mode = "all"` is the default: every enabled provider is searchable. To confine
 every session, message, analysis, file-history, export, resume, and exact-ID read to authorized
 workspaces, use `mode = "allowed-roots"` with one or both trusted standalone sources:
 
@@ -225,19 +234,13 @@ causes the next `auto` read to retry in the background.
 
 ## Rust, Python, and MCP
 
-No struct read from `config.toml` can be built with a struct literal: `Config` and the settings
-tables under it are `#[non_exhaustive]`, and `[ui.keys]` wraps a private map. A downstream crate
-therefore starts from `Default::default()` and assigns the fields it wants, so a new setting does
-not break code that compiles today; `[ui]` alone gained ten fields in the cycle before 1.0.0.
-`ConfigOverrides`
-is deliberately not among them, because it carries CLI and API overrides rather than file
-contents and a literal is how an embedder builds one. `tests/rust-api-consumer` compiles the
-supported pattern from outside the crate, where a struct expression fails with
-`error[E0639]: cannot create non-exhaustive struct using struct expression`.
+Public configuration structs, including `ConfigOverrides`, are `#[non_exhaustive]`. Start with
+`Default::default()`, use `with_*` setters, or assign public fields. Enum matches need a wildcard
+arm. The downstream consumer tests compile these patterns from outside the crate.
 
-Rust embedders should construct `ConfigOverrides` and call `Config::resolve`, then retain the
-returned `ResolvedConfig` for diagnostics and provenance. `SessionSearch::open` and
-`OfficialMcpServer::new` accept the resolved typed configuration without rereading process state.
+Rust embedders pass `ConfigOverrides` to `Config::resolve` and retain `ResolvedConfig.origins`
+for diagnostics. Pass its `config` field to `SessionSearch::open` or `OfficialMcpServer::new`;
+those constructors use the supplied `Config` without rereading process state.
 
 Python's `SessionSearch` accepts `db_path`, `config_path`, `cache_dir`, and `threads`; explicit
 arguments use the same precedence as CLI flags. Each Rust or Python `SessionSearch` owns a
@@ -388,18 +391,7 @@ converted into a page. Session-level `aise list`/`aise search` limits and presen
 separate controls and do not redefine message-hit membership.
 
 <!-- aise-message-search-contract:start -->
-### Generated message-search policy resolution
-
-Resolution precedence, highest first: `explicit` → `detail_preset` → `purpose` → `operation_config` → `surface_config` → `typed_default` → `derived`.
-
-| Caller surface | Omitted non-fuzzy result extent | Context | Lines per message | Field view | Match view | Includes / receipt |
-| --- | --- | --- | ---: | --- | --- | --- |
-| rust | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
-| cli | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
-| mcp | page of 15; offset 0 | 0 before / 0 after | 0 | `{"kind":"max_chars","max_chars":220}` | `{"kind":"max_chars","max_chars":220}` | `["normalized_session_metadata"]` / `none` |
-| python | all results; offset 0 | 0 before / 0 after | 0 | `{"kind":"no_char_limit"}` | `{"kind":"max_chars","max_chars":220}` | `[]` / `none` |
-
-The table uses an empty configuration and is a shipped-default reference, not a claim about a user's effective settings. Run `aise messages search --describe --describe-surface SURFACE` to inspect active values without opening or refreshing the index.
+See the [generated message-search reference](../README.md#generated-message-search-caller-contract) for shipped defaults and resolution precedence. Run `aise messages search --describe --describe-surface SURFACE` to inspect active values without opening or refreshing the index.
 <!-- aise-message-search-contract:end -->
 
 Ordinary indexed search has no elapsed-time deadline. Native CLI/Rust raw SQL uses
@@ -528,7 +520,7 @@ A config file is per machine and these numbers are per client, so each MCP regis
 its own in its `env` block, which every client config format carries:
 
 ```jsonc
-"mcpServers": { "aise": {
+"mcpServers": { "ai-session-search": {
   "command": "aise", "args": ["mcp", "serve"],
   "env": { "AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES": "6000" } } }
 ```
@@ -553,67 +545,38 @@ client's source at a pinned version, recorded with their provenance in
 operator running a client that has since moved sets the new number here rather than waiting for
 a release built against it.
 
-Your own settings change the schema size, because generated descriptions interpolate resolved
-values. `search_messages` measures 4,741 bytes as Codex counts it, the figure pinned in
-`EMITTED_ARTIFACT_CEILINGS`, leaving 259 bytes under Codex's 5,000. A first configured
-`[search.purposes.<name>]` bundle spends about 100 of those, and each later one roughly twice its
-name's length, because the name lands both in an enum Codex keeps and in the prose listing
-configured bundles. Past that limit Codex deletes every parameter description and emits no
-marker, so the server measures its own catalogue when it builds it and writes any breach to
-stderr.
+Your settings change schema size because descriptions contain resolved values. With shipped
+defaults, `search_messages` measures 4,732 bytes after Codex normalization, leaving 268 bytes under
+its 5,000-byte limit. The server keeps `purpose` and `purpose_version` advertised when no bundles
+are configured, with guidance to omit them. Configured names add enum and description bytes; run
+`aise mcp schema-budget` after changing them. The server also checks its catalogue at startup and
+reports a breach on stderr. Over the Codex limit, the client removes every parameter description.
 
 ## Atomic configuration initialization
 
-`aise config init` uses the shared `durable_fs` staged-file transaction. Create-new mode refuses any
-existing entry. `--force` replaces only a regular file, preserves its permissions, rejects symbolic
-links and other file types, syncs file and parent directory data, and removes unpublished staging
-files on drop. A parent-directory sync error reports that publication already occurred so callers do
-not retry blindly.
+`aise config init` writes through a staged file. Create-new mode refuses any existing entry.
+`--force` replaces only a regular file, preserves its permissions, rejects symbolic links and other
+file types, syncs file and parent directory data, and removes unpublished staging files. A
+parent-directory sync error reports that publication already occurred so callers do not retry
+blindly.
 
 ## MCP client configuration transactions
 
-Cross-directory filesystem updates are not atomic. The MCP installer therefore uses an advisory
-lock and a versioned receipt containing exact UTF-8 before/after images and lossless platform path
-units. New receipt files use mode `0600` on Unix and the destination directory's inherited ACL on
-Windows. It validates every input before the receipt, revalidates each preimage before
-publication, atomically publishes each file, and syncs its parent. A handled failure rolls back
-unchanged outputs in reverse order. A crash, external edit, unreadable receipt, or durability-
-confirmation failure preserves evidence and prints a shell-independent executable/argv description
-plus the exact receipt path; recovery never overwrites
-content that differs from both recorded images. Successful publication or complete rollback removes
-the receipt. The adjacent advisory lock file remains because deleting a lock pathname can split
-concurrent waiters across different inodes.
+Install, uninstall, and recovery change files in several directories, and cross-directory
+filesystem updates are not atomic. The installer therefore records a versioned receipt holding
+each file's exact before and after contents. New receipt files use mode `0600` on Unix and the
+destination directory's inherited ACL on Windows. A handled failure rolls back unchanged outputs
+in reverse order. A crash, external edit, unreadable receipt, or durability-confirmation failure
+preserves evidence and prints a shell-independent executable/argv description plus the exact
+receipt path; recovery never overwrites content that differs from both recorded images.
+Successful publication or complete rollback removes the receipt. The adjacent advisory lock file
+remains because deleting a lock pathname can split concurrent waiters across different inodes.
 
-Status holds an `fd_lock` shared guard across the receipt check and every selected config/instruction
-read; install, uninstall, and recovery take the corresponding exclusive guard. Codex TOML edits use
-`toml_edit::DocumentMut` to remove/replace the semantic `mcp_servers.ai-session-search` item, including quoted and
-nested table forms, while preserving unrelated comments and ordering. Generated TOML is reparsed
-before the durable transaction can publish it. Executable paths that cannot be represented as UTF-8
-are rejected before any JSON or TOML mutation instead of being lossily rewritten.
+`aise integrations status` reads under the same lock that install, uninstall, and recovery hold,
+so it never reports a half-applied install. Codex TOML edits replace the
+`mcp_servers.ai-session-search` item, including quoted and nested table forms, while preserving
+unrelated comments and ordering. Executable paths that cannot be represented as UTF-8 are
+rejected before any JSON or TOML mutation instead of being lossily rewritten.
 
-The implementation retains the shared `durable_fs` primitive rather than adding a second atomic-file
-crate. Rust's [`OsStrExt`](https://doc.rust-lang.org/std/os/unix/ffi/trait.OsStrExt.html) defines the
-lossless Unix byte representation used in receipts, and the formatting-preserving TOML API and
-keyed removal contract come from
-[`toml_edit::DocumentMut`](https://docs.rs/toml_edit/latest/toml_edit/struct.DocumentMut.html).
-Receipts record explicit platform-native units, because the alternatives either change encoding
-between releases or reject non-Unicode paths.
-
-## Maintainer checks
-
-Nothing below this point is needed to configure `aise`; it is what a change to configuration
-itself has to satisfy.
-
-Configuration changes require focused tests for all four precedence levels, invalid canonical
-environment values, canonical/legacy conflicts, omitted versus explicit-empty provider paths,
-unknown TOML keys, CLI/MCP/Python parity, and effective-config provenance. Tests must inject
-`ConfigEnvironment`; do not mutate process environment in parallel Rust tests.
-
-The embedded `config.example.toml` is documentation, not a second runtime-default source. Typed
-Rust defaults remain canonical, and the example contract test must compare each uncommented
-tunable with those typed defaults. An embedded default config is acceptable only if it replaces
-rather than duplicates those defaults, and only with a test proving the serialized example,
-parser, CLI help, MCP schemas, and API defaults cannot drift.
-
-Runtime-derived paths and CPU or thread counts stay typed functions, never literal paths or
-machine-specific values embedded in the binary.
+How these guarantees are implemented, and the checks a configuration change must pass, are in
+[installer and configuration maintainer contracts](maintainer-contracts-for-install-and-config.md).

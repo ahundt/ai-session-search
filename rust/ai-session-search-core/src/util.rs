@@ -17,9 +17,9 @@ use serde_json::{json, Value};
 
 use crate::config::Config;
 use crate::models::{
-    FileEdit, Message, MessageAuthorship, MessageContentPart, MessageCorrelationAuthority,
-    MessageCorrelationIdentity, MessageKind, MessageProvenance, MessageRecordRelation,
-    ParsedSession, Provider, Role, SessionRecord,
+    FileEdit, InputDeliveryState, Message, MessageAuthorship, MessageContentPart,
+    MessageCorrelationAuthority, MessageCorrelationIdentity, MessageInputOrigin, MessageKind,
+    MessageProvenance, MessageRecordRelation, ParsedSession, Provider, Role, SessionRecord,
 };
 
 /// Source bytes a cooperative scan may cross before it re-checks cancellation.
@@ -46,13 +46,23 @@ pub(crate) const CANCELLATION_CHECK_BYTES: usize = 64 * 1024;
 pub fn lines_replacing_invalid_utf8<R: io::BufRead>(
     reader: R,
 ) -> impl Iterator<Item = io::Result<String>> {
-    reader.split(b'\n').map(|line| {
+    lines_with_byte_offsets(reader).map(|line| line.map(|(_, text)| text))
+}
+
+/// Original byte positions survive CRLF stripping and lossy UTF-8 decoding.
+pub(crate) fn lines_with_byte_offsets<R: io::BufRead>(
+    reader: R,
+) -> impl Iterator<Item = io::Result<(usize, String)>> {
+    let mut offset = 0;
+    reader.split(b'\n').map(move |line| {
         line.map(|mut bytes| {
+            let start = offset;
+            offset += bytes.len() + 1;
             // `BufRead::split` keeps the `\r` of a `\r\n` ending; drop it to match `lines`.
             if bytes.last() == Some(&b'\r') {
                 bytes.pop();
             }
-            String::from_utf8_lossy(&bytes).into_owned()
+            (start, String::from_utf8_lossy(&bytes).into_owned())
         })
     })
 }
@@ -130,6 +140,10 @@ pub(crate) fn normalize_absolute_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+pub(crate) fn canonical_source_path(path: &Path) -> String {
+    normalize_path(&std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
 pub fn normalize_path(path: &Path) -> String {
@@ -580,14 +594,8 @@ impl UnicodeLowerNeedle {
     /// That is the whole correctness argument, and it does not depend on where in an expansion an
     /// ASCII character can appear.
     ///
-    /// Measured on 618,778,766 bytes of candidate message content from an index of 5.7 million
-    /// messages, best of seven interleaved runs of
-    /// `aise messages search "permission denied" --limit 50 --index-refresh existing-only
-    /// --format json`: 1.11 s against 3.48 s for the unskipped scan, a 3.1x reduction, with the
-    /// `regex` crate over the same candidates at 0.54 s as the floor. Replacing the scalar
-    /// predicate with `memchr2` plus an `is_ascii` confirmation measured 1.06 s, 6.9% better, and
-    /// was not taken: the gain is in the skip rather than the vectorization, and it would add a
-    /// direct dependency for that 6.9%.
+    /// Skip ASCII bytes that cannot start the folded needle before attempting scalar matching.
+    /// Keep the scalar predicate here to avoid a separate dependency for the same skip rule.
     ///
     /// The agreement a skip could break is checked. `CASELESS_CASES` drives the matcher, `find_in`
     /// and the SQL scalar from one table, including a failed candidate before a match that starts
@@ -1083,6 +1091,40 @@ pub fn extract_text(value: &Value) -> String {
     parts.join("\n")
 }
 
+/// Borrow ordered scalar regions in O(B + P) time and O(P) range memory, for B content bytes
+/// and P selected parts. Invalid or overlapping ranges fail rather than clamping to source text.
+pub(crate) fn content_part_regions<'a>(
+    content: &'a str,
+    parts: impl IntoIterator<Item = &'a MessageContentPart>,
+) -> Result<Vec<(&'a MessageContentPart, &'a str)>> {
+    let mut regions = Vec::new();
+    let mut chars = content.char_indices();
+    let (mut scalar, mut byte) = (0, 0);
+    for part in parts {
+        anyhow::ensure!(
+            part.start_char >= scalar && part.end_char > part.start_char,
+            "content parts must have ordered nonempty scalar ranges"
+        );
+        while scalar < part.start_char {
+            let (index, character) = chars
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("content part starts beyond message content"))?;
+            byte = index + character.len_utf8();
+            scalar += 1;
+        }
+        let start_byte = byte;
+        while scalar < part.end_char {
+            let (index, character) = chars
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("content part ends beyond message content"))?;
+            byte = index + character.len_utf8();
+            scalar += 1;
+        }
+        regions.push((part, &content[start_byte..byte]));
+    }
+    Ok(regions)
+}
+
 pub fn substantive_text(value: &str) -> bool {
     let normalized = value.trim();
     if normalized.is_empty() {
@@ -1268,6 +1310,12 @@ fn is_slash_command(text: &str) -> bool {
 /// rows, assigning sequence numbers and normalizing roles via [`classify_role`].
 /// Use [`to_messages_with_tools`] when a provider can name the tool behind a
 /// [`Role::Tool`] message.
+/// Compatibility tuple normalization; scans and retains O(message bytes).
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage constructors; IndexService::reindex_report owns provider normalization"
+)]
+#[allow(deprecated)] // The tuple compatibility adapter delegates to the retained normalizer.
 pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Message> {
     let raw: Vec<LegacyRawMessage> = raw
         .into_iter()
@@ -1279,10 +1327,15 @@ pub fn to_messages(raw: Vec<(String, String, Option<DateTime<Utc>>)>) -> Vec<Mes
 /// Compact adapter input for provider formats that expose only role, text, timestamp, and an
 /// optional tool name. [`to_messages_with_tools`] converts this shape immediately to
 /// [`RawMessage`], so role/kind normalization remains provider-neutral and has one implementation.
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage constructors; IndexService::reindex_report owns provider normalization"
+)]
 pub type LegacyRawMessage = (String, String, Option<DateTime<Utc>>, Option<String>);
 
 /// Provider evidence before role normalization and sequence assignment.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RawMessage {
     role: String,
     content: String,
@@ -1291,6 +1344,7 @@ pub struct RawMessage {
     kind: Option<MessageKind>,
     tool_call_id: Option<String>,
     provenance: MessageProvenance,
+    authorship_override: Option<MessageAuthorship>,
     native_event_identity: Option<(MessageCorrelationAuthority, String)>,
 }
 
@@ -1316,6 +1370,7 @@ impl RawMessage {
             kind: None,
             tool_call_id: None,
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
@@ -1334,6 +1389,7 @@ impl RawMessage {
             kind: Some(MessageKind::HarnessNotice),
             tool_call_id: None,
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
@@ -1352,6 +1408,7 @@ impl RawMessage {
             kind: Some(MessageKind::ToolCall),
             tool_call_id: tool_call_id.map(str::to_string),
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
@@ -1379,13 +1436,32 @@ impl RawMessage {
             kind: Some(MessageKind::ToolResult),
             tool_call_id: tool_call_id.map(str::to_string),
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
 
-    /// Attach provider-verified semantic authorship before role normalization.
+    /// Attach provider-verified semantic authorship, including an explicit `Unknown` override.
     pub fn with_authorship(mut self, authorship: MessageAuthorship) -> Self {
-        self.provenance.authorship = authorship;
+        self.authorship_override = Some(authorship);
+        self
+    }
+
+    /// Retain a single native tool relation on a mixed conversation record without changing its kind.
+    pub(crate) fn with_tool_call_id(mut self, id: Option<String>) -> Self {
+        self.tool_call_id = id;
+        self
+    }
+
+    /// Attach provider evidence about an input queue lifecycle without implying model receipt.
+    pub fn with_input_delivery_state(mut self, state: InputDeliveryState) -> Self {
+        self.provenance.input_delivery_state = Some(state);
+        self
+    }
+
+    /// Attach the typed source of an input record (conversation, queue, or interactive answer).
+    pub fn with_input_origin(mut self, origin: MessageInputOrigin) -> Self {
+        self.provenance.input_origin = Some(origin);
         self
     }
 
@@ -1421,9 +1497,29 @@ impl RawMessage {
     /// [`MessageProvenance::validate`] enforces ordered, gap-free Unicode-scalar ranges before
     /// persistence. The builder sets the required aggregate `Mixed` authorship automatically.
     pub fn with_content_parts(mut self, parts: Vec<MessageContentPart>) -> Self {
-        self.provenance.authorship = MessageAuthorship::Mixed;
+        self.authorship_override = Some(MessageAuthorship::Mixed);
         self.provenance.content_parts = parts;
         self
+    }
+
+    /// Re-tag a row as a harness notice once later provider evidence shows the harness wrote it.
+    /// Content, time and identity stay; authorship becomes `Harness` and input provenance clears,
+    /// as for a row built by [`RawMessage::harness_notice`].
+    pub(crate) fn retag_harness_notice(&mut self) {
+        self.kind = Some(MessageKind::HarnessNotice);
+        self.authorship_override = None;
+        self.provenance.input_origin = None;
+        self.provenance.input_delivery_state = None;
+    }
+
+    /// Replace the authorship with provider evidence found after the row was built.
+    pub(crate) fn set_authorship(&mut self, authorship: MessageAuthorship) {
+        self.authorship_override = Some(authorship);
+    }
+
+    /// Use `ts` only when the row has no time of its own.
+    pub(crate) fn fill_missing_ts(&mut self, ts: Option<DateTime<Utc>>) {
+        self.ts = self.ts.or(ts);
     }
 
     pub fn role(&self) -> &str {
@@ -1435,6 +1531,7 @@ impl RawMessage {
     }
 }
 
+#[allow(deprecated)] // Preserve conversion from the deprecated tuple alias.
 impl From<LegacyRawMessage> for RawMessage {
     fn from((role, content, ts, tool_name): LegacyRawMessage) -> Self {
         Self {
@@ -1445,6 +1542,7 @@ impl From<LegacyRawMessage> for RawMessage {
             kind: None,
             tool_call_id: None,
             provenance: source_event_provenance(),
+            authorship_override: None,
             native_event_identity: None,
         }
     }
@@ -1486,23 +1584,43 @@ fn infer_message_authorship(role: Role, kind: MessageKind) -> MessageAuthorship 
 
 /// Provider evidence that can resolve an otherwise-unknown user-role conversation row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserRoleAuthorshipEvidence {
+#[non_exhaustive]
+pub enum UserRoleEvidence {
     HumanInputEvent,
     AgentDelegationEvent,
     Unverified,
 }
 
-/// Resolve user-role authorship from provider-supplied structured event evidence.
-///
-/// This is linear in message count and changes only still-unknown conversation/slash rows. It
-/// therefore preserves explicit provider evidence while preventing a spawned agent's delegation
-/// prompt (stored by harnesses as `role = user`) from becoming human-authored evidence.
+impl UserRoleEvidence {
+    fn authorship(self) -> MessageAuthorship {
+        match self {
+            Self::HumanInputEvent => MessageAuthorship::Human,
+            Self::AgentDelegationEvent => MessageAuthorship::Agent,
+            Self::Unverified => MessageAuthorship::Unknown,
+        }
+    }
+}
+
+/// Deprecated provider evidence for resolving normalized user-role messages.
+#[doc(inline)]
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage::with_authorship before normalization"
+)]
+pub use UserRoleEvidence as UserRoleAuthorshipEvidence;
+
+/// Resolve still-unknown user/slash conversation authorship without changing other provenance.
+/// New providers attach evidence with [`RawMessage::with_authorship`] before normalization.
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage::with_authorship before normalization"
+)]
+#[allow(deprecated)]
 pub fn apply_user_role_authorship(messages: &mut [Message], evidence: UserRoleAuthorshipEvidence) {
-    let user_authorship = match evidence {
-        UserRoleAuthorshipEvidence::HumanInputEvent => MessageAuthorship::Human,
-        UserRoleAuthorshipEvidence::AgentDelegationEvent => MessageAuthorship::Agent,
-        UserRoleAuthorshipEvidence::Unverified => return,
-    };
+    let authorship = evidence.authorship();
+    if authorship == MessageAuthorship::Unknown {
+        return;
+    }
     for message in messages {
         if message.provenance.authorship == MessageAuthorship::Unknown
             && matches!(message.role, Role::User | Role::Slash)
@@ -1511,9 +1629,16 @@ pub fn apply_user_role_authorship(messages: &mut [Message], evidence: UserRoleAu
                 MessageKind::Conversation | MessageKind::Unknown
             )
         {
-            message.provenance.authorship = user_authorship;
+            message.provenance.authorship = authorship;
         }
     }
+}
+
+/// The spelling of a literal inside stored tool-argument JSON, only when escaping changes it.
+pub(crate) fn json_escaped_literal(query: &str) -> Option<String> {
+    let encoded = serde_json::to_string(query).expect("serializing a string cannot fail");
+    let escaped = &encoded[1..encoded.len() - 1];
+    (escaped != query).then(|| escaped.to_owned())
 }
 
 /// Compact, provider-neutral searchable content for a tool-call input row. Tool outputs remain
@@ -1532,11 +1657,16 @@ pub fn tool_call_message_content(tool_name: &str, args: Value) -> String {
 /// [`Role::Tool`] message came from (e.g. `"Bash"`, `"ls"`, `"apply_patch"`). The name is
 /// stored only as supplied; role classification still derives from the role/text so a
 /// non-tool message with an incidental name is unaffected.
+/// Compatibility provider normalization; scans and retains O(message bytes).
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage constructors; IndexService::reindex_report owns provider normalization"
+)]
 pub fn to_messages_with_tools<T>(raw: Vec<T>) -> Vec<Message>
 where
     T: Into<RawMessage>,
 {
-    normalize_raw_messages(raw, None)
+    normalize_raw_messages_with_evidence(raw, None, UserRoleEvidence::Unverified)
 }
 
 /// Normalize provider records while binding deferred native event IDs to one canonical session.
@@ -1544,14 +1674,23 @@ where
 /// This stays `O(M)` time and `O(M)` output for `M` messages, with `O(1)` extra state beyond the
 /// returned rows. Binding at finalization handles providers whose true session ID is discovered
 /// after earlier records without synthesizing message identity from sequence, timestamps, or text.
+/// Compatibility provider normalization with session identity; retains O(message bytes).
+#[deprecated(
+    since = "1.1.0",
+    note = "use RawMessage constructors; IndexService::reindex_report owns scoped provider normalization"
+)]
 pub fn to_messages_with_tools_in_scope<T>(raw: Vec<T>, scope: &str) -> Vec<Message>
 where
     T: Into<RawMessage>,
 {
-    normalize_raw_messages(raw, Some(scope))
+    normalize_raw_messages_with_evidence(raw, Some(scope), UserRoleEvidence::Unverified)
 }
 
-fn normalize_raw_messages<T>(raw: Vec<T>, correlation_scope: Option<&str>) -> Vec<Message>
+pub(crate) fn normalize_raw_messages_with_evidence<T>(
+    raw: Vec<T>,
+    correlation_scope: Option<&str>,
+    evidence: UserRoleEvidence,
+) -> Vec<Message>
 where
     T: Into<RawMessage>,
 {
@@ -1564,8 +1703,23 @@ where
                 .kind
                 .unwrap_or_else(|| infer_message_kind(normalized, &raw.content));
             let mut provenance = raw.provenance;
-            if provenance.authorship == MessageAuthorship::Unknown {
-                provenance.authorship = infer_message_authorship(normalized, kind);
+            provenance.authorship = raw.authorship_override.unwrap_or_else(|| {
+                let inferred = infer_message_authorship(normalized, kind);
+                if inferred == MessageAuthorship::Unknown
+                    && matches!(normalized, Role::User | Role::Slash)
+                    && matches!(kind, MessageKind::Conversation | MessageKind::Unknown)
+                {
+                    evidence.authorship()
+                } else {
+                    inferred
+                }
+            });
+            if provenance.input_origin.is_none()
+                && provenance.authorship == MessageAuthorship::Human
+                && matches!(normalized, Role::User | Role::Slash)
+                && matches!(kind, MessageKind::Conversation | MessageKind::Unknown)
+            {
+                provenance.input_origin = Some(MessageInputOrigin::DirectConversation);
             }
             if let Some((authority, id)) = raw.native_event_identity {
                 let scope = correlation_scope.expect(
@@ -1598,6 +1752,175 @@ mod role_classification_tests {
     use crate::models::{
         MessageCorrelationAuthority, MessageCorrelationIdentity, MessageKind, MessageRecordRelation,
     };
+
+    #[test]
+    fn content_part_regions_preserve_scalars_and_reject_invalid_ranges() {
+        use crate::models::{ContentPartAuthorship, ContentPartOrigin};
+        let content = "é🦀e\u{301}\nx";
+        let part = |ordinal, start_char, end_char| MessageContentPart {
+            ordinal,
+            start_char,
+            end_char,
+            authorship: ContentPartAuthorship::Unknown,
+            origin: ContentPartOrigin::DirectInput,
+        };
+        let parts = [part(0, 0, 2), part(1, 3, 6)];
+        let regions = content_part_regions(content, &parts).unwrap();
+        assert_eq!(
+            regions.iter().map(|(_, text)| *text).collect::<Vec<_>>(),
+            ["é🦀", "\u{301}\nx"]
+        );
+        assert!(content_part_regions(content, &[]).unwrap().is_empty());
+        for invalid in [
+            vec![part(0, 0, 7)],
+            vec![part(0, 2, 2)],
+            vec![part(0, 0, 3), part(1, 2, 4)],
+        ] {
+            assert!(content_part_regions(content, &invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn explicit_authorship_survives_session_evidence() {
+        for evidence in [
+            UserRoleEvidence::HumanInputEvent,
+            UserRoleEvidence::AgentDelegationEvent,
+            UserRoleEvidence::Unverified,
+        ] {
+            for authorship in [
+                MessageAuthorship::Unknown,
+                MessageAuthorship::Human,
+                MessageAuthorship::Agent,
+            ] {
+                let messages = normalize_raw_messages_with_evidence(
+                    vec![
+                        RawMessage::message("user", "prompt".into(), None, None)
+                            .with_authorship(authorship),
+                        RawMessage::tool_result("question", "reply".into(), Some("call"), None)
+                            .with_authorship(authorship),
+                    ],
+                    None,
+                    evidence,
+                );
+                assert_eq!(messages[0].provenance.authorship, authorship);
+                assert_eq!(messages[1].provenance.authorship, authorship);
+            }
+        }
+    }
+
+    #[test]
+    fn session_evidence_only_resolves_unclassified_input() {
+        for (evidence, expected) in [
+            (UserRoleEvidence::HumanInputEvent, MessageAuthorship::Human),
+            (
+                UserRoleEvidence::AgentDelegationEvent,
+                MessageAuthorship::Agent,
+            ),
+            (UserRoleEvidence::Unverified, MessageAuthorship::Unknown),
+        ] {
+            let messages = normalize_raw_messages_with_evidence(
+                vec![
+                    RawMessage::message("user", "prompt".into(), None, None),
+                    RawMessage::message("user", "/compact request".into(), None, None),
+                    RawMessage::harness_notice("notice".into(), None),
+                    RawMessage::tool_result("read", "output".into(), Some("call"), None),
+                    RawMessage::tool_call("read", json!({}), Some("call"), None),
+                    RawMessage::message("assistant", "response".into(), None, None),
+                    RawMessage::message("compaction", "summary".into(), None, None),
+                ],
+                None,
+                evidence,
+            );
+            let authorships: Vec<_> = messages
+                .iter()
+                .map(|message| message.provenance.authorship)
+                .collect();
+            assert_eq!(
+                authorships,
+                vec![
+                    expected,
+                    expected,
+                    MessageAuthorship::Harness,
+                    MessageAuthorship::Generated,
+                    MessageAuthorship::Agent,
+                    MessageAuthorship::Agent,
+                    MessageAuthorship::Generated,
+                ]
+            );
+            let origin = (expected == MessageAuthorship::Human)
+                .then_some(MessageInputOrigin::DirectConversation);
+            assert_eq!(messages[0].provenance.input_origin, origin);
+            assert_eq!(messages[1].provenance.input_origin, origin);
+            assert!(messages[2..]
+                .iter()
+                .all(|message| message.provenance.input_origin.is_none()));
+        }
+    }
+
+    #[test]
+    fn normalization_preserves_parts_origin_and_identity() {
+        use crate::models::{ContentPartAuthorship, ContentPartOrigin};
+
+        let parts = vec![
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: 2,
+                authorship: ContentPartAuthorship::Human,
+                origin: ContentPartOrigin::DirectInput,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char: 2,
+                end_char: 3,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::ToolPayload,
+            },
+        ];
+        let raw = RawMessage::tool_result("question", "🦀\nx".into(), Some("call"), None)
+            .with_authorship(MessageAuthorship::Unknown)
+            .with_content_parts(parts.clone())
+            .with_input_origin(MessageInputOrigin::InteractiveAnswer)
+            .with_input_delivery_state(InputDeliveryState::Submitted)
+            .with_native_event_identity(MessageCorrelationAuthority::Anthropic, "event");
+        let invalid = raw.clone().with_authorship(MessageAuthorship::Human);
+        let messages = normalize_raw_messages_with_evidence(
+            vec![raw, invalid],
+            Some("claude:session"),
+            UserRoleEvidence::AgentDelegationEvent,
+        );
+        let provenance = &messages[0].provenance;
+        assert_eq!(provenance.authorship, MessageAuthorship::Mixed);
+        assert_eq!(provenance.content_parts, parts);
+        assert_eq!(
+            provenance.input_origin,
+            Some(MessageInputOrigin::InteractiveAnswer)
+        );
+        assert_eq!(
+            provenance.input_delivery_state,
+            Some(InputDeliveryState::Submitted)
+        );
+        assert_eq!(
+            provenance.correlation_identity.as_ref().unwrap().scope,
+            "claude:session"
+        );
+        assert!(provenance.validate(&messages[0].content).is_ok());
+        assert_eq!(messages[1].provenance.content_parts, parts);
+        assert!(messages[1]
+            .provenance
+            .validate(&messages[1].content)
+            .is_err());
+
+        let unknown = normalize_raw_messages_with_evidence(
+            vec![RawMessage::message("user", "x".into(), None, None)
+                .with_authorship(MessageAuthorship::Human)
+                .with_authorship(MessageAuthorship::Unknown)],
+            None,
+            UserRoleEvidence::HumanInputEvent,
+        );
+        assert_eq!(unknown[0].provenance.authorship, MessageAuthorship::Unknown);
+        assert_eq!(unknown[0].provenance.input_origin, None);
+    }
 
     #[test]
     fn typed_tool_events_preserve_kind_and_native_call_id() {
@@ -1758,20 +2081,31 @@ pub fn minimal_record(provider: Provider, path: &Path, warning: String) -> Parse
         transcript_text: String::new(),
         messages: Vec::new(),
         file_edits: Vec::new(),
+        retracted: Default::default(),
     }
+}
+
+#[test]
+fn parser_versions_pin_claude_attachment_and_codex_fork_rules() {
+    assert_eq!(provider_parse_version(Provider::Claude), "claude-v19");
+    assert_eq!(
+        provider_parse_version(Provider::ClaudeDesktop),
+        "claude-desktop-local-agent-v19"
+    );
+    assert_eq!(provider_parse_version(Provider::Codex), "codex-v12");
 }
 
 pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude-v4",
-        Provider::ClaudeDesktop => "claude-desktop-local-agent-v4",
-        Provider::Codex => "codex-v5",
-        Provider::Cursor => "cursor-v4",
-        Provider::Antigravity => "antigravity-v3",
-        Provider::Pi => "pi-v3",
-        Provider::PrimeAgent => "prime-agent-v1",
-        Provider::AiStudio => "aistudio-v3",
-        Provider::GeminiCli => "gemini-cli-v4",
+        Provider::Claude => "claude-v19",
+        Provider::ClaudeDesktop => "claude-desktop-local-agent-v19",
+        Provider::Codex => "codex-v12",
+        Provider::Cursor => "cursor-v5",
+        Provider::Antigravity => "antigravity-v6",
+        Provider::Pi => "pi-v5",
+        Provider::PrimeAgent => "prime-agent-v3",
+        Provider::AiStudio => "aistudio-v4",
+        Provider::GeminiCli => "gemini-cli-v6",
     }
 }
 
@@ -2610,6 +2944,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn line_offsets_count_original_crlf_and_invalid_utf8_bytes() {
+        let lines = lines_with_byte_offsets(std::io::Cursor::new(b"\xff\r\n\nnext\r\nlast"))
+            .collect::<std::io::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            lines,
+            [
+                (0, "�".into()),
+                (3, "".into()),
+                (4, "next".into()),
+                (10, "last".into())
+            ]
+        );
+    }
+
+    #[test]
     fn lines_replacing_invalid_utf8_recovers_bad_bytes_and_matches_lines_semantics() {
         use std::io::Cursor;
         let lines = |bytes: &[u8]| {
@@ -2660,8 +3010,6 @@ pub(crate) mod tests {
     /// their `--session`/`--resume <id>` resolvers list; both accept a path, so the plan names the
     /// file. Claude Code has no path resume and its subagent transcripts are not sessions it can
     /// reopen, so the plan is an error that names the spawning session's own resume command.
-    /// Before this, 111 of 119 Prime rows and 4,398 of 5,349 Claude rows on one real index were
-    /// printed with an id their CLI could not resolve.
     #[test]
     fn subagent_runs_resume_by_transcript_path_or_name_the_spawning_session() {
         for (provider, binary, flag) in [
@@ -2694,12 +3042,12 @@ pub(crate) mod tests {
             String::new(),
         );
         parsed.session.parent_session_id =
-            Some("claude:f330ed56-af97-4b90-a866-99f0a6e11117".to_string());
+            Some("claude:11111111-2222-4333-8444-555555555555".to_string());
         let error = with_stub_binary_on_path("claude", || resume_plan(&parsed.session))
             .unwrap_err()
             .to_string();
         assert!(
-            error.contains("claude --resume f330ed56-af97-4b90-a866-99f0a6e11117"),
+            error.contains("claude --resume 11111111-2222-4333-8444-555555555555"),
             "names the spawning session's resume command: {error}"
         );
         assert!(

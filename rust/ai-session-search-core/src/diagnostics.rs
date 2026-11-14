@@ -135,6 +135,7 @@ fn index_status_for_discovered(
 
 /// One discovered file that produced no session row, and why.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct UnindexedFile {
     pub provider: Provider,
     /// The discovered file that is absent from the index.
@@ -158,7 +159,7 @@ pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>>
     let holders: HashMap<(Provider, String), String> = db
         .indexed_source_identities()?
         .into_iter()
-        .map(|(provider, source_path, _, id)| ((provider, id), source_path))
+        .map(|source| ((source.provider, source.session_id), source.source_path))
         .collect();
 
     let providers = crate::source::ProviderSet::new(config);
@@ -195,7 +196,7 @@ fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {
     Ok(db
         .indexed_source_identities()?
         .into_iter()
-        .map(|(provider, source_path, _, _)| (provider, source_path))
+        .map(|source| (source.provider, source.source_path))
         .collect())
 }
 
@@ -248,17 +249,14 @@ mod tests {
             stale_sessions,
             parse_warnings: 0,
             providers: Vec::new(),
+            unrecognized_record_types: Vec::new(),
         }
     }
 
     /// A discovered file that produced no session row is invisible to stale-session
     /// accounting: every health signal is keyed by a session that WAS indexed, so a file
-    /// that never became one contributes to none of them. That is how 65 of 414 codex
-    /// rollouts stayed missing while `get_index_status` reported stale_sessions 0,
-    /// parse_warnings 0 and repair_commands []. The gap is counted by set difference
-    /// against the indexed source paths, NOT by subtracting indexed_sessions from
-    /// discovered_files: retained sessions make indexed exceed discovered (claude reported
-    /// 858 indexed against 645 discovered), so the subtraction is not the same quantity.
+    /// that never became one contributes to none of them. Count the set difference against
+    /// indexed source paths; subtracting counts is wrong when the index retains pruned sources.
     #[test]
     fn unindexed_discovered_files_are_counted_and_offered_a_repair() {
         let discovered = HashSet::from([

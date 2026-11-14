@@ -30,7 +30,7 @@ pub(crate) const MAX_NAME_CHARS: usize = 64;
 /// Structural depth ceiling for metadata we inspect.
 const MAX_YAML_DEPTH: usize = 32;
 
-/// Standard Agent Skill metadata consumed by Aise.
+/// Standard Agent Skill metadata consumed by aise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentSkillFrontmatter {
     pub(crate) name: String,
@@ -144,12 +144,14 @@ impl<'de> Deserialize<'de> for SkillName {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillNameSelector {
     pub name: SkillName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct SkillPathSelector {
     pub path: PathBuf,
 }
@@ -157,6 +159,7 @@ pub struct SkillPathSelector {
 /// Canonical wire selector: exactly one name or path object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum SkillSelector {
     Name(SkillNameSelector),
     Path(SkillPathSelector),

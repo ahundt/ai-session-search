@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Nisarg Patel
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,14 +13,15 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 
 use crate::models::{
-    FileEdit, MessageCorrelationAuthority, ParsedSession, Provider, SessionRecord, SourceFile,
+    ContentPartAuthorship, ContentPartOrigin, FileEdit, MessageAuthorship, MessageContentPart,
+    MessageCorrelationAuthority, MessageInputOrigin, MessageRecordRelation, ParsedSession,
+    Provider, SessionRecord, SourceFile,
 };
 use crate::providers::{walk_roots, ProviderDiscovery, ProviderPathWarning};
 use crate::util::{
-    apply_user_role_authorship, extract_text, find_repo_root, format_transcript_line,
-    minimal_record, normalize_path, observe_session_end, parse_datetime, parse_unix_millis,
-    parse_unix_seconds, preview_from_text, truncate_for_display, RawMessage,
-    UserRoleAuthorshipEvidence,
+    extract_text, find_repo_root, format_transcript_line, minimal_record, normalize_path,
+    observe_session_end, parse_datetime, parse_unix_millis, parse_unix_seconds, preview_from_text,
+    truncate_for_display, RawMessage, UserRoleEvidence,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -32,6 +33,15 @@ struct CodexMetadata {
     rollout_path: Option<String>,
     first_user_message: Option<String>,
     raw: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone)]
+struct CodexRequestUserInputState {
+    question_ids: Vec<String>,
+    /// A call id is native identity, not a deduplication hint. Duplicate calls or outputs with
+    /// one id are therefore ambiguous and must remain ordinary tool content.
+    valid: bool,
+    answered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +138,7 @@ impl CodexAdapter {
                 .map(|value| value.as_nanos() as i64)
                 .unwrap_or_default();
             files.push(SourceFile {
+                sidecar: None,
                 provider: Provider::Codex,
                 path: entry.path,
                 mtime_ns,
@@ -172,15 +183,34 @@ impl CodexAdapter {
         reader: R,
         path: &Path,
     ) -> Result<ParsedSession> {
+        self.parse_reader_with_context(reader, path, None)
+    }
+
+    pub(crate) fn parse_reader_with_context<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        path: &Path,
+        context: Option<crate::tail::TailContext>,
+    ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
         let mut valid_record_count: usize = 0;
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
+        let mut session_is_agent = self
+            .metadata_for_path(path)
+            .and_then(|metadata| metadata.threads.get(&provider_session_id))
+            .map(|metadata| {
+                let raw = Value::Object(metadata.raw.clone());
+                let (parent, label) = codex_spawn_origin(&raw);
+                parent.is_some() || label.is_some()
+            })
+            .unwrap_or(false);
         // A forked or resumed session emits a SECOND session_meta carrying the parent's id.
         // Only the first one identifies this file, so bind the id once. See the guard below.
         let mut session_id_bound = false;
+        let mut header_spawn_origin = (None, None);
         let mut cwd = None;
         let mut created_at = None;
         let mut updated_at = None;
@@ -188,14 +218,26 @@ impl CodexAdapter {
         let mut messages = Vec::new();
         // call_id -> tool name, so a later function_call_output can be tagged with the tool.
         let mut tool_call_names: HashMap<String, String> = HashMap::new();
+        // The native request_user_input call is the only safe authority for interpreting an
+        // output's answer values as input. Keep the question ids so arbitrary tool JSON and
+        // lookalike tool names cannot become user input by shape alone.
+        let mut request_user_input_calls: HashMap<String, CodexRequestUserInputState> =
+            HashMap::new();
+        let mut requires_full_parse_for_tail = false;
         let mut file_edits: Vec<FileEdit> = Vec::new();
         let mut pending_file_mutations = crate::files::PendingFileMutations::default();
         let mut first_user = None;
         let mut last_user = None;
         let mut latest_goal: Option<Value> = None;
+        // A fork replays its parent's history until its first `thread_settings_applied` event;
+        // the parent's `session_meta` is optional. See `ForkReplay`.
+        let mut fork_replay = ForkReplay::default();
+        let mut fork_parent = None;
+        let mut replayed_file_edits = None;
 
-        for line in crate::util::lines_replacing_invalid_utf8(reader) {
-            let line = line?;
+        for line in crate::util::lines_with_byte_offsets(reader) {
+            let (byte_offset, line) = line?;
+            let is_new = context.is_none_or(|c| byte_offset >= c.new_bytes_start);
             line_count += 1;
             if line.trim().is_empty() {
                 continue;
@@ -220,7 +262,27 @@ impl CodexAdapter {
                         // this file's content to the parent's session, and the
                         // `on conflict(id) do update` upsert in db.rs would then overwrite
                         // the parent's row wholesale instead of storing this one.
+                        if session_id_bound && fork_replay.forked {
+                            fork_replay.start(
+                                messages.len(),
+                                transcript_lines.len(),
+                                &first_user,
+                                &last_user,
+                            );
+                        }
                         if !session_id_bound {
+                            fork_parent = payload
+                                .get("forked_from_id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.trim().is_empty())
+                                .map(str::to_owned);
+                            fork_replay.forked = fork_parent.is_some();
+                            if fork_replay.forked {
+                                fork_replay.start(0, 0, &None, &None);
+                            }
+                            let (parent, label) = codex_spawn_origin(payload);
+                            session_is_agent |= parent.is_some() || label.is_some();
+                            header_spawn_origin = (parent, label);
                             if let Some(id) = payload.get("id").and_then(Value::as_str) {
                                 provider_session_id = id.to_string();
                             }
@@ -251,6 +313,26 @@ impl CodexAdapter {
                     let item_type = payload.get("type").and_then(Value::as_str);
                     let role = payload.get("role").and_then(Value::as_str);
                     if item_type == Some("message") && matches!(role, Some("user" | "assistant")) {
+                        let shell_direct_authorship = if session_is_agent {
+                            ContentPartAuthorship::Agent
+                        } else {
+                            ContentPartAuthorship::Human
+                        };
+                        let shell_attribution = (role == Some("user"))
+                            .then(|| {
+                                codex_native_shell_command_attribution(
+                                    payload,
+                                    shell_direct_authorship,
+                                )
+                            })
+                            .flatten();
+                        let native_attribution = (role == Some("user")
+                            && shell_attribution.is_none())
+                        .then(|| codex_native_message_attribution(payload))
+                        .flatten()
+                        .map(|attribution| {
+                            codex_agent_session_attribution(attribution, session_is_agent)
+                        });
                         let text = extract_text(payload);
                         if text.trim().is_empty() {
                             continue;
@@ -261,7 +343,11 @@ impl CodexAdapter {
                         // caveats. It was previously re-tagged `tool`, which kept it out of
                         // user analytics but described it as tool output and gave one concept
                         // two representations across providers. See claude.rs is_harness_notice.
-                        if role == Some("user") && is_codex_injected_context(&text) {
+                        if role == Some("user")
+                            && native_attribution.is_none()
+                            && shell_attribution.is_none()
+                            && is_codex_injected_context(&text)
+                        {
                             messages.push(RawMessage::harness_notice(text, timestamp));
                             continue;
                         }
@@ -278,6 +364,45 @@ impl CodexAdapter {
                             timestamp,
                             None,
                         );
+                        if let Some(shell_attribution) = shell_attribution {
+                            raw_message = match shell_attribution {
+                                CodexShellCommandAttribution::Parts(parts) => {
+                                    let has_direct_input = parts.iter().any(|part| {
+                                        part.authorship == ContentPartAuthorship::Human
+                                            && part.origin == ContentPartOrigin::DirectInput
+                                    });
+                                    let raw_message = raw_message.with_content_parts(parts);
+                                    if has_direct_input {
+                                        raw_message.with_input_origin(
+                                            MessageInputOrigin::DirectConversation,
+                                        )
+                                    } else {
+                                        raw_message
+                                    }
+                                }
+                                CodexShellCommandAttribution::Unknown => {
+                                    raw_message.with_authorship(MessageAuthorship::Unknown)
+                                }
+                            };
+                        } else if let Some(attribution) = native_attribution {
+                            raw_message = match attribution {
+                                CodexMessageAttribution::Whole {
+                                    authorship,
+                                    input_origin,
+                                } => {
+                                    let mut raw_message = raw_message.with_authorship(authorship);
+                                    if let Some(input_origin) = input_origin {
+                                        raw_message = raw_message.with_input_origin(input_origin);
+                                    }
+                                    raw_message
+                                }
+                                CodexMessageAttribution::Parts(parts) => {
+                                    raw_message.with_content_parts(parts)
+                                }
+                            };
+                        } else if is_codex_subagent_notification(&text) {
+                            raw_message = raw_message.with_authorship(MessageAuthorship::Agent);
+                        }
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
                                 MessageCorrelationAuthority::OpenAi,
@@ -298,6 +423,30 @@ impl CodexAdapter {
                             (payload.get("call_id").and_then(Value::as_str), name)
                         {
                             tool_call_names.insert(call_id.to_string(), name.to_string());
+                            if name == "request_user_input" {
+                                // Calls add rows; only responses need the prefix on a tail parse.
+                                requires_full_parse_for_tail |= context.is_none();
+                                let question_ids = codex_request_user_input_question_ids(
+                                    &codex_tool_call_args(payload),
+                                );
+                                let state = CodexRequestUserInputState {
+                                    valid: question_ids.is_some(),
+                                    question_ids: question_ids.unwrap_or_default(),
+                                    answered: false,
+                                };
+                                if request_user_input_calls
+                                    .insert(call_id.to_string(), state)
+                                    .is_some()
+                                {
+                                    // Reusing a native call id makes later answer correlation
+                                    // ambiguous even if one of the two calls looked valid.
+                                    if let Some(state) = request_user_input_calls.get_mut(call_id) {
+                                        state.valid = false;
+                                        state.answered = true;
+                                        state.question_ids.clear();
+                                    }
+                                }
+                            }
                         }
                         if let Some(name) = name {
                             let args = codex_tool_call_args(payload);
@@ -336,24 +485,81 @@ impl CodexAdapter {
                         // Tool output → a Role::Tool message tagged with the tool that
                         // produced it (correlated by call_id), kept out of the human
                         // transcript/title/preview.
+                        // A tail slice may contain this candidate response without the native
+                        // call/question prefix. Mark it for a full parse; the marker is a
+                        // correctness guard only and does not classify the output as input.
+                        if codex_request_user_input_response(
+                            payload.get("output").unwrap_or(&Value::Null),
+                        )
+                        .is_some()
+                        {
+                            requires_full_parse_for_tail |=
+                                is_new && context.is_none_or(|c| c.prefix_truncated);
+                        }
                         let output = codex_output_text(payload.get("output"));
+                        let call_id = payload.get("call_id").and_then(Value::as_str);
+                        let tool_name = call_id.and_then(|id| tool_call_names.get(id).cloned());
+                        let answer_text = if tool_name.as_deref() == Some("request_user_input") {
+                            call_id.and_then(|id| {
+                                let state = request_user_input_calls.get_mut(id)?;
+                                if !state.valid || state.answered {
+                                    return None;
+                                }
+                                // Consume the first native output regardless of whether it is a
+                                // response, cancellation, or error. A duplicate result must not
+                                // duplicate user-input regions.
+                                state.answered = true;
+                                codex_request_user_input_answers(
+                                    payload.get("output"),
+                                    &state.question_ids,
+                                )
+                            })
+                        } else {
+                            None
+                        };
                         pending_file_mutations.finish(
-                            payload.get("call_id").and_then(Value::as_str),
+                            call_id,
                             codex_apply_patch_succeeded(payload.get("output")),
                             &mut file_edits,
                         );
-                        if !output.trim().is_empty() {
+                        if !output.trim().is_empty() || answer_text.is_some() {
                             observe_session_end(&mut updated_at, timestamp);
-                            let tool_name = payload
-                                .get("call_id")
-                                .and_then(Value::as_str)
-                                .and_then(|id| tool_call_names.get(id).cloned());
+                            let output = codex_append_request_user_input_answers(
+                                output.into_owned(),
+                                answer_text.as_deref(),
+                            );
                             let mut raw_message = RawMessage::tool_result_with_name(
                                 tool_name,
-                                output.into_owned(),
-                                payload.get("call_id").and_then(Value::as_str),
+                                output.content,
+                                call_id,
                                 timestamp,
                             );
+                            if let Some(attribution) = output.attribution {
+                                let attribution = match attribution {
+                                    CodexAnswerAttribution::Whole => {
+                                        CodexMessageAttribution::Whole {
+                                            authorship: MessageAuthorship::Human,
+                                            input_origin: None,
+                                        }
+                                    }
+                                    CodexAnswerAttribution::Mixed(parts) => {
+                                        CodexMessageAttribution::Parts(parts)
+                                    }
+                                };
+                                raw_message = match codex_agent_session_attribution(
+                                    attribution,
+                                    session_is_agent,
+                                ) {
+                                    CodexMessageAttribution::Whole { authorship, .. } => {
+                                        raw_message.with_authorship(authorship).with_input_origin(
+                                            MessageInputOrigin::InteractiveAnswer,
+                                        )
+                                    }
+                                    CodexMessageAttribution::Parts(parts) => raw_message
+                                        .with_content_parts(parts)
+                                        .with_input_origin(MessageInputOrigin::InteractiveAnswer),
+                                };
+                            }
                             if let Some(event_id) = event_id {
                                 raw_message = raw_message.with_native_event_identity(
                                     MessageCorrelationAuthority::OpenAi,
@@ -370,6 +576,21 @@ impl CodexAdapter {
                         .get("type")
                         .or_else(|| payload.get("event_type"))
                         .and_then(Value::as_str);
+                    if event_type == Some("thread_settings_applied") {
+                        // Closing a replay changes earlier rows even when its header is outside
+                        // the overlap; append-only storage cannot reconcile those rows.
+                        requires_full_parse_for_tail |=
+                            is_new && context.is_none_or(|c| c.prefix_truncated);
+                        if fork_replay.open.is_some() {
+                            replayed_file_edits = Some(0..file_edits.len());
+                        }
+                        fork_replay.end(
+                            messages.len(),
+                            transcript_lines.len(),
+                            &mut first_user,
+                            &mut last_user,
+                        );
+                    }
                     if event_type == Some("thread_goal_updated") {
                         latest_goal = payload
                             .get("goal")
@@ -391,6 +612,13 @@ impl CodexAdapter {
             }
         }
 
+        let mut retracted = crate::models::RetractedRows::default();
+        if let Some(range) = replayed_file_edits {
+            // Only indexed parent edits can prove a replay is recoverable, regardless of
+            // whether discovery has seen a parent filename yet. Storage retains unproven copies.
+            retracted.file_edits = file_edits.drain(range).collect();
+        }
+        let messages = fork_replay.mark(messages, &mut transcript_lines);
         let root_metadata = self.metadata_for_path(path);
         let meta = root_metadata
             .and_then(|metadata| metadata.threads.get(&provider_session_id))
@@ -425,8 +653,18 @@ impl CodexAdapter {
             "rollout_path": meta.rollout_path,
             "session_path": normalize_path(path),
         });
+        if let Some(parent) = fork_parent {
+            raw_metadata["forked_from_id"] = json!(parent);
+        }
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
+        }
+        if requires_full_parse_for_tail || (context.is_none() && !retracted.file_edits.is_empty()) {
+            // Replay edits need storage reconciliation against the indexed parent.
+            // An answer may be in the appended tail while its native call and question ids are
+            // before the overlap. The indexer owns the provider guard; this marker is the parser's
+            // evidence that a tail-only parse cannot safely correlate that output.
+            raw_metadata["requires_full_parse_for_tail"] = json!(true);
         }
         if let Value::Object(obj) = &mut raw_metadata {
             if let Some(goal) = latest_goal {
@@ -440,8 +678,13 @@ impl CodexAdapter {
         }
         // Codex records a spawn as `source: {"subagent":{"thread_spawn":{...}}}`, carrying the
         // parent thread and an agent nickname. Lifting it into the typed fields is what makes
-        // it queryable; inside the JSON blob it was present but unusable.
+        // it queryable; the same value may arrive encoded as a string from state_5.sqlite.
         let (parent_session_id, agent_label) = codex_spawn_origin(&raw_metadata);
+        // The rollout header carries spawn provenance even when state_5.sqlite is absent. Keep
+        // it as typed session metadata so bounded tail parses can compare against the persisted
+        // full-parse result; sidecar values remain authoritative when present.
+        let parent_session_id = parent_session_id.or(header_spawn_origin.0);
+        let agent_label = agent_label.or(header_spawn_origin.1);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
         let agent_started = parent_session_id.is_some() || agent_label.is_some();
 
@@ -468,20 +711,20 @@ impl CodexAdapter {
             // evidence that a given file was matched against that database is a mistake that
             // has already cost one investigation: "all indexed rows are jsonl+sqlite and none
             // is plain jsonl" looks like proof that indexing is gated on the sqlite side, and
-            // it is not. `threads` there holds one row per codex THREAD (79), while rollout
-            // files are per-session (414); the two counts are not comparable.
+            // it is not. `threads` holds one row per thread while rollout files are per-session;
+            // these counts describe different units.
             discovery_source: "jsonl+sqlite".to_string(),
             parent_session_id,
             agent_label,
         };
 
-        let mut messages = crate::util::to_messages_with_tools_in_scope(messages, &session.id);
-        apply_user_role_authorship(
-            &mut messages,
+        let messages = crate::util::normalize_raw_messages_with_evidence(
+            messages,
+            Some(&session.id),
             if agent_started {
-                UserRoleAuthorshipEvidence::AgentDelegationEvent
+                UserRoleEvidence::AgentDelegationEvent
             } else {
-                UserRoleAuthorshipEvidence::HumanInputEvent
+                UserRoleEvidence::HumanInputEvent
             },
         );
         Ok(ParsedSession {
@@ -489,6 +732,7 @@ impl CodexAdapter {
             transcript_text: transcript_lines.join("\n\n"),
             messages,
             file_edits,
+            retracted,
         })
     }
 
@@ -505,6 +749,538 @@ impl CodexAdapter {
             .captures(&value)
             .and_then(|captures| captures.get(1))
             .map(|match_| match_.as_str().to_string())
+    }
+}
+
+#[derive(Debug, Clone)]
+enum CodexMessageAttribution {
+    Whole {
+        authorship: MessageAuthorship,
+        input_origin: Option<MessageInputOrigin>,
+    },
+    Parts(Vec<MessageContentPart>),
+}
+
+#[derive(Debug, Clone)]
+enum CodexShellCommandAttribution {
+    Parts(Vec<MessageContentPart>),
+    /// The producer claimed a shell command, but its positional metadata or exact frame was
+    /// unusable. Do not let a role or legacy provenance guess make generated stdout input.
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+enum CodexAnswerAttribution {
+    Whole,
+    Mixed(Vec<MessageContentPart>),
+}
+
+#[derive(Debug, Clone)]
+struct CodexOutputWithAnswers {
+    content: String,
+    attribution: Option<CodexAnswerAttribution>,
+}
+
+/// Decode aligned native shell items alongside ordinary positional provenance. Framing and
+/// inter-item separators remain non-input. Work is O(B + P), for B content bytes and P parts;
+/// output ranges use O(P) memory, with O(L) temporary text for the largest content item L.
+fn codex_native_shell_command_attribution(
+    payload: &Value,
+    direct_authorship: ContentPartAuthorship,
+) -> Option<CodexShellCommandAttribution> {
+    const SHELL_KIND: &str = "shell.user_command";
+    let kinds_value =
+        payload.pointer("/internal_chat_message_metadata_passthrough/content_item_kinds")?;
+    let Some(kinds) = kinds_value.as_array() else {
+        return Some(CodexShellCommandAttribution::Unknown);
+    };
+    let Some(content) = payload.get("content").and_then(Value::as_array) else {
+        return Some(CodexShellCommandAttribution::Unknown);
+    };
+    if kinds.len() != content.len() {
+        return Some(CodexShellCommandAttribution::Unknown);
+    }
+    if !kinds.iter().any(|kind| kind.as_str() == Some(SHELL_KIND)) {
+        return None;
+    }
+    let metadata = payload
+        .pointer("/internal_chat_message_metadata_passthrough/content_item_metadata")
+        .and_then(Value::as_array)
+        .filter(|metadata| metadata.len() == content.len());
+    let mut parts = Vec::new();
+    let mut offset = 0;
+    for (index, (item, kind)) in content.iter().zip(kinds).enumerate() {
+        let text = extract_text(item);
+        if text.is_empty() {
+            continue;
+        }
+        if offset > 0 {
+            parts.push(MessageContentPart {
+                ordinal: parts.len() as u32,
+                start_char: offset,
+                end_char: offset + 1,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::HarnessContext,
+            });
+            offset += 1;
+        }
+        let item_parts = if kind.as_str() == Some(SHELL_KIND) {
+            codex_user_shell_command_parts(&text, direct_authorship)
+        } else {
+            None
+        };
+        let item_parts = item_parts.unwrap_or_else(|| {
+            let (mut authorship, origin) = if kind.as_str() == Some(SHELL_KIND) {
+                (ContentPartAuthorship::Unknown, ContentPartOrigin::Unknown)
+            } else {
+                metadata
+                    .and_then(|metadata| codex_content_item_provenance(&metadata[index]))
+                    .unwrap_or((ContentPartAuthorship::Unknown, ContentPartOrigin::Unknown))
+            };
+            if authorship == ContentPartAuthorship::Human {
+                authorship = direct_authorship;
+            }
+            vec![MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: text.chars().count(),
+                authorship,
+                origin,
+            }]
+        });
+        let item_end = offset + text.chars().count();
+        for mut part in item_parts {
+            part.ordinal = parts.len() as u32;
+            part.start_char += offset;
+            part.end_char += offset;
+            parts.push(part);
+        }
+        offset = item_end;
+    }
+    if parts
+        .iter()
+        .all(|part| part.authorship == ContentPartAuthorship::Unknown)
+    {
+        Some(CodexShellCommandAttribution::Unknown)
+    } else {
+        Some(CodexShellCommandAttribution::Parts(parts))
+    }
+}
+
+/// Split one canonical Codex shell frame without rewriting its persisted content. The producer
+/// interpolates command and stdout without escaping, so a delimiter in either field can create
+/// more than one structurally valid frame. In that case return `None` rather than assigning an
+/// invented author. All offsets are Unicode scalar positions, matching [`MessageContentPart`].
+fn codex_user_shell_command_parts(
+    content: &str,
+    direct_authorship: ContentPartAuthorship,
+) -> Option<Vec<MessageContentPart>> {
+    const OUTER_OPEN: &str = "<user_shell_command>";
+    const OUTER_CLOSE: &str = "</user_shell_command>";
+    const FRAME_PREFIX: &str = "\n<command>\n";
+    const FRAME_BOUNDARY: &str = "\n</command>\n<result>\n";
+    const OUTPUT_PREFIX: &str = "Output:\n";
+    const FRAME_SUFFIX: &str = "\n</result>\n";
+
+    let outer_body = content.strip_prefix(OUTER_OPEN)?;
+    let outer_close = outer_body.rfind(OUTER_CLOSE)?;
+    if !outer_body[outer_close + OUTER_CLOSE.len()..].is_empty() {
+        return None;
+    }
+    let frame = &outer_body[..outer_close];
+    if !frame.starts_with(FRAME_PREFIX) {
+        return None;
+    }
+    let command_body_start = FRAME_PREFIX.len();
+    if !frame.ends_with(FRAME_SUFFIX) {
+        return None;
+    }
+    let output_end = frame.len().checked_sub(FRAME_SUFFIX.len())?;
+    let duration_prefix = "Duration: ";
+    let mut candidate = None;
+    for (boundary, _) in frame.match_indices(FRAME_BOUNDARY) {
+        if boundary < command_body_start {
+            continue;
+        }
+        let result_body = &frame[boundary + FRAME_BOUNDARY.len()..];
+        let Some(exit_line_end) = result_body.find('\n') else {
+            continue;
+        };
+        if !result_body.starts_with("Exit code: ") {
+            continue;
+        }
+        let duration_body = &result_body[exit_line_end + 1..];
+        let Some(duration_body) = duration_body.strip_prefix(duration_prefix) else {
+            continue;
+        };
+        let Some(duration_line_end) = duration_body.find('\n') else {
+            continue;
+        };
+        if !duration_body[..duration_line_end].ends_with(" seconds") {
+            continue;
+        }
+        let output_start_in_result =
+            exit_line_end + 1 + duration_prefix.len() + duration_line_end + 1;
+        if !result_body[output_start_in_result..].starts_with(OUTPUT_PREFIX) {
+            continue;
+        }
+        let output_start =
+            boundary + FRAME_BOUNDARY.len() + output_start_in_result + OUTPUT_PREFIX.len();
+        if output_start > output_end {
+            continue;
+        }
+        if candidate.replace((boundary, output_start)).is_some() {
+            // The native format has no escaping, so two valid candidates are irreducibly
+            // ambiguous. Preserve the complete row for Any searches, but do not call either
+            // candidate direct user input.
+            return None;
+        }
+    }
+    let (boundary, output_start) = candidate?;
+
+    let command_start = OUTER_OPEN.len() + command_body_start;
+    let command_end = OUTER_OPEN.len() + boundary;
+    let output_start = OUTER_OPEN.len() + output_start;
+    let output_end = OUTER_OPEN.len() + output_end;
+    let content_chars = content.chars().count();
+    let byte_to_chars = |byte| content[..byte].chars().count();
+    let ranges = [
+        (
+            0,
+            command_start,
+            ContentPartAuthorship::Harness,
+            ContentPartOrigin::HarnessContext,
+        ),
+        (
+            command_start,
+            command_end,
+            direct_authorship,
+            ContentPartOrigin::DirectInput,
+        ),
+        (
+            command_end,
+            output_start,
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::ToolPayload,
+        ),
+        (
+            output_start,
+            output_end,
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::ToolPayload,
+        ),
+        (
+            output_end,
+            content.len(),
+            ContentPartAuthorship::Harness,
+            ContentPartOrigin::HarnessContext,
+        ),
+    ];
+    let mut parts = Vec::with_capacity(ranges.len());
+    for (start, end, authorship, origin) in ranges {
+        let start_char = byte_to_chars(start);
+        let end_char = byte_to_chars(end);
+        if start_char == end_char {
+            continue;
+        }
+        parts.push(MessageContentPart {
+            ordinal: parts.len() as u32,
+            start_char,
+            end_char,
+            authorship,
+            origin,
+        });
+    }
+    parts
+        .last()
+        .is_some_and(|part| part.end_char == content_chars)
+        .then_some(parts)
+}
+
+/// Generic native `provenance.type=user` identifies a user-role content item, not the physical
+/// root user. A session with explicit spawn provenance is an agent session, so only exact native
+/// actor evidence could override this mapping; the generic user marker cannot.
+fn codex_agent_session_attribution(
+    attribution: CodexMessageAttribution,
+    session_is_agent: bool,
+) -> CodexMessageAttribution {
+    if !session_is_agent {
+        return attribution;
+    }
+    match attribution {
+        CodexMessageAttribution::Whole {
+            authorship: MessageAuthorship::Human,
+            ..
+        } => CodexMessageAttribution::Whole {
+            authorship: MessageAuthorship::Agent,
+            input_origin: None,
+        },
+        CodexMessageAttribution::Whole {
+            authorship,
+            input_origin,
+        } => CodexMessageAttribution::Whole {
+            authorship,
+            input_origin,
+        },
+        CodexMessageAttribution::Parts(parts) => CodexMessageAttribution::Parts(
+            parts
+                .into_iter()
+                .map(|mut part| {
+                    if part.authorship == ContentPartAuthorship::Human {
+                        part.authorship = ContentPartAuthorship::Agent;
+                    }
+                    part
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Decode the producer's positional content metadata without interpreting prose. A missing or
+/// misaligned vector is explicit Unknown evidence: it must not fall through to a role-based
+/// Human guess, while older records with no metadata retain the existing normalization path.
+fn codex_native_message_attribution(payload: &Value) -> Option<CodexMessageAttribution> {
+    let metadata = payload
+        .pointer("/internal_chat_message_metadata_passthrough/content_item_metadata")
+        .and_then(Value::as_array)?;
+    let Some(content) = payload.get("content").and_then(Value::as_array) else {
+        return Some(CodexMessageAttribution::Whole {
+            authorship: MessageAuthorship::Unknown,
+            input_origin: None,
+        });
+    };
+    if metadata.len() != content.len() {
+        return Some(CodexMessageAttribution::Whole {
+            authorship: MessageAuthorship::Unknown,
+            input_origin: None,
+        });
+    }
+
+    let full_text = extract_text(payload);
+    let mut offset = 0usize;
+    let mut observed = Vec::new();
+    for (item, metadata) in content.iter().zip(metadata) {
+        let text = extract_text(item);
+        if text.is_empty() {
+            continue;
+        }
+        if let Some((_, previous_end, _, _)) = observed.last_mut() {
+            // `extract_text` joins content items with a newline. Keep that separator in the
+            // preceding source region so the persisted scalar ranges remain gap-free.
+            *previous_end += 1;
+            offset += 1;
+        }
+        let Some((authorship, origin)) = codex_content_item_provenance(metadata) else {
+            return Some(CodexMessageAttribution::Whole {
+                authorship: MessageAuthorship::Unknown,
+                input_origin: None,
+            });
+        };
+        let end = offset + text.chars().count();
+        observed.push((offset, end, authorship, origin));
+        offset = end;
+    }
+    if observed.is_empty() || offset != full_text.chars().count() {
+        return Some(CodexMessageAttribution::Whole {
+            authorship: MessageAuthorship::Unknown,
+            input_origin: None,
+        });
+    }
+
+    let first_authorship = observed[0].2;
+    if observed
+        .iter()
+        .all(|(_, _, authorship, _)| *authorship == first_authorship)
+    {
+        return Some(CodexMessageAttribution::Whole {
+            authorship: first_authorship.into(),
+            input_origin: (first_authorship == ContentPartAuthorship::Human
+                && observed
+                    .iter()
+                    .all(|(_, _, _, origin)| *origin == ContentPartOrigin::DirectInput))
+            .then_some(MessageInputOrigin::DirectConversation),
+        });
+    }
+
+    Some(CodexMessageAttribution::Parts(
+        observed
+            .into_iter()
+            .enumerate()
+            .map(
+                |(ordinal, (start_char, end_char, authorship, origin))| MessageContentPart {
+                    ordinal: ordinal as u32,
+                    start_char,
+                    end_char,
+                    authorship,
+                    origin,
+                },
+            )
+            .collect(),
+    ))
+}
+
+fn codex_content_item_provenance(
+    metadata: &Value,
+) -> Option<(ContentPartAuthorship, ContentPartOrigin)> {
+    let provenance = metadata.get("provenance").unwrap_or(metadata);
+    let kind = provenance.get("type").and_then(Value::as_str);
+    let legacy_tool = provenance
+        .get("source_tool_namespace")
+        .and_then(Value::as_str)
+        .is_some();
+    let legacy_harness = provenance
+        .get("harness_injected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match kind {
+        Some("user") => Some((ContentPartAuthorship::Human, ContentPartOrigin::DirectInput)),
+        Some("harness") | Some("skills") | Some("agents_md") | Some("developer_instructions") => {
+            Some((
+                ContentPartAuthorship::Harness,
+                ContentPartOrigin::HarnessContext,
+            ))
+        }
+        Some("tool") => Some((
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::ToolPayload,
+        )),
+        Some("unknown") | None if legacy_tool => Some((
+            ContentPartAuthorship::Generated,
+            ContentPartOrigin::ToolPayload,
+        )),
+        Some("unknown") | None if legacy_harness => Some((
+            ContentPartAuthorship::Harness,
+            ContentPartOrigin::HarnessContext,
+        )),
+        Some("unknown") | None => {
+            Some((ContentPartAuthorship::Unknown, ContentPartOrigin::Unknown))
+        }
+        Some(_) => Some((ContentPartAuthorship::Unknown, ContentPartOrigin::Unknown)),
+    }
+}
+
+fn codex_request_user_input_question_ids(args: &Value) -> Option<Vec<String>> {
+    let questions = args.get("questions")?.as_array()?;
+    if questions.is_empty() {
+        return None;
+    }
+    let mut seen = HashSet::with_capacity(questions.len());
+    let mut ids = Vec::with_capacity(questions.len());
+    for question in questions {
+        let id = question.get("id").and_then(Value::as_str)?.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            return None;
+        }
+        ids.push(id.to_string());
+    }
+    Some(ids)
+}
+
+fn codex_request_user_input_response(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| codex_request_user_input_response(&parsed)),
+        Value::Object(object) if object.contains_key("answers") => Some(value.clone()),
+        Value::Object(object) => object
+            .get("output")
+            .and_then(codex_request_user_input_response),
+        _ => None,
+    }
+}
+
+/// Decode only the exact native response shape for the exact native call. This intentionally
+/// rejects free-form output, cancellation/error objects, accepted acknowledgements, unknown
+/// question ids, and non-string answers instead of classifying them from resemblance.
+fn codex_request_user_input_answers(
+    output: Option<&Value>,
+    question_ids: &[String],
+) -> Option<Vec<String>> {
+    let response = codex_request_user_input_response(output?)?;
+    let answers = response.get("answers")?.as_object()?;
+    if answers
+        .keys()
+        .any(|id| !question_ids.iter().any(|known| known == id))
+    {
+        return None;
+    }
+    let mut values = Vec::new();
+    for question_id in question_ids {
+        let Some(answer) = answers.get(question_id) else {
+            continue;
+        };
+        let answer_values = answer.get("answers")?.as_array()?;
+        for value in answer_values {
+            let text = value.as_str()?;
+            if !text.trim().is_empty() {
+                values.push(text.to_string());
+            }
+        }
+    }
+    (!values.is_empty()).then_some(values)
+}
+
+fn codex_append_request_user_input_answers(
+    mut content: String,
+    answers: Option<&[String]>,
+) -> CodexOutputWithAnswers {
+    let Some(answers) = answers.filter(|answers| !answers.is_empty()) else {
+        return CodexOutputWithAnswers {
+            content,
+            attribution: None,
+        };
+    };
+    if content.is_empty() && answers.len() == 1 {
+        content.push_str(&answers[0]);
+        return CodexOutputWithAnswers {
+            content,
+            attribution: Some(CodexAnswerAttribution::Whole),
+        };
+    }
+    let mut parts = Vec::new();
+    let mut cursor = content.chars().count();
+    if cursor > 0 {
+        parts.push(MessageContentPart {
+            ordinal: 0,
+            start_char: 0,
+            end_char: cursor,
+            authorship: ContentPartAuthorship::Generated,
+            origin: ContentPartOrigin::ToolPayload,
+        });
+    }
+    for answer in answers {
+        if !content.is_empty() {
+            content.push('\n');
+            if let Some(previous) = parts
+                .last_mut()
+                .filter(|part| part.authorship == ContentPartAuthorship::Generated)
+            {
+                previous.end_char += 1;
+            } else {
+                parts.push(MessageContentPart {
+                    ordinal: parts.len() as u32,
+                    start_char: cursor,
+                    end_char: cursor + 1,
+                    authorship: ContentPartAuthorship::Generated,
+                    origin: ContentPartOrigin::ToolPayload,
+                });
+            }
+            cursor += 1;
+        }
+        let end = cursor + answer.chars().count();
+        content.push_str(answer);
+        parts.push(MessageContentPart {
+            ordinal: parts.len() as u32,
+            start_char: cursor,
+            end_char: end,
+            authorship: ContentPartAuthorship::Human,
+            origin: ContentPartOrigin::DirectInput,
+        });
+        cursor = end;
+    }
+    CodexOutputWithAnswers {
+        content,
+        attribution: Some(CodexAnswerAttribution::Mixed(parts)),
     }
 }
 
@@ -646,7 +1422,18 @@ fn codex_output_text<'a>(output: Option<&'a Value>) -> std::borrow::Cow<'a, str>
     // whitespace-only multi-MB output is never cloned.
     match output {
         Some(Value::String(s)) => std::borrow::Cow::Borrowed(s),
-        Some(other) => std::borrow::Cow::Owned(extract_text(other)),
+        Some(other) => {
+            let text = extract_text(other);
+            if text.is_empty() {
+                // Preserve a structured native result even when it has no display-text field
+                // (notably request_user_input's `{answers: ...}` response).
+                std::borrow::Cow::Owned(
+                    serde_json::to_string(other).unwrap_or_else(|_| String::new()),
+                )
+            } else {
+                std::borrow::Cow::Owned(text)
+            }
+        }
         None => std::borrow::Cow::Borrowed(""),
     }
 }
@@ -677,22 +1464,94 @@ fn codex_apply_patch_succeeded(output: Option<&Value>) -> bool {
         && text.contains("\nOutput:\nSuccess. Updated the following files:")
 }
 
-/// True when a role:user codex message is injected context rather than real user
-/// input: the approval-mode agent-history transcript codex asks the model to assess,
-/// or an injected `AGENTS.md`. Excluded from user/correction analytics.
-/// Read codex's spawn record out of session metadata as (parent session id, agent label).
+/// The parent history a forked rollout replays before its own records.
 ///
-/// Codex stores `source` as a JSON *string* holding
-/// `{"subagent":{"thread_spawn":{"parent_thread_id":...,"agent_nickname":...}}}`, or
-/// `{"subagent":{"other":"guardian"}}` for a spawn with no parent recorded. Both shapes are
-/// handled: the second yields a label with no parent, which is still worth keeping because it
-/// marks the session as agent-spawned rather than user-started.
+/// Codex writes a fork's own `session_meta`, optionally the parent's `session_meta`, a copy of
+/// the parent's records, then the fork's first `event_msg` of type `thread_settings_applied`
+/// and what happened in the fork. The copied rows are kept, so nothing is lost when the parent
+/// file is gone, but marked as mirrors of the parent: they are not the fork's input, analytics
+/// do not count them, and they stay out of its session text, title and preview. Only a file
+/// whose own `session_meta` names `forked_from_id` is read this way, and a replay that never
+/// reaches that event is left as it is.
+#[derive(Default)]
+struct ForkReplay {
+    /// The file's own `session_meta` names the session it was forked from.
+    forked: bool,
+    /// Start coordinates and first/last-user state to restore when the parent replay closes.
+    open: Option<(usize, usize, bool, Option<String>)>,
+    /// Replayed `messages` and `transcript_lines` ranges once the fork's own records begin.
+    closed: Option<(std::ops::Range<usize>, std::ops::Range<usize>)>,
+}
+
+impl ForkReplay {
+    fn start(
+        &mut self,
+        messages: usize,
+        transcript: usize,
+        first_user: &Option<String>,
+        last_user: &Option<String>,
+    ) {
+        if self.open.is_none() && self.closed.is_none() {
+            self.open = Some((
+                messages,
+                transcript,
+                first_user.is_some(),
+                last_user.clone(),
+            ));
+        }
+    }
+
+    fn end(
+        &mut self,
+        messages: usize,
+        transcript: usize,
+        first_user: &mut Option<String>,
+        last_user: &mut Option<String>,
+    ) {
+        if let Some((message_start, transcript_start, had_first, last)) = self.open.take() {
+            if !had_first {
+                *first_user = None;
+            }
+            *last_user = last;
+            self.closed = Some((message_start..messages, transcript_start..transcript));
+        }
+    }
+
+    fn mark(
+        &self,
+        messages: Vec<RawMessage>,
+        transcript_lines: &mut Vec<String>,
+    ) -> Vec<RawMessage> {
+        let Some((replayed, transcript)) = &self.closed else {
+            return messages;
+        };
+        transcript_lines.drain(transcript.clone());
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| {
+                if replayed.contains(&index) {
+                    message.with_record_relation(MessageRecordRelation::Mirror)
+                } else {
+                    message
+                }
+            })
+            .collect()
+    }
+}
+
+/// Read Codex's spawn record out of session metadata as (parent session id, agent label).
+/// `source` is an object in native rollout records and an encoded JSON string in state_5.sqlite;
+/// both carry `{"subagent":{"thread_spawn":...}}` (or a label-only `other` record).
 fn codex_spawn_origin(raw_metadata: &Value) -> (Option<String>, Option<String>) {
-    let Some(source) = raw_metadata.get("source").and_then(Value::as_str) else {
+    let Some(source) = raw_metadata.get("source") else {
         return (None, None);
     };
-    let Ok(source) = serde_json::from_str::<Value>(source) else {
-        return (None, None);
+    let decoded = source.as_str().map(serde_json::from_str::<Value>);
+    let source = match decoded {
+        Some(Ok(ref source)) => source,
+        Some(Err(_)) => return (None, None),
+        None => source,
     };
     let Some(subagent) = source.get("subagent") else {
         return (None, None);
@@ -708,6 +1567,7 @@ fn codex_spawn_origin(raw_metadata: &Value) -> (Option<String>, Option<String>) 
         .and_then(|spawn| spawn.get("agent_nickname"))
         .and_then(Value::as_str)
         .or_else(|| subagent.get("other").and_then(Value::as_str))
+        .or_else(|| subagent.as_str())
         .map(ToOwned::to_owned);
     (parent, label)
 }
@@ -729,6 +1589,13 @@ fn is_codex_injected_context(text: &str) -> bool {
         // Codex emits this role:user control record after an interrupted model turn. It is an
         // event about the user, not text entered by the user.
         || head.starts_with("<turn_aborted")
+}
+
+/// Codex emits subagent status as a user-role contextual fragment. The exact wrapper is a
+/// structural protocol marker; ordinary prompts that merely mention the tag remain untouched.
+fn is_codex_subagent_notification(text: &str) -> bool {
+    let text = text.trim();
+    text.starts_with("<subagent_notification>") && text.ends_with("</subagent_notification>")
 }
 
 /// The other form of the same rollout: `x.jsonl` for `x.jsonl.zst`, and the reverse. The two are
@@ -951,10 +1818,14 @@ fn load_index_titles(path: &Path) -> Result<SidecarLoad<HashMap<String, String>>
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_apply_patch_succeeded, codex_output_text, codex_spawn_origin,
-        is_codex_injected_context, CodexAdapter,
+        codex_apply_patch_succeeded, codex_native_shell_command_attribution, codex_output_text,
+        codex_spawn_origin, codex_user_shell_command_parts, is_codex_injected_context,
+        CodexAdapter, CodexShellCommandAttribution,
     };
-    use crate::models::{Provider, Role};
+    use crate::models::{
+        ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageInputOrigin, Provider,
+        Role,
+    };
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1117,12 +1988,35 @@ mod tests {
         assert_eq!(codex_output_text(None), "");
     }
 
+    #[test]
+    fn forked_session_does_not_inherit_parent_spawn_attribution() {
+        let source = json!({"subagent":{"thread_spawn":{"parent_thread_id":"grandparent","agent_nickname":"parent-agent"}}});
+        let records = [
+            json!({"type":"session_meta","payload":{"id":"own-fork","source":"cli"}}),
+            json!({"type":"session_meta","payload":{"id":"parent","source":source}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user",
+                "content":[{"type":"input_text","text":"own fork prompt"}],
+                "internal_chat_message_metadata_passthrough":{"content_item_metadata":[{"provenance":{"type":"user"}}]}}}),
+        ].into_iter().map(|value| value.to_string()+"\n").collect::<String>();
+        let parsed = CodexAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(records),
+                Path::new("/tmp/own-fork.jsonl"),
+            )
+            .unwrap();
+        assert!(parsed.session.parent_session_id.is_none());
+        assert!(parsed.session.agent_label.is_none());
+        assert_eq!(
+            parsed.messages[0].provenance.authorship,
+            MessageAuthorship::Human
+        );
+    }
+
     /// A forked session's rollout carries TWO session_meta lines: its own first, then the
     /// inherited parent metadata. Binding the id to the last one silently rebinds this file
     /// to the parent's session, and the `on conflict(id) do update` upsert in db.rs then
-    /// overwrites the parent's row instead of storing this session at all. Observed against
-    /// real data as 65 of 414 codex sessions absent from the index with no parse warning and
-    /// no stale entry, because a file that produces no row is invisible to every health signal.
+    /// overwrites the parent's row instead of storing this session. A file that produces
+    /// no row is invisible to health signals keyed only by indexed sessions.
     #[test]
     fn forked_session_keeps_its_own_id_not_the_parents() {
         let temp = tempdir().unwrap();
@@ -1155,6 +2049,109 @@ mod tests {
         );
         // The first meta also supplies cwd, so the parent's later meta must not win there either.
         assert_eq!(parsed.session.cwd.as_deref(), Some("/tmp/fork"));
+    }
+
+    /// Parent replay remains searchable as mirror content and is excluded from the fork's
+    /// input, transcript, title and preview once its settings event arrives.
+    #[test]
+    fn fork_without_parent_metadata_marks_replay_only_after_settings_arrive() {
+        use crate::models::MessageRecordRelation;
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("rollout-fork.jsonl");
+        let prefix = [
+            json!({"type":"compacted","payload":{"message":"parent summary"}}),
+            json!({"type":"session_meta","payload":{"id":"fork","forked_from_id":"parent"}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"parent prompt"}]}}),
+        ];
+        let adapter = CodexAdapter::new(vec![temp.path().to_path_buf()]);
+        for closed in [false, true] {
+            let mut records = prefix.to_vec();
+            if closed {
+                records
+                    .push(json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}));
+            }
+            records.push(json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fork task"}]}}));
+            fs::write(
+                &file,
+                records
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let parsed = adapter.parse(&adapter.discover()[0]);
+            assert_eq!(parsed.session.provider_session_id, "fork");
+            assert!(
+                parsed.session.parent_session_id.is_none(),
+                "a fork is not a spawned agent"
+            );
+            for message in &parsed.messages {
+                let replay = closed && message.content != "fork task";
+                assert_eq!(
+                    message.provenance.record_relation,
+                    if replay {
+                        MessageRecordRelation::Mirror
+                    } else {
+                        MessageRecordRelation::Original
+                    },
+                    "{closed}: {}",
+                    message.content
+                );
+            }
+            assert_eq!(parsed.transcript_text.contains("parent prompt"), !closed);
+            if closed {
+                assert_eq!(parsed.session.preview_text, "fork task");
+            }
+        }
+    }
+
+    #[test]
+    fn forked_session_keeps_replayed_parent_history_only_as_mirror_rows() {
+        use crate::models::MessageRecordRelation;
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let own = "019f5ce8-afff-76a3-86f2-174307f3fa08";
+        let parent = "019f4a0e-d714-7cc3-8003-543a04a1a822";
+        let file = root.join(format!("rollout-2026-07-13T15-16-21-{own}.jsonl"));
+        let lines = [
+            json!({"timestamp":"2026-07-13T19:16:21.425Z","type":"session_meta","payload":{"id":own,"forked_from_id":parent,"timestamp":"2026-07-13T19:16:21.181Z","cwd":"/tmp/fork","source":{"subagent":{"thread_spawn":{"parent_thread_id":parent,"agent_nickname":"worker"}}}}}),
+            json!({"timestamp":"2026-07-13T19:16:21.425Z","type":"session_meta","payload":{"id":parent,"timestamp":"2026-07-10T03:25:14.410Z","cwd":"/tmp/parent"}}),
+            json!({"timestamp":"2026-07-13T19:16:21.426Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"parent prompt"}]}}),
+            json!({"timestamp":"2026-07-13T19:16:21.426Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"parent answer"}]}}),
+            json!({"timestamp":"2026-07-13T19:16:21.427Z","type":"event_msg","payload":{"type":"thread_settings_applied"}}),
+            json!({"timestamp":"2026-07-13T19:16:24.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fork task"}]}}),
+        ]
+        .map(|line| line.to_string())
+        .join("\n");
+        fs::write(&file, lines).unwrap();
+
+        let adapter = CodexAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let rows: Vec<_> = parsed
+            .messages
+            .iter()
+            .map(|m| (m.content.as_str(), m.provenance.record_relation))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("parent prompt", MessageRecordRelation::Mirror),
+                ("parent answer", MessageRecordRelation::Mirror),
+                ("fork task", MessageRecordRelation::Original),
+            ]
+        );
+        assert!(
+            !parsed.transcript_text.contains("parent"),
+            "{}",
+            parsed.transcript_text
+        );
+        assert!(parsed.transcript_text.contains("fork task"));
+        assert_eq!(parsed.session.preview_text, "fork task");
+        assert_eq!(
+            parsed.session.parent_session_id.as_deref(),
+            Some(format!("codex:{parent}").as_str())
+        );
     }
 
     #[test]
@@ -1225,6 +2222,690 @@ mod tests {
         );
         // Tool output stays out of the human transcript.
         assert!(!parsed.transcript_text.contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn native_content_metadata_overrides_user_role_and_preserves_regions() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        fs::write(
+            &file,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","cwd":"/tmp/proj"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"direct-é"},{"type":"input_text","text":" same-token"},{"type":"input_text","text":" same-token"}],"internal_chat_message_metadata_passthrough":{"content_item_metadata":[{"provenance":{"type":"user"}},{"provenance":{"type":"harness","hook":false}},{"provenance":{"type":"tool","namespace":"functions"}}]}}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<subagent_notification>generated-sentinel</subagent_notification>"}]}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"misaligned-token"}],"internal_chat_message_metadata_passthrough":{"content_item_metadata":[]}}}"#,
+            ),
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let mixed = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("direct-é"))
+            .expect("native mixed message");
+        assert_eq!(mixed.provenance.authorship, MessageAuthorship::Mixed);
+        assert_eq!(mixed.provenance.content_parts.len(), 3);
+        assert_eq!(
+            mixed.provenance.content_parts[0].authorship,
+            ContentPartAuthorship::Human
+        );
+        assert_eq!(
+            mixed.provenance.content_parts[0].origin,
+            ContentPartOrigin::DirectInput
+        );
+        assert_eq!(
+            mixed.provenance.content_parts[1].authorship,
+            ContentPartAuthorship::Harness
+        );
+        assert_eq!(
+            mixed.provenance.content_parts[2].authorship,
+            ContentPartAuthorship::Generated
+        );
+        assert!(mixed.provenance.validate(&mixed.content).is_ok());
+
+        let subagent = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("generated-sentinel"))
+            .expect("subagent notice");
+        assert_eq!(subagent.provenance.authorship, MessageAuthorship::Agent);
+
+        let misaligned = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "misaligned-token")
+            .expect("misaligned native message");
+        assert_eq!(misaligned.provenance.authorship, MessageAuthorship::Unknown);
+        assert_eq!(misaligned.provenance.input_origin, None);
+        assert!(misaligned.provenance.content_parts.is_empty());
+    }
+
+    #[test]
+    fn native_shell_command_partitions_command_from_stdout_in_service_search() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let shell = "<user_shell_command>\n<command>\nprintf shell-only-command🙂 </user_shell_command> </user_shell_command>\n</command>\n<result>\nExit code: 0\nDuration: 0.0000 seconds\nOutput:\nshell-only-output🙂\n</result>\n</user_shell_command>";
+        let ambiguous = "<user_shell_command>\n<command>\nprintf command\n</command>\n<result>\nExit code: 0\nDuration: 0.0000 seconds\nOutput:\nfake-produced-only\n</command>\n<result>\nExit code: 0\nDuration: 0.0000 seconds\nOutput:\nremaining stdout\n</result>\n</user_shell_command>";
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        let records = [
+            json!({
+                "type": "session_meta",
+                "payload": {"id": session_id, "cwd": "/tmp/proj"}
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": shell}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_kinds": ["shell.user_command"],
+                        "content_item_metadata": [{"provenance": {"type": "harness"}}]
+                    }
+                }
+            }),
+            json!({"type":"response_item","payload":{
+                "type":"message","role":"user","content":[{"type":"input_text","text":ambiguous}],
+                "internal_chat_message_metadata_passthrough":{
+                    "content_item_kinds":["shell.user_command"],
+                    "content_item_metadata":[{"provenance":{"type":"harness"}}]
+                }
+            }}),
+        ]
+        .into_iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&file, format!("{records}\n")).unwrap();
+
+        let adapter = CodexAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let message = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == shell)
+            .expect("native shell message");
+        assert_eq!(message.provenance.authorship, MessageAuthorship::Mixed);
+        assert_eq!(
+            message.provenance.input_origin,
+            Some(MessageInputOrigin::DirectConversation)
+        );
+        assert!(message.provenance.validate(&message.content).is_ok());
+        let direct = message
+            .provenance
+            .content_parts
+            .iter()
+            .find(|part| part.origin == ContentPartOrigin::DirectInput)
+            .expect("command direct-input part");
+        assert_eq!(
+            &message.content.chars().collect::<Vec<_>>()[direct.start_char..direct.end_char]
+                .iter()
+                .collect::<String>(),
+            "printf shell-only-command🙂 </user_shell_command> </user_shell_command>"
+        );
+
+        let db_path = temp.path().join("input-index.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        for (query, scope, expected) in [
+            ("fake-produced-only", Some(crate::models::Role::User), 0),
+            ("fake-produced-only", None, 1),
+            ("shell-only-command🙂", Some(crate::models::Role::User), 1),
+            ("shell-only-output🙂", Some(crate::models::Role::User), 0),
+            ("shell-only-output🙂", None, 1),
+        ] {
+            let request = {
+                let builder = crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal(query).unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                );
+                if let Some(role) = scope {
+                    builder.role(role)
+                } else {
+                    builder
+                }
+            }
+            .build()
+            .unwrap();
+            assert_eq!(
+                service.search(request).unwrap().hits().len(),
+                expected,
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_shell_and_other_parts_preserve_independent_input_regions() {
+        let temp = tempdir().unwrap();
+        let file = temp
+            .path()
+            .join("rollout-2026-06-25T03-04-06-019efd97-d602-7922-89dd-467272106505.jsonl");
+        let shell = "<user_shell_command>\n<command>\nmixed-command🙂\n</command>\n<result>\nExit code: 0\nDuration: 0.0000 seconds\nOutput:\nmixed-stdout🙂\n</result>\n</user_shell_command>";
+        for (shell, valid_shell) in [
+            (shell.to_owned(), true),
+            (format!("{shell}unexpected suffix"), false),
+        ] {
+            let payload = json!({"type":"response_item","payload":{
+                "type":"message","role":"user","content":[
+                    {"type":"input_text","text":"<environment_context>mixed-context-é</environment_context>"},
+                    {"type":"input_text","text":"mixed-prompt-é"},
+                    {"type":"input_text","text":shell}
+                ],
+                "internal_chat_message_metadata_passthrough":{
+                    "content_item_kinds":[null,null,"shell.user_command"],
+                    "content_item_metadata":[
+                        {"provenance":{"type":"harness"}},
+                        {"provenance":{"type":"user"}},
+                        {"provenance":{"type":"harness"}}
+                    ]
+                }
+            }});
+            let mut assistant = payload.clone();
+            assistant["payload"]["role"] = json!("assistant");
+            fs::write(&file, format!("{payload}\n{assistant}\n")).unwrap();
+            let adapter = CodexAdapter::new(vec![temp.path().to_path_buf()]);
+            let parsed = adapter.parse(&adapter.discover()[0]);
+            assert_eq!(parsed.messages.len(), 2);
+            assert_eq!(
+            parsed.messages[0].content,
+            format!("<environment_context>mixed-context-é</environment_context>\nmixed-prompt-é\n{shell}")
+        );
+            assert!(parsed.messages[0]
+                .provenance
+                .validate(&parsed.messages[0].content)
+                .is_ok());
+            let db =
+                crate::db::Db::open(&temp.path().join(format!("index-{valid_shell}.db"))).unwrap();
+            db.mark_schema_current().unwrap();
+            db.upsert_session(&parsed, 0, 0).unwrap();
+            let config = crate::config::Config::default();
+            let service = crate::service::MessageService::new(
+                &config,
+                &db,
+                crate::message_search::SearchSurface::Rust,
+            );
+            for (query, expected) in [
+                ("mixed-prompt-é", 1),
+                ("mixed-command🙂", usize::from(valid_shell)),
+                ("mixed-stdout🙂", 0),
+                ("mixed-context-é", 0),
+            ] {
+                for (scope, count) in [(Some(crate::models::Role::User), expected), (None, 2)] {
+                    let request = {
+                        let builder = crate::message_search::MessageSearchRequest::builder(
+                            crate::message_search::MessageQuery::literal(query).unwrap(),
+                            crate::message_search::MessageTarget::content(),
+                        );
+                        if let Some(role) = scope {
+                            builder.role(role)
+                        } else {
+                            builder
+                        }
+                    }
+                    .build()
+                    .unwrap();
+                    assert_eq!(
+                        service.search(request).unwrap().hits().len(),
+                        count,
+                        "{query} {scope:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shell_frame_requires_native_kind_and_rejects_malformed_typed_text() {
+        let shell = "<user_shell_command>\n<command>legacy command</command>\n<result>\nOutput:\nlegacy output\n</result>\n</user_shell_command>";
+        let legacy = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": shell}]
+        });
+        assert!(
+            codex_native_shell_command_attribution(&legacy, ContentPartAuthorship::Human).is_none()
+        );
+
+        let malformed = json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "<user_shell_command>broken"}],
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["shell.user_command"],
+                "content_item_metadata": [{"provenance": {"type": "user"}}]
+            }
+        });
+        assert!(matches!(
+            codex_native_shell_command_attribution(&malformed, ContentPartAuthorship::Human),
+            Some(CodexShellCommandAttribution::Unknown)
+        ));
+
+        let empty_command = "<user_shell_command>\n<command>\n\n</command>\n<result>\nExit code: 1\nDuration: 0.0000 seconds\nOutput:\nerror\n</result>\n</user_shell_command>";
+        let parts = codex_user_shell_command_parts(empty_command, ContentPartAuthorship::Human)
+            .expect("empty command still has a structurally valid frame");
+        assert!(parts
+            .iter()
+            .all(|part| part.origin != ContentPartOrigin::DirectInput));
+        assert!(crate::models::MessageProvenance {
+            authorship: MessageAuthorship::Mixed,
+            content_parts: parts,
+            ..Default::default()
+        }
+        .validate(empty_command)
+        .is_ok());
+    }
+
+    #[test]
+    fn delegated_native_shell_command_is_agent_input_not_root_user_input() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let shell = "<user_shell_command>\n<command>\ndelegated-command\n</command>\n<result>\nExit code: 0\nDuration: 0.0000 seconds\nOutput:\ndelegated-output\n</result>\n</user_shell_command>";
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        let records = [
+            json!({
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": "/tmp/proj",
+                    "source": r#"{"subagent":{"thread_spawn":{"parent_thread_id":"parent","agent_nickname":"worker"}}}"#
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": shell}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_kinds": ["shell.user_command"],
+                        "content_item_metadata": [{"provenance": {"type": "harness"}}]
+                    }
+                }
+            }),
+            json!({"type":"response_item","payload":{
+                "type":"message","role":"user",
+                "content":[{"type":"input_text","text":"delegated-native-user"}],
+                "internal_chat_message_metadata_passthrough":{
+                    "content_item_metadata":[{"provenance":{"type":"user"}}]
+                }
+            }}),
+        ]
+        .into_iter()
+        .map(|record| record.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&file, format!("{records}\n")).unwrap();
+        let adapter = CodexAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let delegated = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == "delegated-native-user")
+            .unwrap();
+        assert_eq!(
+            delegated.provenance.authorship,
+            MessageAuthorship::Agent,
+            "native user-role provenance does not turn a known agent delegation into root user input");
+        let message = parsed
+            .messages
+            .iter()
+            .find(|message| message.content == shell)
+            .expect("delegated shell message");
+        assert_eq!(message.provenance.authorship, MessageAuthorship::Mixed);
+        assert!(message.provenance.content_parts.iter().any(|part| {
+            part.authorship == ContentPartAuthorship::Agent
+                && part.origin == ContentPartOrigin::DirectInput
+        }));
+        let db = crate::db::Db::open(&temp.path().join("input-index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let request = crate::message_search::MessageSearchRequest::builder(
+            crate::message_search::MessageQuery::literal("delegated-command").unwrap(),
+            crate::message_search::MessageTarget::content(),
+        )
+        .role(crate::models::Role::User)
+        .build()
+        .unwrap();
+        assert!(service.search(request).unwrap().hits().is_empty());
+    }
+
+    #[test]
+    fn request_user_input_answers_are_correlated_in_question_order_once() {
+        let temp = tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        let session_id = "019efd97-d602-7922-89dd-467272106505";
+        let file = root.join(format!("rollout-2026-06-25T03-04-06-{session_id}.jsonl"));
+        fs::write(
+            &file,
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"019efd97-d602-7922-89dd-467272106505","cwd":"/tmp/proj"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","id":"fc_question","name":"request_user_input","call_id":"call_question","arguments":"{\"questions\":[{\"id\":\"q1\",\"header\":\"First\",\"question\":\"First?\"},{\"id\":\"q2\",\"header\":\"Second\",\"question\":\"Second?\"}]}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","id":"fo_question","call_id":"call_question","output":"{\"answers\":{\"q2\":{\"answers\":[\"two \\\"quoted\\\"🙂\"]},\"q1\":{\"answers\":[\"one-é\"]}}}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_question","output":"{\"answers\":{\"q1\":{\"answers\":[\"duplicate-must-not-appear\"]}}}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input_async","call_id":"call_async","arguments":"{\"questions\":[{\"id\":\"qa\",\"question\":\"Async?\"}]}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_async","output":"{\"accepted\":true}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"call_cancel","arguments":"{\"questions\":[{\"id\":\"qc\",\"question\":\"Cancel?\"}]}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_cancel","output":{"error":"request_user_input cancelled"}}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_missing","output":"{\"answers\":{\"qm\":{\"answers\":[\"missing-call-not-input\"]}}}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"lookalike","call_id":"call_lookalike","arguments":"{\"questions\":[{\"id\":\"ql\",\"question\":\"Lookalike?\"}]}"}}"#,
+                "\n",
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_lookalike","output":"{\"answers\":{\"ql\":{\"answers\":[\"not-input\"]}}}"}}"#,
+            ),
+        )
+        .unwrap();
+
+        let adapter = CodexAdapter::new(vec![root]);
+        let parsed = adapter.parse(&adapter.discover()[0]);
+        let answer = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("one-é"))
+            .expect("linked answer output");
+        assert!(answer.content.contains(r#"{"answers":{"q2""#));
+        assert!(answer.content.contains("one-é\ntwo"));
+        assert!(!answer.content.contains("duplicate-must-not-appear"));
+        assert_eq!(
+            answer.provenance.input_origin,
+            Some(MessageInputOrigin::InteractiveAnswer)
+        );
+        assert_eq!(
+            answer
+                .provenance
+                .correlation_identity
+                .as_ref()
+                .map(|identity| identity.id.as_str()),
+            Some("fo_question")
+        );
+        assert_eq!(answer.provenance.authorship, MessageAuthorship::Mixed);
+        assert_eq!(
+            answer.provenance.content_parts[0].authorship,
+            ContentPartAuthorship::Generated
+        );
+        assert_eq!(
+            answer.provenance.content_parts[1].authorship,
+            ContentPartAuthorship::Human
+        );
+        assert!(answer.provenance.validate(&answer.content).is_ok());
+
+        let async_ack = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains(r#"{"accepted":true}"#))
+            .expect("async acknowledgement preserved");
+        assert_eq!(
+            async_ack.provenance.authorship,
+            MessageAuthorship::Generated
+        );
+        assert!(async_ack.provenance.content_parts.is_empty());
+        let cancelled = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("request_user_input cancelled"))
+            .expect("cancellation output preserved");
+        assert_eq!(
+            cancelled.provenance.authorship,
+            MessageAuthorship::Generated
+        );
+        assert!(cancelled.provenance.content_parts.is_empty());
+        let missing = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("missing-call-not-input"))
+            .expect("unmatched output preserved");
+        assert_eq!(missing.provenance.authorship, MessageAuthorship::Generated);
+        assert!(missing.provenance.content_parts.is_empty());
+        let lookalike = parsed
+            .messages
+            .iter()
+            .find(|message| message.content.contains("not-input"))
+            .expect("lookalike output preserved");
+        assert_eq!(
+            lookalike.provenance.authorship,
+            MessageAuthorship::Generated
+        );
+        assert!(lookalike.provenance.content_parts.is_empty());
+        let db_path = temp.path().join("input-index.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        for (query, expected) in [("one-é", 1), ("two \"quoted\"🙂", 1), ("one-é\ntwo", 0)] {
+            let request = crate::message_search::MessageSearchRequest::builder(
+                crate::message_search::MessageQuery::literal(query).unwrap(),
+                crate::message_search::MessageTarget::content(),
+            )
+            .role(crate::models::Role::User)
+            .build()
+            .unwrap();
+            assert_eq!(
+                service.search(request).unwrap().hits().len(),
+                expected,
+                "{query}"
+            );
+        }
+        let raw = parsed.session.raw_metadata_json.unwrap();
+        assert!(raw.contains(r#""requires_full_parse_for_tail":true"#));
+    }
+
+    #[test]
+    fn spawned_request_user_input_answer_stays_out_of_user_input_scope() {
+        let temp = tempdir().unwrap();
+        let root_path = temp.path().join("rollout-root.jsonl");
+        let child_path = temp.path().join("rollout-child.jsonl");
+        let call = r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","call_id":"ask-call","arguments":"{\"questions\":[{\"id\":\"q\",\"question\":\"Proceed?\"}]}"}}"#;
+        let answer = r#"{"type":"response_item","payload":{"type":"function_call_output","id":"answer-event","call_id":"ask-call","output":"{\"answers\":{\"q\":{\"answers\":[\"same answer phrase\"]}}}"}}"#;
+        let root_records = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"root-session\"}}}}\n{call}\n{answer}\n"
+        );
+        let child_records = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"child-session\",\"source\":\"{{\\\"subagent\\\":{{\\\"thread_spawn\\\":{{\\\"parent_thread_id\\\":\\\"root-session\\\",\\\"agent_nickname\\\":\\\"worker\\\"}}}}}}\"}}}}\n{call}\n{answer}\n"
+        );
+        fs::write(&root_path, root_records).unwrap();
+        fs::write(&child_path, child_records).unwrap();
+
+        let adapter = CodexAdapter::new(Vec::new());
+        let root = adapter
+            .parse_reader(
+                std::io::Cursor::new(fs::read(&root_path).unwrap()),
+                &root_path,
+            )
+            .unwrap();
+        let child = adapter
+            .parse_reader(
+                std::io::Cursor::new(fs::read(&child_path).unwrap()),
+                &child_path,
+            )
+            .unwrap();
+        let root_answer = root
+            .messages
+            .iter()
+            .find(|message| message.content.contains("same answer phrase"))
+            .expect("root answer is retained");
+        let child_answer = child
+            .messages
+            .iter()
+            .find(|message| message.content.contains("same answer phrase"))
+            .expect("spawned answer is retained");
+        assert_eq!(
+            root_answer.provenance.input_origin,
+            Some(MessageInputOrigin::InteractiveAnswer)
+        );
+        assert!(root_answer.provenance.content_parts.iter().any(|part| {
+            part.authorship == ContentPartAuthorship::Human
+                && part.origin == ContentPartOrigin::DirectInput
+        }));
+        assert_eq!(
+            child_answer.provenance.input_origin,
+            Some(MessageInputOrigin::InteractiveAnswer)
+        );
+        assert!(child_answer.provenance.content_parts.iter().any(|part| {
+            part.authorship == ContentPartAuthorship::Agent
+                && part.origin == ContentPartOrigin::DirectInput
+        }));
+        assert!(child_answer.provenance.content_parts.iter().all(|part| {
+            part.authorship != ContentPartAuthorship::Human
+                || part.origin != ContentPartOrigin::DirectInput
+        }));
+
+        let db = crate::db::Db::open(&temp.path().join("input-index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&root, 0, 0).unwrap();
+        db.upsert_session(&child, 0, 0).unwrap();
+        let config = crate::config::Config::default();
+        let service = crate::service::MessageService::new(
+            &config,
+            &db,
+            crate::message_search::SearchSurface::Rust,
+        );
+        let request = |scope| {
+            {
+                let builder = crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal("same answer phrase").unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                );
+                if let Some(role) = scope {
+                    builder.role(role)
+                } else {
+                    builder
+                }
+            }
+            .build()
+            .unwrap()
+        };
+        assert_eq!(service.search(request(None)).unwrap().hits().len(), 2);
+        assert_eq!(
+            service
+                .search(request(Some(crate::models::Role::User)))
+                .unwrap()
+                .hits()
+                .len(),
+            1,
+            "the known spawned-session answer must not satisfy restricted input search"
+        );
+    }
+
+    #[test]
+    fn subagent_notification_marker_is_not_user_input() {
+        assert!(super::is_codex_subagent_notification(
+            "<subagent_notification>\n{\"status\":\"done\"}\n</subagent_notification>"
+        ));
+        assert!(!super::is_codex_subagent_notification(
+            "please explain <subagent_notification> in this prompt"
+        ));
+    }
+
+    #[test]
+    fn fork_replay_edits_are_counted_only_without_an_indexed_parent_copy() {
+        let parent = "019f4a0e-d714-7cc3-8003-543a04a1a822";
+        let own = "019f5ce8-afff-76a3-86f2-174307f3fa08";
+        for (parent_present, fork_parent) in [(true, parent), (false, parent), (false, own)] {
+            let dir = tempdir().unwrap();
+            let parent_path = dir.path().join(format!("rollout-{parent}.jsonl"));
+            let path = dir.path().join(format!("rollout-{own}.jsonl"));
+            let mutation = |id: &str, name: &str| {
+                [
+                    json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":id,"name":"apply_patch","input":format!("*** Begin Patch\n*** Add File: /p/{name}\n+content\n*** End Patch")}}),
+                    json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":id,"output":format!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /p/{name}\n")}}),
+                ]
+            };
+            let parent_records = mutation("parent-call", "parent.rs");
+            if parent_present {
+                let mut rows = vec![json!({"type":"session_meta","payload":{"id":parent}})];
+                rows.extend(parent_records.clone());
+                fs::write(
+                    &parent_path,
+                    rows.into_iter()
+                        .map(|r| r.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+                .unwrap();
+            }
+            let mut rows = vec![
+                json!({"type":"session_meta","payload":{"id":own,"forked_from_id":fork_parent}}),
+            ];
+            rows.extend(parent_records);
+            rows.push(json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}));
+            rows.extend(mutation("fork-call", "fork.rs"));
+            fs::write(
+                &path,
+                rows.into_iter()
+                    .map(|r| r.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+            let adapter = CodexAdapter::new(vec![dir.path().to_path_buf()]);
+            let source = adapter
+                .discover()
+                .into_iter()
+                .find(|source| source.path == path)
+                .unwrap();
+            let parsed = adapter.parse(&source);
+            let names: Vec<_> = parsed
+                .file_edits
+                .iter()
+                .map(|edit| edit.file_name.as_str())
+                .collect();
+            assert_eq!(names, vec!["fork.rs"]);
+            assert_eq!(parsed.retracted.file_edits.len(), 1);
+            let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+            if parent_present {
+                let parent_source = adapter
+                    .discover()
+                    .into_iter()
+                    .find(|source| source.path == parent_path)
+                    .unwrap();
+                db.upsert_session(&adapter.parse(&parent_source), 1, 1)
+                    .unwrap();
+            }
+            let mut old = parsed.clone();
+            old.session.parse_version = "codex-v11".into();
+            old.file_edits.extend(parsed.retracted.file_edits.clone());
+            old.retracted.file_edits.clear();
+            old.file_edits.sort_by_key(|edit| edit.seq);
+            db.upsert_session(&old, 1, 1).unwrap();
+            db.upsert_session(&parsed, 1, 1).unwrap();
+            assert_eq!(db.file_edit_count().unwrap(), 2);
+        }
     }
 
     #[test]
@@ -1362,7 +3043,6 @@ mod tests {
             parsed.session.parse_version,
             crate::util::provider_parse_version(Provider::Codex)
         );
-        assert_eq!(parsed.session.parse_version, "codex-v5");
         let raw = parsed.session.raw_metadata_json.as_deref().unwrap();
         assert!(raw.contains(r#""model":"gpt-test""#));
         assert!(raw.contains(r#""git_branch":"feat/x""#));
@@ -1445,9 +3125,7 @@ mod tests {
         assert_ne!(prose.kind, crate::models::MessageKind::HarnessNotice);
     }
 
-    /// Codex records a spawn as a JSON *string* under `source`, and has done all along; the
-    /// parent thread and agent nickname were present but unreachable inside that blob. Lifting
-    /// them into the typed fields is what makes "every subagent of this session" a query.
+    /// Native source objects and encoded SQLite values preserve the same spawn identity.
     #[test]
     fn codex_spawn_origin_is_read_from_the_source_payload() {
         let spawn = json!({
@@ -1463,6 +3141,33 @@ mod tests {
                 Some("McClintock".to_string())
             )
         );
+        let native_object = json!({
+            "source": {
+                "subagent": {
+                    "thread_spawn": {
+                        "parent_thread_id": "019f6287-88d4-71a0-a523-6f66568e4a3b",
+                        "agent_nickname": "McClintock"
+                    }
+                }
+            }
+        });
+        assert_eq!(
+            codex_spawn_origin(&native_object),
+            codex_spawn_origin(&spawn)
+        );
+
+        for label in ["review", "compact", "memory_consolidation"] {
+            let source = json!({"subagent":label});
+            for value in [
+                source.clone(),
+                serde_json::Value::String(source.to_string()),
+            ] {
+                assert_eq!(
+                    codex_spawn_origin(&json!({"source":value})),
+                    (None, Some(label.into()))
+                );
+            }
+        }
 
         // A spawn with no parent recorded still marks the session as agent-started.
         let other = json!({ "source": r#"{"subagent":{"other":"guardian"}}"# });

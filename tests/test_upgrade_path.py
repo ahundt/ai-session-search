@@ -17,6 +17,51 @@ from scripts import verify_upgrade_path
 from scripts.verify_upgrade_path import problems_in_status
 
 
+@pytest.mark.skipif(os.name == "nt", reason="the documented downgrade uses bash")
+@pytest.mark.parametrize("obstacle", ["archive", "wal_archive", "directory", "move_failure", "none"])
+def test_documented_downgrade_preserves_every_archive_byte(tmp_path: Path, obstacle: str) -> None:
+    database = tmp_path / "index.db"
+    originals = {path: path.name.encode() for path in verify_upgrade_path._index_files(database)}
+    for path, content in originals.items():
+        path.write_bytes(content)
+    backup = database.with_name(database.name + ".from-1.1.0")
+    sentinels = {}
+    if obstacle in {"archive", "wal_archive"}:
+        # Both the former flat archives and the directory recipe must remain untouched.
+        path = backup if obstacle == "archive" else Path(str(database) + "-wal.from-1.1.0")
+        path.write_bytes(b"retained history")
+        sentinels[path] = path.read_bytes()
+    if obstacle == "directory":
+        backup.mkdir()
+        path = backup / database.name
+        path.write_bytes(b"retained history")
+        sentinels[path] = path.read_bytes()
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    aise = commands / "aise"
+    aise.write_text('#!/bin/sh\nprintf \'{"database":"%s"}\\n\' "$AI_SESSION_SEARCH_DATABASE"\n')
+    aise.chmod(0o755)
+    if obstacle == "move_failure":
+        move = commands / "mv"
+        move.write_text('#!/bin/sh\ncase "$1" in *-wal) exit 42;; esac\nexec /bin/mv "$@"\n')
+        move.chmod(0o755)
+    environment = verify_upgrade_path._environment(tmp_path / "home", commands)
+    environment["AI_SESSION_SEARCH_DATABASE"] = str(database)
+    result = verify_upgrade_path._move_index_as_documented(aise, environment, database)
+    for path, content in sentinels.items():
+        assert path.read_bytes() == content
+    assert isinstance(result, dict) == (obstacle == "none"), result
+    if isinstance(result, dict):
+        assert result == {path: backup / path.name for path in originals}
+    for path, content in originals.items():
+        retained = backup / path.name
+        assert (path.exists() and path.read_bytes() == content) or (retained.exists() and retained.read_bytes() == content)
+    if obstacle in {"archive", "wal_archive", "directory"}:
+        assert all(path.read_bytes() == content for path, content in originals.items())
+    if obstacle == "move_failure":
+        assert Path(str(database) + "-shm").read_bytes() == originals[Path(str(database) + "-shm")]
+
+
 @pytest.mark.skipif(os.name == "nt", reason="historical upgrades require a disposable Windows profile")
 def test_upgrade_command_terminates_and_waits_for_background_children(tmp_path: Path) -> None:
     stopped = tmp_path / "stopped"
@@ -56,6 +101,7 @@ def test_upgrade_root_cleanup_depends_on_child_shutdown(tmp_path: Path, monkeypa
         raise error("test failure")
 
     monkeypatch.setattr(verify_upgrade_path, "_run", fail)
+    monkeypatch.setattr(verify_upgrade_path, "check_populated_upgrade", lambda *_: [])
     try:
         with pytest.raises(verify_upgrade_path.UpgradeCheckUnavailable) as caught:
             verify_upgrade_path.check_upgrade("1.0.1", tmp_path / "aise")
@@ -185,3 +231,55 @@ def test_archive_fixture_checks_shrink_rewrite_edits_and_injected_rows() -> None
         assert verify_upgrade_path.archive_evidence(database) == {
             "shrink": True, "rewrite": True, "file_edits": True, "injected_rows": True,
         }
+
+
+@pytest.mark.parametrize("mutation", [
+    "update messages set input_origin='queued' where id=(select min(id) from messages)",
+    "update messages set seq=seq+10 where id=(select min(id) from messages)",
+    "update messages set content='different' where id=(select min(id) from messages)",
+    "update file_edits set new_content='different'",
+    "update file_edits set seq=seq+10",
+    "update transcripts set transcript_text='different'",
+])
+def test_populated_comparison_detects_content_order_edits_text_and_provenance(
+    tmp_path: Path, mutation: str,
+) -> None:
+    import sqlite3
+
+    database = tmp_path / "index.db"
+    fixture = verify_upgrade_path.UPGRADE_FIXTURES / "v1_0_0_populated.sql"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(fixture.read_text())
+        connection.executescript("alter table messages add column input_origin text; "
+                                 "alter table messages add column input_delivery_state text;")
+    expected = verify_upgrade_path.populated_index_snapshot(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(mutation)
+    assert verify_upgrade_path.populated_index_snapshot(database) != expected
+
+
+def test_populated_sources_include_queue_removal_replay_and_repeated_text(tmp_path: Path) -> None:
+    verify_upgrade_path.write_upgrade_sources(tmp_path)
+    records = [json.loads(line) for line in (tmp_path / "claude/queue.jsonl").read_text().splitlines()]
+    enqueues = [r["content"] for r in records if r.get("operation") == "enqueue"]
+    assert len(enqueues) > len(set(enqueues))
+    assert any(r.get("operation") == "remove" for r in records)
+    assert len([r for r in records if r.get("uuid") == "repeated-delivery"]) == 2
+
+
+def test_populated_comparison_counts_duplicate_messages_outside_seed_sessions(tmp_path: Path) -> None:
+    import sqlite3
+
+    database = tmp_path / "index.db"
+    with sqlite3.connect(database) as connection:
+        connection.executescript((verify_upgrade_path.UPGRADE_FIXTURES / "v1_0_0_populated.sql").read_text())
+        connection.executescript("alter table messages add column input_origin text; "
+                                "alter table messages add column input_delivery_state text;")
+        connection.execute("insert into messages(session_id,provider,seq,role,kind,content) "
+                           "values ('claude:additional','claude',0,'user','harness_notice','<task-notification>synthetic</task-notification>')")
+    expected = verify_upgrade_path.populated_index_snapshot(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute("insert into messages(session_id,provider,seq,role,kind,content) "
+                           "select session_id,provider,seq,role,kind,content from messages where session_id='claude:additional'")
+    observed = verify_upgrade_path.populated_index_snapshot(database)
+    assert observed["messages"] != expected["messages"]

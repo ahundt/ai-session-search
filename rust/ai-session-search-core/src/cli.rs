@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, IsTerminal, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -17,7 +17,7 @@ use crate::dates::DateRange;
 use crate::db::Db;
 use crate::durable_fs::{atomic_write_file, AtomicWriteMode};
 use crate::indexer;
-use crate::inspect::{inspection_rows, InspectionOptions};
+use crate::inspect::InspectionOptions;
 use crate::migration::{
     import_legacy_config, load_receipt, migrate_database, publish_imported_config,
     recover_database_migration, verify_migration, ConfigPublishOptions, DatabaseMigrationOptions,
@@ -30,10 +30,10 @@ use crate::service::SessionSearch;
 use crate::tui;
 use crate::util::{
     current_repo, highlight_matches, prompt_confirm, relative_age, render_posix_shell_command,
-    resume_plan, select_transcript_lines, truncate_for_display,
+    truncate_for_display,
 };
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use serde::Serialize;
 
 /// Help section shared by the root-level flags.
@@ -54,7 +54,7 @@ const GLOBAL_OPTIONS_HEADING: &str =
 const ROOT_COMMAND_GROUPS: &str = "\
 Start here (everyday):   search, messages, show, list, resume, files
 Export and maintenance:  export, reindex, doctor, integrations, package, config, dates
-Analytics:               stats, repeats, vocab, planning, analyze, skills
+Analytics:               stats, repeats, slash-commands, analyze, skills
 Expert:                  db, migrate, compact, mcp, tui
 
 Typical path: `aise search \"<topic>\" --when 30d` or `aise list --path <dir> --when 7d` to find a
@@ -96,6 +96,23 @@ struct Cli {
     skip_release_notification: bool,
     #[command(subcommand)]
     command: Commands,
+    /// Subcommand names below `aise`, as parsed; `parse_cli_from` fills it from clap's matches
+    /// so `validate_root_options` and the help read one table keyed by the same path.
+    #[arg(skip)]
+    command_path: Vec<String>,
+}
+
+/// Recognize a registration's launch arguments without resolving configuration or running it.
+pub(crate) fn is_mcp_serve_arguments(args: &[&str]) -> bool {
+    args.iter().all(|arg| !arg.is_empty())
+        && Cli::try_parse_from(std::iter::once("aise").chain(args.iter().copied())).is_ok_and(
+            |cli| {
+                matches!(
+                    cli.command,
+                    Commands::Mcp(crate::integrations::McpCmd::Serve)
+                )
+            },
+        )
 }
 
 #[derive(Debug, Subcommand)]
@@ -107,9 +124,10 @@ enum Commands {
     /// Use `aise doctor` to see what is already indexed or diagnose indexing failures.
     #[command(display_order = 21)]
     Reindex(ReindexArgs),
-    /// Reclaim disk space: merge FTS segments, `VACUUM`, then truncate the WAL.
+    /// Reclaim disk space: rebuild full-text indexes, `VACUUM`, then truncate the WAL.
     ///
-    /// Use `aise doctor` first to see whether the index is large enough to be worth compacting.
+    /// Scans and rewrites the whole index under the writer lock; allow up to twice its size in
+    /// temporary disk space. Use `aise doctor` first to inspect storage.
     #[command(display_order = 42)]
     Compact,
     /// List recent sessions, optionally intersecting their known spans with a date period.
@@ -124,7 +142,7 @@ enum Commands {
     /// The span can contain gaps and is not continuous runtime.
     #[command(
         display_order = 10,
-        after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY` or select `--query-mode regex|fuzzy`."
+        after_help = "For turn-level literal, regex, or fuzzy content search, use `aise messages search QUERY`; select `--query-mode regex|fuzzy` there."
     )]
     Search(SearchArgs),
     /// Print one session's transcript and metadata (bounded by default).
@@ -144,8 +162,8 @@ enum Commands {
     /// Search and read individual messages: conversation turns and tool evidence (search|get|timeline|evidence).
     #[command(display_order = 11, subcommand)]
     Messages(crate::messages::MessagesCmd),
-    /// Aggregate slash-command usage frequency.
-    #[command(display_order = 33)]
+    /// Aggregate slash-command usage frequency. `planning` is a deprecated alias.
+    #[command(name = "slash-commands", alias = "planning", display_order = 33)]
     Planning(crate::analytics::PlanningArgs),
     /// Analyze indexed sessions with an optional validated JSON policy and publish one immutable bundle.
     #[command(display_order = 34)]
@@ -169,7 +187,7 @@ enum Commands {
     /// This counts the index itself, so unlike `aise stats` it counts every indexed message,
     /// harness notices included: hook and tool wording ranks here beside what people and models
     /// wrote. It reports how often, never which messages — `aise messages search` returns those.
-    #[command(display_order = 32)]
+    #[command(display_order = 32, hide = true)]
     Vocab(crate::analytics::VocabArgs),
     /// Find recurring phrases in what people wrote.
     ///
@@ -230,6 +248,29 @@ enum RootOption {
 }
 
 impl RootOption {
+    const ALL: [Self; 7] = [
+        Self::ConfigFile,
+        Self::Database,
+        Self::CacheDirectory,
+        Self::WorkerThreads,
+        Self::IndexRefresh,
+        Self::ReleaseNotification,
+        Self::HarnessHome,
+    ];
+
+    /// Clap argument id: the `Cli` field name.
+    fn id(self) -> &'static str {
+        match self {
+            Self::ConfigFile => "config",
+            Self::Database => "database",
+            Self::CacheDirectory => "cache_dir",
+            Self::HarnessHome => "harness_home",
+            Self::WorkerThreads => "threads",
+            Self::IndexRefresh => "index_refresh",
+            Self::ReleaseNotification => "skip_release_notification",
+        }
+    }
+
     fn flag(self) -> &'static str {
         match self {
             Self::ConfigFile => "--config",
@@ -448,7 +489,7 @@ struct SessionFilterArgs {
     /// Restrict to one indexed session source; omit to include all nine.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
     provider: Option<Provider>,
-    /// Restrict to sessions whose cwd or repo root is this directory or a descendant of it
+    /// Restrict to sessions whose cwd, repo root, or transcript path is this directory or a descendant of it
     /// (a component boundary: `project` matches `project/src`, never `project-other`).
     /// Omit to search every allowed root.
     #[arg(help_heading = SESSION_FILTER_HEADING, long)]
@@ -682,13 +723,16 @@ struct ShowArgs {
     /// Omit to use `[cli].show_transcript_lines` from config.
     #[arg(long, allow_hyphen_values = true)]
     transcript_lines: Option<i64>,
-    /// Print a compact session summary: purpose, tool activity, refs, changed files, and follow-ups.
+    /// Deprecated: use aise messages evidence ID.
+    /// Print compact purpose, tool activity, refs, changed files, and follow-ups.
     #[arg(long, conflicts_with_all = ["transcript_lines", "raw"])]
     summary: bool,
+    /// Deprecated: use aise messages evidence ID --summary-items N.
     /// With --summary, select aggregate evidence records: positive=first, negative=last, 0=all.
     /// Omit to use [cli].summary_items from config.
     #[arg(long, allow_hyphen_values = true, requires = "summary")]
     summary_items: Option<i64>,
+    /// Deprecated: use aise messages evidence ID --preview-chars N.
     /// With --summary, cap each evidence preview to this many characters (1 or greater).
     /// Omit to use [cli].evidence_preview_chars from config.
     #[arg(long, requires = "summary", value_parser = parse_positive_usize)]
@@ -696,16 +740,21 @@ struct ShowArgs {
     /// Print the raw stored transcript text instead of the formatted view.
     #[arg(long)]
     raw: bool,
+    /// Output format. Table (default) keeps the transcript view; JSON/JSONL include text,
+    /// normalized session metadata and line-window extent. CSV/plain emit one transcript row.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table, conflicts_with = "raw")]
+    format: OutputFormat,
 }
 
 #[derive(Debug, Args)]
 struct ResumeArgs {
     /// Session id or unambiguous id prefix to resume.
     id: String,
-    /// Skip the confirmation prompt and run the resume command immediately.
+    /// Skip confirmation and run the resume command when stdin and stdout are terminals.
     #[arg(long)]
     yes: bool,
     /// Print a POSIX-shell rendering of the resume arguments without running them.
+    /// This is also the default when stdin or stdout is not a terminal.
     #[arg(long)]
     dry_run: bool,
 }
@@ -760,7 +809,7 @@ enum ConfigCmd {
     ///
     /// Use `aise config show` for the values themselves, or `aise config paths` for the files consulted.
     Origins,
-    /// Print resolved config, state, search-scope, and session-source paths.
+    /// Print resolved config, state, search-scope, and provider-source paths.
     ///
     /// Use `aise config file` for the active configuration path, or `aise doctor` when one is unreadable.
     Paths(ReportArgs),
@@ -836,7 +885,8 @@ where
     let Some(program) = args.next() else {
         return Cli::try_parse_from(std::iter::empty::<OsString>());
     };
-    let globals = Cli::command()
+    let grammar = Cli::command();
+    let globals = grammar
         .get_arguments()
         .filter(|argument| argument.is_global_set())
         .filter_map(|argument| {
@@ -849,13 +899,27 @@ where
     let mut global_tokens = Vec::new();
     let mut command_tokens = Vec::with_capacity(remaining.len());
     let mut index = 0;
+    let mut command = &grammar;
     while index < remaining.len() {
         let token = &remaining[index];
+        if let Some(child) = token
+            .to_str()
+            .and_then(|name| command.find_subcommand(name))
+        {
+            command = child;
+        }
         let global = token.to_str().and_then(|token| {
             token
                 .strip_prefix("--")
                 .map(|long| long.split_once('=').map_or(long, |(name, _)| name))
                 .and_then(|name| globals.get(name).map(|takes_value| (name, *takes_value)))
+                .filter(|(name, _)| {
+                    // A command-local spelling owns its value. Hoisting it would leave the
+                    // local required argument empty.
+                    !command.get_arguments().any(|argument| {
+                        argument.get_long() == Some(*name) && !argument.is_global_set()
+                    })
+                })
         });
         match global {
             Some((_name, takes_value)) => {
@@ -877,27 +941,140 @@ where
         .chain(global_tokens)
         .chain(command_tokens.iter().cloned())
         .collect::<Vec<_>>();
-    Cli::try_parse_from(&normalized)
-        .map_err(|error| clarify_stale_message_argument(error, &command_tokens))
+    let mut command = cli_command();
+    let mut matches = command
+        .try_get_matches_from_mut(&normalized)
+        .map_err(|error| clarify_mistaken_argument(error, &command_tokens))?;
+    let mut command_path = Vec::new();
+    let mut level = &matches;
+    while let Some((name, child)) = level.subcommand() {
+        command_path.push(name.to_string());
+        level = child;
+    }
+    let mut cli =
+        Cli::from_arg_matches_mut(&mut matches).map_err(|error| error.format(&mut command))?;
+    cli.command_path = command_path;
+    if command_tokens
+        .first()
+        .is_some_and(|token| token == "planning")
+    {
+        eprintln!("aise: planning is deprecated; use slash-commands");
+    }
+    if command_tokens
+        .first()
+        .is_some_and(|token| token == "repeats")
+        && command_tokens
+            .iter()
+            .skip(1)
+            .take_while(|token| *token != "--")
+            .any(|token| {
+                token
+                    .to_str()
+                    .is_some_and(|text| text == "--limit" || text.starts_with("--limit="))
+            })
+    {
+        eprintln!("aise: repeats --limit is deprecated; use --max-candidates to bound examined messages, or --max-groups to bound output");
+    }
+    Ok(cli)
 }
 
-/// Replace Clap's edit-distance guess only for removed message-search arguments whose meaning is
-/// known. The stale names remain rejected: accepting aliases would silently preserve old scope
-/// semantics. `command_tokens` are the arguments after the hoisted globals, so a leading
-/// `--index-refresh` does not hide the subcommand; the offending flag comes from the error's own
-/// `InvalidArg` context, so `--project=/x` is recognized too, and the usage line is replaced with
-/// the subcommand's real usage rather than the one clap built around its guess. O(A) over the
-/// argument vector with O(1) extra state.
-fn clarify_stale_message_argument(
-    mut error: clap::Error,
-    command_tokens: &[OsString],
-) -> clap::Error {
+/// An argument name that a command rejects but whose intended meaning is known.
+struct MistakenArgument {
+    /// Subcommand path below `aise` that rejects the name.
+    command: &'static [&'static str],
+    /// The rejected long flag, as typed.
+    name: &'static str,
+    /// What to type instead; rendered as clap's "a similar argument exists" tip.
+    replacement: &'static str,
+    /// A further tip line, or "" for none.
+    note: &'static str,
+}
+
+/// Mistaken argument names and what replaces each. They stay rejected: accepting aliases would
+/// silently preserve old or different semantics (`--path` on `aise search` scopes sessions, so the
+/// same spelling on a message command would mean two things).
+///
+/// Two shapes of rename, neither reachable through clap's edit distance. A scope rename maps name
+/// to name, where clap either guesses a near-miss with the wrong meaning (`--project` guesses
+/// `--role`) or guesses nothing (`--type`, `--path`). A mode rename maps a bare flag to a flag AND
+/// a value, so no single argument name is close enough and clap offers nothing at all. Removing any
+/// row restores that build's behavior, which the tests cover in both directions.
+const MISTAKEN_ARGUMENTS: &[MistakenArgument] = &[
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--project",
+        replacement: "--workspace-path",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--path",
+        replacement: "--workspace-path",
+        note: "--path is the session-level filter of `aise search` and `aise list`",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--type",
+        replacement: "--role",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--regex",
+        replacement: "--query-mode regex",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--fuzzy",
+        replacement: "--query-mode fuzzy",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["messages", "search"],
+        name: "--explain",
+        replacement: "--receipt-level summary",
+        note: "",
+    },
+    MistakenArgument {
+        command: &["show"],
+        name: "--tail",
+        replacement: "--transcript-lines -N",
+        note: SHOW_TRANSCRIPT_LINES_SIGN_RULE,
+    },
+    MistakenArgument {
+        command: &["show"],
+        name: "--last",
+        replacement: "--transcript-lines -N",
+        note: SHOW_TRANSCRIPT_LINES_SIGN_RULE,
+    },
+    MistakenArgument {
+        command: &["show"],
+        name: "--head",
+        replacement: "--transcript-lines N",
+        note: SHOW_TRANSCRIPT_LINES_SIGN_RULE,
+    },
+    MistakenArgument {
+        command: &["show"],
+        name: "--max-lines",
+        replacement: "--transcript-lines N",
+        note: SHOW_TRANSCRIPT_LINES_SIGN_RULE,
+    },
+];
+
+const SHOW_TRANSCRIPT_LINES_SIGN_RULE: &str = "--transcript-lines N prints the first N lines, \
+     --transcript-lines -N the last N, and --transcript-lines 0 the whole transcript";
+
+/// Replace Clap's edit-distance guess for a [`MISTAKEN_ARGUMENTS`] row. `command_tokens` are the
+/// arguments after the hoisted globals, so a leading `--index-refresh` does not hide the
+/// subcommand; the offending flag comes from the error's own `InvalidArg` context, so
+/// `--project=/x` is recognized too, and the usage line is replaced with the subcommand's real
+/// usage rather than the one clap built around its guess. O(A + R) over the argument vector and
+/// the table.
+fn clarify_mistaken_argument(mut error: clap::Error, command_tokens: &[OsString]) -> clap::Error {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
 
-    if error.kind() != ErrorKind::UnknownArgument
-        || command_tokens.first().and_then(|value| value.to_str()) != Some("messages")
-        || command_tokens.get(1).and_then(|value| value.to_str()) != Some("search")
-    {
+    if error.kind() != ErrorKind::UnknownArgument {
         return error;
     }
     let invalid = match error.get(ContextKind::InvalidArg) {
@@ -907,46 +1084,47 @@ fn clarify_stale_message_argument(
     let stale = invalid
         .split_once('=')
         .map_or(invalid.as_str(), |(name, _)| name);
-    // Two shapes of rename, neither reachable through clap's edit distance. A scope rename maps name
-    // to name, where clap either guesses a near-miss with the wrong meaning — `--project` guesses
-    // `--role`, the defect this table was built for — or, as with `--type`, guesses nothing. A mode
-    // rename maps a bare flag to a flag AND a value, so no single argument name is close enough and
-    // clap offers nothing at all. Removing any row below restores that build's behavior, which the
-    // tests cover in both directions.
-    let replacement = match stale {
-        "--project" => "--workspace-path",
-        "--type" => "--role",
-        "--regex" => "--query-mode regex",
-        "--fuzzy" => "--query-mode fuzzy",
-        "--explain" => "--receipt-level summary",
-        _ => return error,
+    let Some(row) = MISTAKEN_ARGUMENTS.iter().find(|row| {
+        row.name == stale
+            && command_tokens.len() >= row.command.len()
+            && row
+                .command
+                .iter()
+                .zip(command_tokens)
+                .all(|(name, token)| token.to_str() == Some(name))
+    }) else {
+        return error;
     };
     error.insert(
         ContextKind::SuggestedArg,
-        ContextValue::String(replacement.to_string()),
+        ContextValue::String(row.replacement.to_string()),
     );
     // clap adds `to pass '--type' as a value, use '-- --type'` whenever it has no suggestion of its
-    // own, which is every mode rename plus `--type`. Searching for the literal text `--type` is
-    // never what someone who typed a retired flag meant, so that tip competes with the answer this
-    // table just supplied. Clearing it is also what makes all five renames render alike: `--project`
-    // never showed the tip, because clap did have a guess there — the wrong one.
+    // own. Searching for the literal text `--type` is never what someone who typed a retired flag
+    // meant, so that tip competes with the answer this table just supplied; the row's own note, if
+    // any, takes its place.
     //
-    // This clears a whole context slot, and for an unknown argument clap fills that slot with one of
-    // exactly two things: the pass-as-value tip above, or `'<subcommand> <flag>' exists` when the
+    // This replaces a whole context slot, and for an unknown argument clap fills that slot with one
+    // of exactly two things: the pass-as-value tip above, or `'<subcommand> <flag>' exists` when the
     // flag belongs to a child command. Only the first is reachable here, because clap looks for that
-    // second case among the current command's children and `messages search` has none — an invariant
-    // `message_search_has_no_subcommands_so_clearing_the_suggestion_slot_drops_only_the_value_tip`
+    // second case among the current command's children and no command in the table has any, an
+    // invariant `mistaken_argument_commands_have_no_subcommands_so_the_suggestion_slot_holds_only_the_value_tip`
     // holds, so adding a child command fails there rather than silently deleting its suggestion.
-    error.insert(ContextKind::Suggested, ContextValue::None);
+    let note = if row.note.is_empty() {
+        ContextValue::None
+    } else {
+        ContextValue::StyledStrs(vec![row.note.into()])
+    };
+    error.insert(ContextKind::Suggested, note);
     // `build()` propagates the binary-name chain, so the usage reads `aise messages search ...`
     // rather than the bare `search ...` an unbuilt subcommand renders.
     let mut root = Cli::command();
     root.build();
-    if let Some(usage) = root
-        .find_subcommand_mut("messages")
-        .and_then(|messages| messages.find_subcommand_mut("search"))
-        .map(clap::Command::render_usage)
-    {
+    let mut command = Some(&mut root);
+    for name in row.command {
+        command = command.and_then(|parent| parent.find_subcommand_mut(name));
+    }
+    if let Some(usage) = command.map(|command| command.render_usage()) {
         error.insert(ContextKind::Usage, ContextValue::StyledStr(usage));
     }
     error
@@ -992,7 +1170,9 @@ fn execute(cli: Cli) -> Result<()> {
         cache_dir: cli.cache_dir,
         threads: cli.threads,
         index_refresh: cli.index_refresh,
-    };
+        ..ConfigOverrides::default()
+    }
+    .set_by_command_line();
     // Whatever the user runs first after an upgrade, including `aise integrations status` and
     // `aise mcp serve`, finds the installed skill already current. Commands that write
     // integrations or move state themselves are left to do exactly what was asked. A config
@@ -1134,12 +1314,7 @@ fn execute(cli: Cli) -> Result<()> {
         if matches!(&cmd, crate::sql_query::DbCmd::Query(_)) {
             crate::search_scope::ensure_raw_sql_allowed(&config.search.scope, "aise db query")?;
         }
-        return crate::sql_query::run(
-            &config.db_path(),
-            config.index.busy_timeout_ms,
-            &config.db,
-            cmd,
-        );
+        return crate::sql_query::run_command(&crate::service::SqlService::new(&config), cmd);
     }
     if let Commands::Config(cmd) = command {
         return run_config_cmd(&resolved, cmd);
@@ -1178,6 +1353,9 @@ fn execute(cli: Cli) -> Result<()> {
     };
     // Terminal frontend: report library progress (e.g. the one-time lazy index build) to stderr.
     app.set_progress_reporter(|message| eprintln!("aise: {message}"));
+    // The command line applies the refresh policy below and prints an empty result when another
+    // process is still writing the first index.
+    app.serve_unrefreshed_index_as_empty();
     let db = app.database();
 
     // Repair an unusable schema before a read. A usable index is served immediately; `auto`
@@ -1256,6 +1434,7 @@ fn execute(cli: Cli) -> Result<()> {
         }
         Commands::Show(args) => {
             if args.summary {
+                eprintln!("aise: show --summary/--summary-items/--preview-chars are deprecated; use aise messages evidence ID with --summary-items/--preview-chars");
                 let options = InspectionOptions {
                     preview_chars: args
                         .preview_chars
@@ -1267,7 +1446,7 @@ fn execute(cli: Cli) -> Result<()> {
                     include_time_profile: false,
                 };
                 let inspection = app.catalog().inspect(&args.id, options)?;
-                render_rows(&inspection_rows(&inspection, options), OutputFormat::Table)?;
+                crate::messages::emit_inspection(&inspection, options, args.format)?;
                 schedule_auto_refresh_after_output(
                     &config,
                     db,
@@ -1276,23 +1455,39 @@ fn execute(cli: Cli) -> Result<()> {
                 );
                 return Ok(());
             }
-            let session = db.resolve_session(&args.id)?;
-            print_session_detail(&session.session);
-            let transcript_lines = args
-                .transcript_lines
-                .unwrap_or(config.cli.show_transcript_lines);
-            let (transcript, returned_lines) =
-                select_transcript_lines(&session.transcript_text, transcript_lines);
-            if args.raw {
-                println!("\n{transcript}");
+            let window = app.catalog().transcript(
+                &args.id,
+                args.transcript_lines
+                    .unwrap_or(config.cli.show_transcript_lines),
+            )?;
+            if args.format == OutputFormat::Table {
+                print_session_detail(&window.session);
+                let (transcript, returned_lines) = (window.text, window.lines_label);
+                if args.raw {
+                    println!("\n{transcript}");
+                } else {
+                    println!("\nTranscript lines returned: {returned_lines}");
+                    println!("\nTranscript\n{transcript}\n");
+                }
             } else {
-                println!("\nTranscript lines returned: {returned_lines}");
-                println!("\nTranscript\n{transcript}\n");
+                let mut record = serde_json::to_value(&window)?;
+                if let Some(session) = record["session"].as_object_mut() {
+                    session.remove("raw_metadata_json");
+                }
+                crate::render::render_record(
+                    &record,
+                    std::slice::from_ref(&window),
+                    args.format,
+                    &mut io::stdout().lock(),
+                )?;
             }
         }
         Commands::Resume(args) => {
-            let session = db.resolve_session_record(&args.id)?;
-            let (cmd, cwd) = resume_plan(&session)?;
+            let plan = app.catalog().resume_command(&args.id)?;
+            let (cmd, cwd) = match plan.argv {
+                Some(argv) => (argv, plan.cwd),
+                None => bail!("{}", plan.unavailable_reason.unwrap_or_default()),
+            };
             let rendered = render_posix_shell_command(&cmd)?;
             println!("POSIX shell resume command: {rendered}");
             println!("{}", crate::util::RESUME_COMMAND_POLICY_NOTE);
@@ -1300,7 +1495,7 @@ fn execute(cli: Cli) -> Result<()> {
                 println!("cwd: {cwd}");
             }
             schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
-            if args.dry_run {
+            if args.dry_run || !io::stdout().is_terminal() || !io::stdin().is_terminal() {
                 return Ok(());
             }
             if !args.yes && !prompt_confirm("Execute resume command?")? {
@@ -1341,8 +1536,8 @@ fn execute(cli: Cli) -> Result<()> {
                 {
                     return Err(anyhow!(
                         "aise export {id} does not accept corpus filters, --limit, or \
-                         --output-dir (those apply to multi-session export); drop --id to \
-                         export a filtered corpus, or drop --limit/--output-dir/filters to \
+                         --output-dir (those apply to multi-session export); omit the session ID \
+                         to export a filtered corpus, or drop --limit/--output-dir/filters to \
                          export just {id}"
                     ));
                 }
@@ -1376,7 +1571,7 @@ fn execute(cli: Cli) -> Result<()> {
                 );
             }
         }
-        Commands::Messages(cmd) => crate::messages::run(db, &cmd, &config)?,
+        Commands::Messages(cmd) => crate::messages::run_command(db, &cmd, &config)?,
         Commands::Planning(args) => crate::analytics::run_planning(db, &config, &args)?,
         Commands::Analyze(args) => {
             let filters = build_filters(&args.filters, 0)?;
@@ -1420,13 +1615,13 @@ fn execute(cli: Cli) -> Result<()> {
             );
         }
         Commands::Stats(args) => crate::analytics::run_stats(db, &config, &args)?,
-        Commands::Vocab(args) => crate::analytics::run_vocab(db, &config.analytics, &args)?,
-        Commands::Repeats(args) => crate::analytics::run_repeats(db, &config.analytics, &args)?,
-        Commands::Files(cmd) => crate::files::run(db, &cmd)?,
+        Commands::Vocab(args) => crate::analytics::run_vocab(db, &config, &args)?,
+        Commands::Repeats(args) => crate::analytics::run_repeats(db, &config, &args)?,
+        Commands::Files(cmd) => crate::files::run_command(db, &cmd)?,
         Commands::Compact => {
             let before = db.storage_allocation()?.total_bytes;
             eprintln!(
-                "aise: compacting index ({}) — optimize + vacuum + wal checkpoint…",
+                "aise: compacting index ({}) — rebuild full-text indexes + vacuum + wal checkpoint…",
                 mib(before)
             );
             let outcome = app.maintenance().compact()?;
@@ -1438,7 +1633,7 @@ fn execute(cli: Cli) -> Result<()> {
             );
         }
         Commands::Dates => unreachable!("date reference returns before opening the DB"),
-        Commands::Doctor(args) => print_doctor(&config, db, args.format, args.explain_unindexed)?,
+        Commands::Doctor(args) => print_doctor(&resolved, db, args.format, args.explain_unindexed)?,
         Commands::Tui => {
             schedule_auto_refresh_after_output(&config, db, implicit_read, &mut refresh_scheduled);
             let selected = tui::select_session(&config, db)?;
@@ -1488,6 +1683,7 @@ fn execute(cli: Cli) -> Result<()> {
                     crate::skill_run::MessageClassificationQuery {
                         filters,
                         additional_skills,
+                        include_unattributed_input: args.include_unattributed_input,
                     },
                 ),
             })?;
@@ -1507,98 +1703,153 @@ fn execute(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-fn validate_root_options(cli: &Cli) -> Result<()> {
+/// The shared (root-global) options a command accepts, by its subcommand path below `aise`.
+///
+/// Every shared option is `global = true`, so clap parses it on every command; this decides which
+/// ones a command actually uses. `validate_root_options` rejects the rest at run time and
+/// `cli_command` hides the rest from that command's help, so help never lists an option the
+/// command refuses. O(1).
+fn root_options_for(path: &[&str]) -> &'static [RootOption] {
+    use RootOption::{
+        CacheDirectory, ConfigFile, Database, HarnessHome, IndexRefresh, ReleaseNotification,
+        WorkerThreads,
+    };
     const CONFIG_INPUTS: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::WorkerThreads,
-        RootOption::IndexRefresh,
+        ConfigFile,
+        Database,
+        CacheDirectory,
+        WorkerThreads,
+        IndexRefresh,
     ];
     const MCP_INPUTS: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::WorkerThreads,
-        RootOption::IndexRefresh,
-        RootOption::HarnessHome,
+        ConfigFile,
+        Database,
+        CacheDirectory,
+        WorkerThreads,
+        IndexRefresh,
+        HarnessHome,
     ];
-    const CONFIG_AND_CACHE: &[RootOption] = &[RootOption::ConfigFile, RootOption::CacheDirectory];
-    const CONFIG_DATABASE_AND_CACHE: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-    ];
-    const INTEGRATION_INPUTS: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::HarnessHome,
-    ];
-    const CONFIG_FILE_ONLY: &[RootOption] = &[RootOption::ConfigFile];
-    const DATABASE_COMMAND_INPUTS: &[RootOption] = &[RootOption::ConfigFile, RootOption::Database];
+    const CONFIG_AND_CACHE: &[RootOption] = &[ConfigFile, CacheDirectory];
+    const CONFIG_DATABASE_AND_CACHE: &[RootOption] = &[ConfigFile, Database, CacheDirectory];
+    const INTEGRATION_INPUTS: &[RootOption] = &[ConfigFile, Database, CacheDirectory, HarnessHome];
+    const CONFIG_FILE_ONLY: &[RootOption] = &[ConfigFile];
+    const DATABASE_COMMAND_INPUTS: &[RootOption] = &[ConfigFile, Database];
     const ORDINARY_COMMAND_INPUTS: &[RootOption] = &[
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::WorkerThreads,
-        RootOption::IndexRefresh,
-        RootOption::ReleaseNotification,
-        RootOption::HarnessHome,
+        ConfigFile,
+        Database,
+        CacheDirectory,
+        WorkerThreads,
+        IndexRefresh,
+        ReleaseNotification,
+        HarnessHome,
+    ];
+    // Skill-package management reads skill directories, never harness files; `skills update`
+    // refreshes installed integrations first and so does read them.
+    const SKILL_MANAGEMENT_INPUTS: &[RootOption] = &[
+        ConfigFile,
+        Database,
+        CacheDirectory,
+        WorkerThreads,
+        IndexRefresh,
+        ReleaseNotification,
     ];
     const NO_ROOT_OPTIONS: &[RootOption] = &[];
 
-    let (command_name, allowed) = match &cli.command {
-        Commands::Integrations(IntegrationsCmd::Install(_)) => {
-            ("aise integrations install", INTEGRATION_INPUTS)
-        }
-        Commands::Integrations(IntegrationsCmd::Status(_)) => {
-            ("aise integrations status", INTEGRATION_INPUTS)
-        }
-        Commands::Integrations(IntegrationsCmd::Uninstall(_)) => {
-            ("aise integrations uninstall", INTEGRATION_INPUTS)
-        }
-        Commands::Integrations(IntegrationsCmd::Recover(_)) => {
-            ("aise integrations recover", CONFIG_FILE_ONLY)
-        }
-        Commands::Package(PackageCmd::Status(_)) => ("aise package status", NO_ROOT_OPTIONS),
-        Commands::Package(PackageCmd::Check(_)) => ("aise package check", CONFIG_AND_CACHE),
-        Commands::Package(PackageCmd::Update(_)) => ("aise package update", INTEGRATION_INPUTS),
-        Commands::Mcp(_) => ("aise mcp serve", MCP_INPUTS),
-        Commands::Config(ConfigCmd::File) => ("aise config file", CONFIG_FILE_ONLY),
-        Commands::Config(ConfigCmd::Example) => ("aise config example", NO_ROOT_OPTIONS),
-        Commands::Config(ConfigCmd::Init(_)) => ("aise config init", CONFIG_DATABASE_AND_CACHE),
-        Commands::Config(ConfigCmd::Show(_)) => ("aise config show", CONFIG_INPUTS),
-        Commands::Config(ConfigCmd::Check) => ("aise config check", CONFIG_INPUTS),
-        Commands::Config(ConfigCmd::Origins) => ("aise config origins", CONFIG_INPUTS),
-        Commands::Config(ConfigCmd::Paths(_)) => ("aise config paths", CONFIG_DATABASE_AND_CACHE),
-        Commands::Db(_) => ("aise db", DATABASE_COMMAND_INPUTS),
-        Commands::Migrate(_) => ("aise migrate", NO_ROOT_OPTIONS),
-        Commands::Dates => ("aise dates", NO_ROOT_OPTIONS),
-        Commands::RefreshIndex => ("aise __refresh-index", NO_ROOT_OPTIONS),
-        _ => ("this command", ORDINARY_COMMAND_INPUTS),
-    };
+    match path {
+        ["integrations", "install" | "status" | "uninstall"] => INTEGRATION_INPUTS,
+        ["integrations", "recover"] => CONFIG_FILE_ONLY,
+        ["package", "status"] => NO_ROOT_OPTIONS,
+        ["package", "check"] => CONFIG_AND_CACHE,
+        ["package", "update"] => INTEGRATION_INPUTS,
+        ["mcp", ..] => MCP_INPUTS,
+        ["config", "file"] => CONFIG_FILE_ONLY,
+        ["config", "example"] => NO_ROOT_OPTIONS,
+        ["config", "init" | "paths"] => CONFIG_DATABASE_AND_CACHE,
+        ["config", "show" | "check" | "origins"] => CONFIG_INPUTS,
+        ["db", ..] => DATABASE_COMMAND_INPUTS,
+        // This spelling is local to migration, but clap also copies it to the root field.
+        ["migrate", "config"] => &[CacheDirectory],
+        ["migrate", ..] | ["dates"] | ["__refresh-index"] => NO_ROOT_OPTIONS,
+        ["skills", "list" | "show" | "validate" | "create" | "restore"] => SKILL_MANAGEMENT_INPUTS,
+        _ => ORDINARY_COMMAND_INPUTS,
+    }
+}
 
-    for option in [
-        RootOption::ConfigFile,
-        RootOption::Database,
-        RootOption::CacheDirectory,
-        RootOption::WorkerThreads,
-        RootOption::IndexRefresh,
-        RootOption::ReleaseNotification,
-        RootOption::HarnessHome,
-    ] {
-        let unrelated_harness_home = option == RootOption::HarnessHome
-            && matches!(&cli.command,
-            Commands::Skills(cmd) if cmd.is_management() && !matches!(cmd, crate::skills::SkillsCmd::Update(_)));
-        if option.is_present(cli) && (!allowed.contains(&option) || unrelated_harness_home) {
+fn validate_root_options(cli: &Cli) -> Result<()> {
+    let path: Vec<&str> = cli.command_path.iter().map(String::as_str).collect();
+    let allowed = root_options_for(&path);
+    for option in RootOption::ALL {
+        if option.is_present(cli) && !allowed.contains(&option) {
             bail!(
-                "{} does not apply to `{command_name}`; remove it",
-                option.flag()
+                "{} does not apply to `aise {}`; remove it",
+                option.flag(),
+                path.join(" ")
             );
         }
     }
     Ok(())
+}
+
+/// The root command with each subcommand's help listing only the shared options
+/// [`root_options_for`] lets it accept. A command with subcommands lists the options any of them
+/// accepts; the root lists all. The options stay parseable everywhere, so a misplaced one still
+/// reaches `validate_root_options` and its "does not apply" message rather than clap's generic
+/// unknown-argument error. Visits each command once.
+fn cli_command() -> clap::Command {
+    /// Gives `command` a hidden copy of each global option that neither it nor any command below
+    /// it accepts. Clap propagates a global option only into a subcommand that lacks one with the
+    /// same id, so the hidden copy is what that subcommand keeps, and it still parses and reaches
+    /// the root's value. This runs before `build()`: mutating a built command's arguments leaves
+    /// clap's flag lookup pointing at the old positions.
+    fn hide_inapplicable(
+        mut command: clap::Command,
+        path: &mut Vec<String>,
+        globals: &[clap::Arg],
+    ) -> (clap::Command, Vec<RootOption>) {
+        let children: Vec<String> = command
+            .get_subcommands()
+            .map(|child| child.get_name().to_string())
+            .collect();
+        let mut accepted = Vec::new();
+        if children.is_empty() {
+            let names: Vec<&str> = path.iter().map(String::as_str).collect();
+            accepted.extend_from_slice(root_options_for(&names));
+        }
+        for name in children {
+            path.push(name.clone());
+            command = command.mut_subcommand(&name, |child| {
+                let (child, child_accepted) = hide_inapplicable(child, path, globals);
+                accepted.extend(child_accepted);
+                child
+            });
+            path.pop();
+        }
+        if !path.is_empty() {
+            for global in globals {
+                let option = RootOption::ALL
+                    .into_iter()
+                    .find(|option| global.get_id() == option.id())
+                    .expect("every global option is a RootOption");
+                // `migrate config` declares its own `--cache-dir`, which clap keeps in place of
+                // the global one; that one is the command's own and stays visible.
+                let declared = command
+                    .get_arguments()
+                    .any(|argument| argument.get_id() == global.get_id());
+                if !declared && !accepted.contains(&option) {
+                    command = command.arg(global.clone().hide(true));
+                }
+            }
+        }
+        (command, accepted)
+    }
+
+    let root = Cli::command();
+    let globals: Vec<clap::Arg> = root
+        .get_arguments()
+        .filter(|argument| argument.is_global_set())
+        .cloned()
+        .collect();
+    hide_inapplicable(root, &mut Vec::new(), &globals).0
 }
 
 fn run_migration(command: MigrationCmd) -> Result<()> {
@@ -1894,15 +2145,6 @@ fn run_background_refresh_from_stdin() -> Result<()> {
     Ok(())
 }
 
-/// Render rows to stdout in a non-table machine format (json/jsonl/csv/plain).
-fn render_rows<T: serde::Serialize + Row>(rows: &[T], format: OutputFormat) -> Result<()> {
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    render(rows, format, &mut out)?;
-    out.flush()?;
-    Ok(())
-}
-
 struct SessionRecordOutput<'a> {
     session: &'a SessionRecord,
     include_raw_metadata: bool,
@@ -2033,6 +2275,30 @@ fn render_session_rows_to<T: SessionMachineOutput, W: Write>(
         }
     }
     Ok(())
+}
+
+impl Row for crate::service::TranscriptWindow {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "session",
+            "provider",
+            "total_lines",
+            "lines_returned",
+            "complete",
+            "text",
+        ]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.session.id.clone(),
+            self.session.provider.as_str().into(),
+            self.total_lines.to_string(),
+            self.lines_returned.to_string(),
+            self.complete.to_string(),
+            self.text.clone(),
+        ]
+    }
 }
 
 fn configured_search_limit(limit: Option<usize>, config: &Config) -> usize {
@@ -2229,25 +2495,40 @@ fn print_unindexed_explanation(unindexed: &[crate::diagnostics::UnindexedFile]) 
 }
 
 fn print_doctor(
-    config: &Config,
+    resolved: &ResolvedConfig,
     db: &Db,
     format: DoctorFormat,
     explain_unindexed: bool,
 ) -> Result<()> {
+    let config = &resolved.config;
+    let config_file_exists = resolved.config_path.is_file();
+    let config_files_not_read = Config::config_files_not_read(&resolved.config_path);
     let diagnostics = crate::diagnostics::collect(config, db)?;
     let unindexed = explain_unindexed
         .then(|| crate::diagnostics::explain_unindexed(config, db))
         .transpose()?;
     if format == DoctorFormat::Json {
         let mut document = serde_json::to_value(&diagnostics)?;
+        let fields = document
+            .as_object_mut()
+            .expect("DiagnosticStatus serializes as an object");
+        fields.insert(
+            "config_file".to_string(),
+            serde_json::json!({
+                "path": resolved.config_path,
+                "origin": resolved.origins.config,
+                "exists": config_file_exists,
+            }),
+        );
+        fields.insert(
+            "config_files_not_read".to_string(),
+            serde_json::to_value(&config_files_not_read)?,
+        );
         if let Some(unindexed) = unindexed {
-            document
-                .as_object_mut()
-                .expect("DiagnosticStatus serializes as an object")
-                .insert(
-                    "unindexed_file_explanations".to_string(),
-                    serde_json::to_value(unindexed)?,
-                );
+            fields.insert(
+                "unindexed_file_explanations".to_string(),
+                serde_json::to_value(unindexed)?,
+            );
         }
         println!("{}", serde_json::to_string_pretty(&document)?);
         return Ok(());
@@ -2255,6 +2536,19 @@ fn print_doctor(
     let status = &diagnostics.index_status;
     let health = &diagnostics.providers;
     let warnings = status.parser_health.parse_warnings;
+    println!(
+        "Config: {} ({}{})",
+        resolved.config_path.display(),
+        resolved.origins.config,
+        if config_file_exists {
+            ""
+        } else {
+            "; no file there, built-in defaults in use"
+        }
+    );
+    for path in &config_files_not_read {
+        println!("Config file not read: {}", path.display());
+    }
     if !config.unknown_config_keys.is_empty() {
         println!(
             "Ignored config keys: {}; run `aise config check`",
@@ -2290,7 +2584,7 @@ fn print_doctor(
         );
     }
     // Stated as a consequence, not as a bare count: the reason this mattered is that a reader
-    // seeing only "discovered 414 / indexed 349" concluded the index was healthy.
+    // showing only discovered and indexed counts can conceal identity collisions.
     if status.unindexed_files > 0 {
         println!(
             "Unindexed: {} discovered file(s) produced no session, so their content is \
@@ -2331,6 +2625,15 @@ fn print_doctor(
         println!("Index refresh next command: {command}");
     }
     println!("Parse warnings indexed: {warnings}");
+    for unrecognized in &status.parser_health.unrecognized_record_types {
+        println!(
+            "Unrecognized record type, not indexed: {} {:?} ({} records in {} sessions)",
+            unrecognized.provider,
+            unrecognized.record_type,
+            unrecognized.records,
+            unrecognized.sessions
+        );
+    }
     for warning in &diagnostics.discovery_warnings {
         println!(
             "Discovery warning: {} {} {}: {} {}",
@@ -2679,14 +2982,14 @@ mod tests {
     }
 
     fn assert_root_options_apply<const N: usize>(args: [&str; N]) {
-        let cli = Cli::try_parse_from(args)
+        let cli = parse_cli_from(args)
             .unwrap_or_else(|err| panic!("expected CLI args to parse: {args:?}: {err}"));
         validate_root_options(&cli)
             .unwrap_or_else(|err| panic!("expected root options to apply: {args:?}: {err}"));
     }
 
     fn assert_root_option_is_irrelevant<const N: usize>(args: [&str; N], flag: &str) {
-        let cli = Cli::try_parse_from(args)
+        let cli = parse_cli_from(args)
             .unwrap_or_else(|err| panic!("expected CLI args to parse: {args:?}: {err}"));
         let error = validate_root_options(&cli).unwrap_err().to_string();
         assert!(error.contains(flag), "{error}");
@@ -2910,12 +3213,56 @@ mod tests {
         );
     }
 
+    /// `aise vocab` is kept, with its own help and behavior, but left out of the root command list
+    /// and its group legend.
+    #[test]
+    fn vocab_is_hidden_from_the_root_help_and_keeps_its_own_help() {
+        let root_help = parse_cli_from(["aise", "--help"]).unwrap_err().to_string();
+        assert!(
+            !root_help
+                .split_whitespace()
+                .any(|word| word.trim_end_matches(',') == "vocab"),
+            "{root_help}"
+        );
+        let vocab_help = parse_cli_from(["aise", "vocab", "--help"]).unwrap_err();
+        assert_eq!(vocab_help.kind(), clap::error::ErrorKind::DisplayHelp);
+        assert!(
+            vocab_help.to_string().contains("Usage: aise vocab"),
+            "{vocab_help}"
+        );
+        assert_parses(["aise", "vocab", "--prefix", "cargo"]);
+    }
+
     /// `aise messages search` has thirty-nine options; every one is filed under a section so the
     /// six a caller needs first are not buried in one alphabetical block. A new option must pick
     /// a section: only `--help` and the positional query stay in the unnamed default section.
     /// Both path scopes match the exact directory and its component-boundary descendants
     /// (`db::path_prefix_patterns`: exact, or `prefix/`-anchored `LIKE`), so `project` never
     /// admits `project-other`; the help must say the same thing on both commands.
+    #[test]
+    fn session_path_help_includes_transcript_location() {
+        let root = Cli::command();
+        let command = root.find_subcommand("list").unwrap();
+        let help = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "path")
+            .unwrap()
+            .get_long_help()
+            .or_else(|| {
+                command
+                    .get_arguments()
+                    .find(|arg| arg.get_id() == "path")
+                    .unwrap()
+                    .get_help()
+            })
+            .unwrap()
+            .to_string();
+        assert!(
+            help.contains("cwd, repo root, or transcript path is this directory"),
+            "{help}"
+        );
+    }
+
     #[test]
     fn path_scope_help_states_component_boundary_matching_on_both_commands() {
         let root = Cli::command();
@@ -2985,15 +3332,26 @@ mod tests {
         }
     }
 
-    /// The shipped skill and README are what an agent reads instead of `--help`, so an example
-    /// that names a flag this build no longer accepts teaches the wrong command with authority.
-    /// That happened: `messages search --regex/--fuzzy/--explain` were renamed to `--query-mode`
-    /// and `--receipt-level` on 2026-07-22 and the skill kept the old spellings through rc1;
-    /// session history shows agents on Pi and Claude Code paying for it with `--help` probes and
-    /// failed calls. Every documented invocation must parse against the current CLI, including
-    /// the capability arguments after `skills <name>`, which the root parser passes through.
+    /// The shipped skill and README are what an agent reads instead of `--help`, so an example that
+    /// names a flag this build no longer accepts teaches the wrong command with authority. That
+    /// happened: `messages search --regex/--fuzzy/--explain` were renamed to `--query-mode` and
+    /// `--receipt-level` and the skill kept the old spellings through rc1; agents paid for it with
+    /// `--help` probes and failed calls. Every documented invocation must parse against the current
+    /// CLI, including the capability arguments after `skills <name>`, which the root parser passes
+    /// through. Message reads also execute against a synthetic session to check runtime validation.
     #[test]
     fn every_documented_aise_example_parses_against_the_current_cli() {
+        let temporary = tempfile::tempdir().unwrap();
+        let db = Db::open(&temporary.path().join("examples.db")).unwrap();
+        let session = crate::util::minimal_record(
+            Provider::Claude,
+            &temporary
+                .path()
+                .join("00000000-0000-4000-8000-000000000000.jsonl"),
+            String::new(),
+        );
+        db.upsert_session(&session, 1, 1).unwrap();
+        let config = Config::default();
         let documents = [
             (
                 "skills/ai-session-search/SKILL.md",
@@ -3026,6 +3384,13 @@ mod tests {
                         continue;
                     }
                 };
+                if let Commands::Messages(command @ crate::messages::MessagesCmd::Get(_)) =
+                    &cli.command
+                {
+                    if let Err(error) = crate::messages::run_command(&db, command, &config) {
+                        failures.push(format!("{name}:{line}: {rendered}\n    {error}"));
+                    }
+                }
                 if let Commands::Skills(command) = cli.command {
                     if !command.is_management() {
                         if let Err(error) = command.into_execution() {
@@ -3041,7 +3406,7 @@ mod tests {
         );
         assert!(
             failures.is_empty(),
-            "{} documented aise invocation(s) do not parse against this build:\n{}",
+            "{} documented aise invocation(s) fail against this build:\n{}",
             failures.len(),
             failures.join("\n")
         );
@@ -3642,6 +4007,136 @@ mod tests {
         );
     }
 
+    /// Every leaf command's help lists under the shared-options heading exactly the shared options
+    /// it accepts: each listed one passes `validate_root_options` and each unlisted one is
+    /// rejected with "does not apply". Both sides go through `parse_cli_from`, the parser
+    /// `aise` runs. `aise db --help` used to list `--index-refresh` and
+    /// `--skip-release-notification`, which `aise db schema` then refused.
+    #[test]
+    fn every_leaf_command_help_lists_exactly_the_shared_options_it_accepts() {
+        fn leaves(command: &clap::Command, path: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+            let children: Vec<_> = command
+                .get_subcommands()
+                .filter(|child| child.get_name() != "help")
+                .collect();
+            if children.is_empty() {
+                out.push(path.clone());
+            }
+            for child in children {
+                path.push(child.get_name().to_string());
+                leaves(child, path, out);
+                path.pop();
+            }
+        }
+        /// Placeholder values for a leaf's required arguments, so a parse reaches the shared
+        /// option check instead of stopping at a missing argument.
+        fn required_arguments(root: &clap::Command, path: &[String]) -> Vec<String> {
+            let mut command = root;
+            for name in path {
+                command = command.find_subcommand(name).expect("leaf exists");
+            }
+            let mut out = Vec::new();
+            for argument in command.get_arguments() {
+                if !argument.is_required_set() || argument.is_global_set() {
+                    continue;
+                }
+                if let Some(long) = argument.get_long() {
+                    out.push(format!("--{long}"));
+                }
+                out.push("/tmp/placeholder".to_string());
+            }
+            out
+        }
+        fn listed_shared_options(help: &str) -> Vec<&'static str> {
+            let section = help
+                .split(&format!("{GLOBAL_OPTIONS_HEADING}:"))
+                .nth(1)
+                .map(|rest| {
+                    rest.lines()
+                        .skip(1)
+                        .take_while(|line| line.is_empty() || line.starts_with(' '))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            RootOption::ALL
+                .iter()
+                .map(|option| option.flag())
+                .filter(|flag| {
+                    section
+                        .split_whitespace()
+                        .any(|word| word.trim_end_matches(',') == *flag)
+                })
+                .collect()
+        }
+
+        let mut root = Cli::command();
+        root.build();
+        let mut paths = Vec::new();
+        leaves(&root, &mut Vec::new(), &mut paths);
+        assert!(paths.len() > 20, "{paths:?}");
+        for path in paths {
+            // `migrate config` requires its own `--cache-dir`, and `parse_cli_from` hoists every
+            // `--cache-dir` token as the shared option, so no argument vector reaches its
+            // shared-option check. Its help is still checked against the table above.
+            let unreachable = path == ["migrate", "config"];
+            let help = parse_cli_from(
+                std::iter::once("aise".to_string())
+                    .chain(path.iter().cloned())
+                    .chain(["--help".to_string()]),
+            )
+            .unwrap_err();
+            assert_eq!(
+                help.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "{path:?}: {help}"
+            );
+            let help = help.to_string();
+            let listed = listed_shared_options(&help);
+            if unreachable {
+                let names: Vec<&str> = path.iter().map(String::as_str).collect();
+                let expected: Vec<&str> = root_options_for(&names)
+                    .iter()
+                    .map(|option| option.flag())
+                    .filter(|flag| *flag != "--cache-dir")
+                    .collect();
+                let mut listed = listed;
+                listed.retain(|flag| *flag != "--cache-dir");
+                assert_eq!(listed, expected, "{path:?}: {help}");
+                continue;
+            }
+            for option in RootOption::ALL {
+                let mut argv = vec!["aise".to_string(), option.flag().to_string()];
+                match option {
+                    RootOption::ReleaseNotification => {}
+                    RootOption::WorkerThreads => argv.push("2".to_string()),
+                    RootOption::IndexRefresh => argv.push("existing-only".to_string()),
+                    _ => argv.push("/tmp/placeholder".to_string()),
+                }
+                argv.extend(path.iter().cloned());
+                argv.extend(required_arguments(&root, &path));
+                let cli = parse_cli_from(&argv)
+                    .unwrap_or_else(|error| panic!("{argv:?} parses: {error}"));
+                let verdict = validate_root_options(&cli);
+                if listed.contains(&option.flag()) {
+                    assert!(
+                        verdict.is_ok(),
+                        "{path:?} help lists {} but rejects it: {verdict:?}",
+                        option.flag()
+                    );
+                } else {
+                    let error = verdict
+                        .err()
+                        .unwrap_or_else(|| {
+                            panic!("{path:?} accepts {} but its help omits it", option.flag())
+                        })
+                        .to_string();
+                    assert!(error.contains("does not apply"), "{path:?}: {error}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn root_options_parse_before_or_after_subcommands_and_remain_semantically_checked() {
         let root_help = Cli::try_parse_from(["aise", "--help"])
@@ -4143,33 +4638,127 @@ mod tests {
         }
     }
 
-    /// Clearing clap's suggestion slot for a renamed flag can only drop the pass-as-value tip.
+    /// Replacing clap's suggestion slot for a renamed flag can only drop the pass-as-value tip.
     ///
-    /// `clarify_stale_message_argument` clears `ContextKind::Suggested` whole. For an unknown
+    /// `clarify_mistaken_argument` replaces `ContextKind::Suggested` whole. For an unknown
     /// argument clap fills that slot with one of two things: the pass-as-value tip, or
     /// `'<subcommand> <flag>' exists` when the flag belongs to a child of the command that rejected
-    /// it. The second is what makes clearing the slot lossy, and it is unreachable only while
-    /// `messages search` has no children — `--regex`, for one, is a real flag on `aise repeats`, so
-    /// the case is not hypothetical, only out of reach from this command. Giving `messages search`
-    /// a subcommand would put it in reach; this fails first.
+    /// it. The second is what makes replacing the slot lossy, and it is unreachable only while
+    /// every command in `MISTAKEN_ARGUMENTS` has no children. `--regex`, for one, is a real flag
+    /// on `aise repeats`, so the case is not hypothetical. Giving one of those commands a
+    /// subcommand would put it in reach; this fails first.
     #[test]
-    fn message_search_has_no_subcommands_so_clearing_the_suggestion_slot_drops_only_the_value_tip()
-    {
+    fn mistaken_argument_commands_have_no_subcommands_so_the_suggestion_slot_holds_only_the_value_tip(
+    ) {
         let mut root = Cli::command();
         root.build();
-        let search = root
-            .find_subcommand_mut("messages")
-            .and_then(|messages| messages.find_subcommand_mut("search"))
-            .expect("messages search exists");
-        let children: Vec<_> = search
-            .get_subcommands()
-            .map(clap::Command::get_name)
-            .collect();
-        assert!(
-            children.is_empty(),
-            "clearing the suggestion slot would now delete clap's `'<subcommand> <flag>' exists` \
-             tip: {children:?}"
-        );
+        for row in MISTAKEN_ARGUMENTS {
+            let mut command = Some(&mut root);
+            for name in row.command {
+                command = command.and_then(|parent| parent.find_subcommand_mut(name));
+            }
+            let command = command.unwrap_or_else(|| panic!("{:?} exists", row.command));
+            let children: Vec<_> = command
+                .get_subcommands()
+                .map(clap::Command::get_name)
+                .collect();
+            assert!(
+                children.is_empty(),
+                "{:?}: replacing the suggestion slot would now delete clap's \
+                 `'<subcommand> <flag>' exists` tip: {children:?}",
+                row.command
+            );
+            // A row whose name the command accepts would never be reached, and would hide a
+            // working flag behind a rename if clap's matching ever changed.
+            assert!(
+                command
+                    .get_arguments()
+                    .all(|argument| argument.get_long() != row.name.strip_prefix("--")),
+                "{:?} accepts {}",
+                row.command,
+                row.name
+            );
+        }
+    }
+
+    /// `--path` is the session-level filter of `aise search` and `aise list`; on
+    /// `aise messages search` the same scope is `--workspace-path`. Before the table named it,
+    /// clap answered with its pass-as-value tip, telling the caller to search for the text `--path`.
+    #[test]
+    fn messages_search_path_names_workspace_path_and_where_path_belongs() {
+        for invocation in [
+            vec!["aise", "messages", "search", "workflow", "--path", "/tmp/p"],
+            vec!["aise", "messages", "search", "--path=/tmp/p", "workflow"],
+        ] {
+            let error = parse_cli_from(invocation.clone()).unwrap_err();
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{invocation:?}"
+            );
+            assert_ne!(error.exit_code(), 0, "{invocation:?}");
+            let text = error.to_string();
+            assert!(
+                text.contains("a similar argument exists: '--workspace-path'"),
+                "{invocation:?}: {text}"
+            );
+            assert!(
+                text.contains("session-level filter of `aise search` and `aise list`"),
+                "{invocation:?}: {text}"
+            );
+            assert!(!text.contains("as a value"), "{invocation:?}: {text}");
+            assert!(
+                text.contains("Usage: aise messages search [OPTIONS] [QUERY]"),
+                "{invocation:?}: {text}"
+            );
+        }
+        // The session-level commands keep their own `--path`.
+        assert_parses(["aise", "search", "workflow", "--path", "/tmp/p"]);
+        assert_parses(["aise", "list", "--path", "/tmp/p"]);
+    }
+
+    /// `aise show` windows its transcript with one signed `--transcript-lines`. Callers reach for
+    /// `--tail`, `--last`, `--head`, or `--max-lines`; clap answered those with its pass-as-value
+    /// tip, or nothing useful.
+    #[test]
+    fn show_line_window_spellings_name_transcript_lines_and_its_sign_rule() {
+        for (stale, replacement) in [
+            ("--tail", "--transcript-lines -N"),
+            ("--last", "--transcript-lines -N"),
+            ("--head", "--transcript-lines N"),
+            ("--max-lines", "--transcript-lines N"),
+        ] {
+            for invocation in [
+                vec!["aise", "show", "abc", stale, "40"],
+                vec!["aise", "show", stale, "40", "abc"],
+            ] {
+                let error = parse_cli_from(invocation.clone()).unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    clap::error::ErrorKind::UnknownArgument,
+                    "{invocation:?}"
+                );
+                let text = error.to_string();
+                assert!(
+                    text.contains(&format!("a similar argument exists: '{replacement}'")),
+                    "{invocation:?}: {text}"
+                );
+                assert!(
+                    text.contains("the last N, and --transcript-lines 0 the whole transcript"),
+                    "{invocation:?}: {text}"
+                );
+                assert!(!text.contains("as a value"), "{invocation:?}: {text}");
+                assert!(text.contains("Usage: aise show"), "{invocation:?}: {text}");
+            }
+        }
+        let cli = parse_cli_from(["aise", "show", "abc", "--transcript-lines", "-40"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Show(ShowArgs {
+                transcript_lines: Some(-40),
+                ..
+            })
+        ));
     }
 
     /// The renames stay rejections, never working aliases: accepting `--regex` would keep two
@@ -4463,6 +5052,13 @@ mod tests {
     }
 
     #[test]
+    fn slash_commands_is_the_canonical_usage_command() {
+        assert_parses(["aise", "slash-commands", "--commands", "^/review$"]);
+        assert_parses(["aise", "planning", "--commands", "^/review$"]);
+        assert!(Cli::command().find_subcommand("slash-commands").is_some());
+    }
+
+    #[test]
     fn planning_accepts_command_token_regex_filters() {
         assert_parses([
             "aise",
@@ -4473,6 +5069,44 @@ mod tests {
             "^/cmd-b$",
         ]);
         assert_parses(["aise", "planning", "--command", "^/cmd-c$"]);
+    }
+
+    #[test]
+    fn classification_all_results_selects_zero_limit() {
+        let parsed =
+            Cli::try_parse_from(["aise", "skills", "corrections", "--all-results"]).unwrap();
+        let Commands::Skills(command) = parsed.command else {
+            panic!("expected skills");
+        };
+        let args = command.into_execution().unwrap().args;
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let config = Config::default();
+        assert_eq!(
+            crate::analytics::message_classification_filters(&db, &config, &args)
+                .unwrap()
+                .limit,
+            0
+        );
+    }
+
+    #[test]
+    fn classification_accepts_comma_separated_session_kinds() {
+        let parsed = Cli::try_parse_from([
+            "aise",
+            "skills",
+            "corrections",
+            "--session-kinds",
+            "user,subagent",
+        ])
+        .unwrap();
+        let Commands::Skills(command) = parsed.command else {
+            panic!("expected skills");
+        };
+        assert_eq!(
+            command.into_execution().unwrap().args.session_kinds,
+            vec![SessionKind::User, SessionKind::Subagent]
+        );
     }
 
     #[test]
@@ -4528,6 +5162,17 @@ mod tests {
     }
 
     #[test]
+    fn repeats_names_its_candidate_limit() {
+        for flag in ["--max-candidates", "--limit"] {
+            let parsed = parse_cli_from(["aise", "repeats", flag, "20"]).unwrap();
+            let Commands::Repeats(args) = parsed.command else {
+                panic!("expected repeats");
+            };
+            assert_eq!(args.limit, 20);
+        }
+    }
+
+    #[test]
     fn repeats_command_parses() {
         assert_parses(["aise", "repeats", "--role", "user"]);
         assert_parses(["aise", "repeats", "magic values", "--role", "user"]);
@@ -4544,6 +5189,7 @@ mod tests {
             "--max-groups",
             "20",
         ]);
+        assert_parses(["aise", "repeats", "--format", "json", "--report"]);
         assert_rejects(["aise", "repeats", "you forgot", "--similarity"]);
         assert_rejects(["aise", "repeats", "you forgot", "--groups"]);
         assert_rejects(["aise", "repeats", "--context", "-1"]);
@@ -4608,5 +5254,22 @@ mod tests {
             "--output-dir",
             "many",
         ]);
+    }
+}
+
+#[cfg(test)]
+mod published_cli_compatibility {
+    use super::*;
+
+    #[test]
+    fn published_command_spellings_remain_parseable() {
+        let cases: Vec<Vec<String>> = serde_json::from_str(include_str!(
+            "../tests/fixtures/v1_0_0_cli_invocations.json"
+        ))
+        .unwrap();
+        for argv in cases {
+            let parsed = Cli::try_parse_from(&argv);
+            assert!(parsed.is_ok(), "failed to parse {argv:?}: {parsed:?}");
+        }
     }
 }

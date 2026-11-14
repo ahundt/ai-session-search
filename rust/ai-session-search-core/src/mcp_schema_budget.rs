@@ -57,6 +57,7 @@ pub const REJECTED_ROOT_COMBINATORS: [&str; 7] =
 /// margins, and reading them as the same thing is what makes a numerically smaller cap look
 /// like the one worth defaulting to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FailureMode {
     /// The client neither errors nor marks the result. Nothing downstream reports it.
     Silent,
@@ -70,6 +71,7 @@ pub enum FailureMode {
 
 /// Which artifact a row measures, and therefore what the sweep iterates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AppliesTo {
     InputSchema,
     ToolDescription,
@@ -82,6 +84,7 @@ pub enum AppliesTo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Status {
     Pass,
     /// Inside the limit but past its notice line; this is not a client-limit warning.
@@ -104,6 +107,7 @@ impl Status {
 
 /// One (client, artifact, limit) triple, swept over every tool the catalogue advertises.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct HarnessLimit {
     pub name: &'static str,
     /// The external client, protocol, or repository policy that owns this rule.
@@ -581,34 +585,38 @@ pub fn all_limits() -> impl Iterator<Item = &'static HarnessLimit> {
 ///
 /// Columns: tool, Codex-measured `inputSchema` bytes, `outputSchema` depth.
 pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
-    // 4_645 -> 4_706: `field_view`/`match_view` now state their omission value as the JSON a
-    // caller sends (`{kind:max_chars,max_chars:220}`) because Claude Code drops `oneOf` from the
-    // schema it shows the model, and `query`'s omission reads "without it every message the
-    // filters allow is eligible". 4_706 -> 4_741: `match_window` says which messages a page
-    // keeps (first N in session order, or last N of one session) instead of "which match per
-    // message", which described an occurrence choice the search never makes. 259 bytes remain
-    // below Codex's 5,000-byte description-deletion cliff; the 4,750 margin tripwire is 9 bytes
-    // away, so the next byte spent here needs a byte saved.
-    ("search_messages", 4_741, 10),
+    // Reuse public controls before adding fields or trimming help; a higher recorded ceiling does not raise a client's limit.
+    // Reusing role for recorded input measures 4,732 bytes after Codex normalization.
+    // Re-measured after removing the origin/delivery unknown output values: input bytes and
+    // output depth remain unchanged, so these ceilings stay pinned to the same measurements.
+    // Re-measured with hit timestamps: input bytes and output depth are unchanged.
+    // Published purpose controls remain present even without configured bundles.
+    ("search_messages", 4_732, 10),
     // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`
     // and `all_results` say "omit for" like every other property so the tool description's
-    // omitted-values sentence can read them back. 279 bytes of headroom remain before Codex's
-    // 5,000-byte cliff, past which it deletes every parameter description with no marker to the
-    // model.
-    ("run_skill_capability", 4_721, 9),
-    ("get_session", 4_064, 10),
-    // 4_250 -> 4_306: `query` now states its matching model (case-insensitive substring of the
-    // whole query and of each word, fuzzy on title and paths, every-word bonus, no quote or
-    // boolean operators) instead of "keywords, a phrase, or a code snippet". 694 bytes remain
-    // below Codex's 5,000-byte cliff.
-    ("search_sessions", 4_306, 8),
-    ("list_sessions", 3_892, 8),
+    // omitted-values sentence can read them back. Codex deletes parameter descriptions beyond
+    // its 5,000-byte limit without marking the removal for the model.
+    // 4_721 -> 4_883: `include_unattributed_input` opts in to queued messages with no recorded
+    // sender, which the run otherwise leaves out and counts. Tighter wording later retained the
+    // same contract at 4,723 bytes, below the 4,750-byte tripwire.
+    ("run_skill_capability", 4_723, 9),
+    // Explicit range kinds include harness notices without changing the default class set.
+    // Canonical detail compact/full retains the deprecated response_format spelling.
+    ("get_session", 4_110, 10),
+    // Session dates state the UTC default and the explicit [Area/City] calendar opt-in.
+    ("search_sessions", 4_340, 8),
+    ("list_sessions", 3_792, 8),
     ("query_session_index", 1_724, 8),
     ("get_resume_command", 374, 8),
     ("get_index_status", 238, 9),
 ];
 
 /// The recorded `(bytes, depth)` ceiling for one tool, or `None` when nothing is watching it.
+/// Look up a tool ceiling by scanning the fixed emitted-artifact ledger with constant auxiliary space.
+#[deprecated(
+    since = "1.1.0",
+    note = "use mcp_schema_budget::evaluate_all; run_cli_from exposes the schema-budget command"
+)]
 pub fn ceiling_for(tool: &str) -> Option<(usize, usize)> {
     EMITTED_ARTIFACT_CEILINGS
         .iter()
@@ -618,6 +626,7 @@ pub fn ceiling_for(tool: &str) -> Option<(usize, usize)> {
 
 /// One measurement of one row against one tool.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Finding {
     pub limit: &'static HarnessLimit,
     /// The budget actually applied: what the operator configured, or the measured default.
@@ -844,6 +853,11 @@ pub fn codex_measured_bytes(value: &Value) -> usize {
 /// survives, which nothing here asks about.
 // ponytail: models pass 1 only; extend to the later passes if a caller needs to know which
 // structure survives a breach rather than whether the prose does.
+/// Model description stripping by serializing the schema, using O(schema bytes) time and memory.
+#[deprecated(
+    since = "1.1.0",
+    note = "use mcp_schema_budget::evaluate_all; run_cli_from exposes the schema-budget command"
+)]
 pub fn codex_strips_descriptions(value: &Value) -> bool {
     codex_measured_bytes(value) > CODEX_COMPACT_TOOL_SCHEMA_BYTES
 }
@@ -1590,6 +1604,10 @@ pub fn describe_breach(limit: &HarnessLimit, budget: usize, measured: usize) -> 
 /// Collapsing any two of them reports a validator cost as a model-context cost, or a wire byte as
 /// a token. The last three need a `tools/call` fixture, so a catalogue reports them with a status
 /// rather than with a zero that would read as a saving.
+#[deprecated(
+    since = "1.1.0",
+    note = "use run_cli_from for the schema-budget stage ledger; mcp_schema_budget::evaluate_all evaluates catalogue limits"
+)]
 pub const LEDGER_STAGES: [&str; 9] = [
     "raw_catalogue",
     "jsonrpc_catalogue_envelope",
@@ -2253,31 +2271,20 @@ mod tests {
 
     #[test]
     fn warning_only_rows_start_after_the_inclusive_limit() {
-        let config = crate::config::Config::default();
         let margin = all_limits()
             .find(|limit| limit.name == "codex-input-schema-margin")
             .expect("Codex margin rule");
-        let mut tool = crate::mcp_server::advertised_tools(&config)
-            .as_array()
-            .expect("tools list")
-            .iter()
-            .find(|tool| tool["name"] == "search_messages")
-            .cloned()
-            .expect("search_messages tool");
-        let mut at_limit = None;
-        for _ in 0..=margin.budget {
-            let (measured, _) = measure(margin, &tool, margin.budget);
-            if measured == margin.budget {
-                at_limit = Some(tool.clone());
-                break;
-            }
-            let description = tool["inputSchema"]["properties"]["query"]["description"]
-                .as_str()
-                .expect("query description");
-            tool["inputSchema"]["properties"]["query"]["description"] =
-                json!(format!("{description}x"));
-        }
-        let at_limit = at_limit.expect("the margin rule should have a reachable exact boundary");
+        let mut at_limit = minimal_tool();
+        let (measured, _) = measure(margin, &at_limit, margin.budget);
+        let padding = margin
+            .budget
+            .checked_sub(measured)
+            .expect("fixture below margin");
+        let description = at_limit["inputSchema"]["properties"]["query"]["description"]
+            .as_str()
+            .expect("query description");
+        at_limit["inputSchema"]["properties"]["query"]["description"] =
+            json!(format!("{description}{}", "x".repeat(padding)));
         let exact = evaluate(
             std::slice::from_ref(&at_limit),
             &ClientLimitOverrides::new(),

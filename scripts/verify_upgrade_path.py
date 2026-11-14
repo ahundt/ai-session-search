@@ -4,7 +4,10 @@
 
 """Prove that upgrading from a published release needs nothing beyond replacing the executable.
 
-For each earlier release, in an empty home directory:
+For each earlier release, in an empty home directory, first build a populated synthetic index
+with that release, open it with the candidate, run incremental and full refresh, and compare
+ordered messages, provenance, content parts, file edits, and transcript text with a fresh
+candidate. Every provider the release supports must contribute messages. Then:
 
 1. install that release's integrations from PyPI for every harness it supports that installs files
    an upgrade could leave behind: skills and their discovery links, and both instruction variants;
@@ -13,7 +16,13 @@ For each earlier release, in an empty home directory:
 3. run one ordinary command with the candidate executable, which is all an upgrade through uv,
    pip, Cargo, or a native archive does;
 4. require `aise integrations status --format json` to report every integration the earlier
-   release installed as `current`.
+   release installed as `current`;
+5. require the earlier release to still read that config and integration state, as it must
+   after a downgrade.
+
+From 1.0.0 it also proves the documented index downgrade: 1.0.0 refuses the candidate's index,
+rebuilds from the transcripts once that index is moved aside, and the moved index keeps every
+archived row for the next upgrade.
 
 A failure names the release and what would have needed a manual step. CI runs this on every
 push against the Linux build, so a change that breaks upgrades fails before it merges, and the
@@ -184,6 +193,11 @@ def archive_evidence(database: sqlite3.Connection) -> dict[str, bool]:
 
 
 def _archive_writer_evidence(command: Sequence[str], home: pathlib.Path) -> dict[str, bool]:
+    return _archive_home(command, home)[0]
+
+
+def _archive_home(command: Sequence[str], home: pathlib.Path) -> tuple[dict[str, bool], dict[str, str]]:
+    """Index a transcript, shrink and rewrite it, and return the archive markers and environment."""
     home.mkdir()
     environment = isolated_environment(home)
     config = pathlib.Path(environment["AI_SESSION_SEARCH_CONFIG"])
@@ -232,7 +246,110 @@ def _archive_writer_evidence(command: Sequence[str], home: pathlib.Path) -> dict
     write_source(["gamma"])
     reindex()
     with sqlite3.connect(environment["AI_SESSION_SEARCH_DATABASE"]) as database:
-        return archive_evidence(database)
+        return archive_evidence(database), environment
+
+
+DOWNGRADE_GUIDE = pathlib.Path(__file__).resolve().parents[1] / "docs/development/installation.md"
+DOCUMENTED_REBUILD = 'aise --database "$DB" reindex --full'
+
+
+def _index_files(database: pathlib.Path) -> list[pathlib.Path]:
+    return [database.with_name(database.name + suffix) for suffix in ("", "-wal", "-shm")]
+
+
+def check_downgrade(old: Sequence[str], executable: pathlib.Path) -> list[str]:
+    """Prove the documented downgrade: move the index aside and let the earlier release rebuild.
+
+    The candidate's index refuses the earlier release, the earlier release rebuilds from the
+    transcripts still on disk, and the index moved aside keeps every archived row for an upgrade
+    back.
+    """
+    if os.name == "nt":
+        raise UpgradeCheckUnavailable("historical archive writers require a disposable Unix home")
+    with tempfile.TemporaryDirectory(prefix="aise-downgrade-") as directory:
+        evidence, environment = _archive_home([str(executable)], pathlib.Path(directory).resolve() / "home")
+        if not all(evidence.values()):
+            return [f"candidate did not retain every archive marker before the downgrade: {evidence}"]
+        database = pathlib.Path(environment["AI_SESSION_SEARCH_DATABASE"])
+        refused = _run([*old, "reindex"], environment)
+        if refused.returncode == 0 or "newer than this aise build" not in refused.stderr:
+            return [f"the earlier release did not refuse the candidate's index: exit "
+                    f"{refused.returncode}, {refused.stderr.strip()}"]
+        moved = _move_index_as_documented(executable, environment, database)
+        if isinstance(moved, str):
+            return [moved]
+        problems = _rebuild_with_earlier_release(old, environment, database, moved)
+        for path in _index_files(database):
+            path.unlink(missing_ok=True)
+        _rename_existing({kept: path for path, kept in moved.items()})
+        restored = _run([str(executable), "reindex"], environment)
+        if restored.returncode != 0:
+            problems.append(f"the candidate could not reopen the restored index: {restored.stderr.strip()}")
+        with sqlite3.connect(database) as connection:
+            after = archive_evidence(connection)
+        problems.extend(f"restored index lost {name}" for name, kept in after.items() if not kept)
+        return problems
+
+
+def _rename_existing(moves: dict[pathlib.Path, pathlib.Path]) -> None:
+    for source, target in moves.items():
+        if source.exists():
+            source.rename(target)
+
+
+def _documented_downgrade_lines() -> list[str]:
+    """The shell lines of the downgrade block in installation.md, comments and blanks removed."""
+    text = DOWNGRADE_GUIDE.read_text(encoding="utf-8")
+    block = re.search(r"To downgrade, stop every aise process.*?```bash\n(.*?)```", text, re.S)
+    if block is None:
+        raise UpgradeCheckUnavailable(f"{DOWNGRADE_GUIDE} has no downgrade command block")
+    lines = [line.split("  #")[0].strip() for line in block.group(1).splitlines()]
+    return [line for line in lines if line and not line.startswith("#")]
+
+
+def _move_index_as_documented(
+    executable: pathlib.Path, environment: dict[str, str], database: pathlib.Path
+) -> dict[pathlib.Path, pathlib.Path] | str:
+    """Run the guide's own path lookup and move loop with the candidate first on PATH.
+
+    Returns each moved index file mapped to where the guide put it, or the problem that stopped
+    it, so a wrong command in the guide fails here rather than on a user's index.
+    """
+    lines = _documented_downgrade_lines()
+    if DOCUMENTED_REBUILD not in lines:
+        return f"the downgrade guide no longer rebuilds with `{DOCUMENTED_REBUILD}`"
+    steps = [line for line in lines if not line.startswith(("uv tool install", DOCUMENTED_REBUILD))]
+    shell = {**environment, "PATH": f"{executable.parent}{os.pathsep}{environment['PATH']}"}
+    result = _run(["bash", "-euc", "\n".join([*steps, 'printf "%s" "$DB"'])], shell)
+    if result.returncode != 0 or result.stdout != str(database):
+        return (f"the guide's commands did not move {database}: exit {result.returncode}, "
+                f"printed {result.stdout!r}, {result.stderr.strip()}")
+    backup = database.with_name(database.name + ".from-1.1.0")
+    moved = {path: backup / path.name for path in _index_files(database)}
+    left = [str(path) for path in _index_files(database) if path.exists()]
+    if left or not moved[database].exists():
+        return f"the guide's commands left {left or [str(database)]} in place"
+    return {path: kept for path, kept in moved.items() if kept.exists()}
+
+
+def _rebuild_with_earlier_release(
+    old: Sequence[str],
+    environment: dict[str, str],
+    database: pathlib.Path,
+    moved: dict[pathlib.Path, pathlib.Path],
+) -> list[str]:
+    """Rebuild at the same path with the earlier release; the moved files must stay byte-identical."""
+    moved_bytes = {kept: kept.read_bytes() for kept in moved.values()}
+    rebuilt = _run([*old, "--database", str(database), "reindex", "--full"], environment)
+    if rebuilt.returncode != 0:
+        return [f"the earlier release could not rebuild after the index was moved aside: "
+                f"{rebuilt.stderr.strip()}"]
+    with sqlite3.connect(database) as connection:
+        current = {row[0] for row in connection.execute("select content from messages")}
+    problems = [] if "gamma" in current else ["the rebuilt index lacks the transcript's current message"]
+    problems += [f"{kept.name} changed while the earlier release ran"
+                 for kept, before in moved_bytes.items() if kept.read_bytes() != before]
+    return problems
 
 
 def check_archive_write_paths(old: Sequence[str], executable: pathlib.Path) -> list[str]:
@@ -249,14 +366,165 @@ def check_archive_write_paths(old: Sequence[str], executable: pathlib.Path) -> l
     return problems
 
 
+def _earlier_release_still_reads(
+    previous: str, old: Sequence[str], environment: dict[str, str], clients: Sequence[str], home: pathlib.Path
+) -> list[str]:
+    """Downgrading replaces the executable again; the earlier release must still read the config
+    and integration state the candidate left behind."""
+    problems = []
+    for command in (["config", "show"], ["integrations", "status", *_client_arguments(clients)]):
+        downgraded = _run([*old, *command], environment)
+        if downgraded.returncode != 0:
+            problems.append(f"{previous} `aise {' '.join(command[:2])}` failed after the candidate "
+                            f"ran: {downgraded.stderr.strip().replace(str(home), '~')}")
+    return problems
+
+
+# These provider fixtures exercise both changed parser contracts and the released schema.
+# Keep them shared with the Rust upgrade regression instead of maintaining two transcript shapes.
+UPGRADE_FIXTURES = pathlib.Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/tests/fixtures"
+
+
+def populated_index_snapshot(path: pathlib.Path) -> dict[str, list[tuple[object, ...]]]:
+    """Compare message multisets (including seq), provenance, edits, and transcripts."""
+    queries = {
+        "messages": "select session_id,provider,seq,role,ts,kind,content,tool_name,tool_call_id,is_compaction,authorship,correlation_authority,correlation_scope,correlation_id,input_delivery_state,input_origin,record_relation from messages order by session_id,seq,id",
+        "file_edits": "select session_id,provider,seq,file_path,file_name,ts,tool,new_content,edits_json from file_edits order by session_id,seq,id",
+        "transcripts": "select session_id,transcript_text from transcripts order by session_id",
+        "content_parts": "select m.session_id,m.seq,p.ordinal,p.start_char,p.end_char,p.authorship,p.origin from message_content_parts p join messages m on m.id=p.message_id order by m.session_id,m.seq,p.ordinal",
+    }
+    with sqlite3.connect(path.as_uri() + "?immutable=1", uri=True) as database:
+        snapshot = {name: database.execute(sql).fetchall() for name, sql in queries.items()}
+        # Retain every occurrence across every session, independently of presentation order.
+        snapshot["messages"].sort(key=repr)
+        return snapshot
+
+
+def write_upgrade_sources(sources: pathlib.Path) -> None:
+    """Synthetic formats for every provider supported by the published stable release."""
+    def write(relative: str, value: object, *, jsonl: bool = False) -> None:
+        path = sources / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = "".join(json.dumps(row) + "\n" for row in value) if jsonl else json.dumps(value)
+        path.write_text(text, encoding="utf-8")
+
+    for provider in ("claude", "codex"):
+        destination = sources / provider
+        destination.mkdir(parents=True)
+        shutil.copyfile(UPGRADE_FIXTURES / f"v1_0_0_{provider}.jsonl", destination / "session.jsonl")
+    shutil.copyfile(UPGRADE_FIXTURES / "v1_0_0_queue.jsonl", sources / "claude/queue.jsonl")
+    write("claude-desktop/local-agent-mode-sessions/install/account/local_upgrade-desktop/audit.jsonl", [
+        {"type": "user", "uuid": "desktop-input", "session_id": "upgrade-desktop",
+         "_audit_timestamp": "2026-06-01T10:00:00Z", "message": {"role": "user", "content": "synthetic desktop question"}},
+    ], jsonl=True)
+    write("cursor/project/agent-transcripts/upgrade-cursor/upgrade-cursor.jsonl", [
+        {"role": "user", "message": {"content": [{"type": "text", "text": "synthetic cursor question"}]}},
+    ], jsonl=True)
+    write("antigravity/upgrade-antigravity/.system_generated/logs/transcript.jsonl", [
+        {"step_index": 1, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+         "created_at": "2026-06-01T10:00:00Z", "content": "synthetic antigravity question"},
+    ], jsonl=True)
+    for provider in ("pi", "prime-agent"):
+        name = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl" if provider == "prime-agent" else "2026-06-01T10-00-00-000Z_upgrade-pi.jsonl"
+        write(f"{provider}/project/{name}", [
+            {"type": "session", "version": 3, "id": f"upgrade-{provider}",
+             "timestamp": "2026-06-01T10:00:00Z", "cwd": "/fixture/project"},
+            {"type": "message", "id": "input", "timestamp": "2026-06-01T10:00:00Z",
+             "message": {"role": "user", "content": [{"type": "text", "text": f"synthetic {provider} question"}]}},
+        ], jsonl=True)
+    write("aistudio/session.json", {"chunkedPrompt": {"chunks": [{"role": "user", "text": "synthetic studio question"}]}})
+    write("gemini-cli/project/chats/session-upgrade.json", {"sessionId": "upgrade-gemini",
+        "startTime": "2026-06-01T10:00:00Z", "lastUpdated": "2026-06-01T10:01:00Z",
+        "messages": [{"id": "input", "type": "user", "timestamp": "2026-06-01T10:00:00Z", "content": "synthetic gemini question"}]})
+
+
+def check_populated_upgrade(old: Sequence[str], executable: pathlib.Path) -> list[str]:
+    """Refresh a published writer's populated index and compare with a fresh candidate.
+
+    Callable offline with a locally supplied baseline command; the release orchestrator still
+    uses the published uvx command for each release. Sources are shared, so source timestamps
+    and paths cannot create false differences between the fresh and upgraded indexes.
+    """
+    with tempfile.TemporaryDirectory(prefix="aise-populated-upgrade-") as directory:
+        root = pathlib.Path(directory).resolve()
+        sources = root / "sources"
+        write_upgrade_sources(sources)
+
+        probe = isolated_environment(root / "probe")
+        probe_config = pathlib.Path(probe["AI_SESSION_SEARCH_CONFIG"])
+        probe_config.parent.mkdir(parents=True, exist_ok=True)
+        probe_config.write_text("[index]\n", encoding="utf-8")
+        paths = _run([*old, "config", "paths", "--format", "json"], probe)
+        shown = _run([*old, "config", "show", "--format", "json"], probe)
+        if paths.returncode or shown.returncode:
+            raise UpgradeCheckUnavailable(f"could not learn published providers: {shown.stderr.strip()}")
+        supported = {name.replace("_", "-") for name in json.loads(shown.stdout)["providers"]}
+
+        def environment(label: str) -> dict[str, str]:
+            home = root / label
+            home.mkdir()
+            env = isolated_environment(home)
+            config = pathlib.Path(env["AI_SESSION_SEARCH_CONFIG"])
+            config.parent.mkdir(parents=True, exist_ok=True)
+            text = '[index]\nrefresh = "auto"\n'
+            names = (supported if label == "seed" else {
+                "claude", "codex", "claude-desktop", "cursor", "antigravity",
+                "pi", "prime-agent", "aistudio", "gemini-cli",
+            })
+            for provider in sorted(names):
+                enabled = True
+                paths = [str(sources / provider)]
+                text += f"[providers.{provider}]\nenabled = {str(enabled).lower()}\npaths = {json.dumps(paths)}\n"
+            config.write_text(text, encoding="utf-8")
+            return env
+
+        def run(command: Sequence[str], args: Sequence[str], env: dict[str, str]) -> None:
+            paths = _run([*command, "config", "paths", "--format", "json"], env)
+            if paths.returncode:
+                raise UpgradeCheckUnavailable(f"config paths failed: {paths.stderr.strip()}")
+            result = _run([*command, *args], env)
+            if result.returncode:
+                raise UpgradeCheckUnavailable(f"populated {' '.join(args)} failed: {result.stderr.strip()}")
+
+        seed = environment("seed")
+        run(old, ["reindex", "--full"], seed)
+        seed_path = pathlib.Path(seed["AI_SESSION_SEARCH_DATABASE"])
+        with sqlite3.connect(seed_path.as_uri() + "?immutable=1", uri=True) as database:
+            providers = {row[0] for row in database.execute("select distinct provider from messages")}
+            edits = database.execute("select count(*) from file_edits").fetchone()[0]
+        if providers != supported or not edits:
+            return [f"published index provider coverage differs: expected {sorted(supported)}, "
+                    f"populated {sorted(providers)}, file edits={edits}"]
+        try:
+            fresh = environment("fresh")
+            run([str(executable)], ["reindex", "--full"], fresh)
+            expected = populated_index_snapshot(pathlib.Path(fresh["AI_SESSION_SEARCH_DATABASE"]))
+            problems = []
+            for full in (False, True):
+                env = environment("full" if full else "incremental")
+                database = pathlib.Path(env["AI_SESSION_SEARCH_DATABASE"])
+                database.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(seed_path, database)
+                # An ordinary writable open must finish the additive migration before refresh.
+                run([str(executable)], ["list", "--format", "json"], env)
+                run([str(executable)], ["reindex", *(["--full"] if full else [])], env)
+                observed = populated_index_snapshot(database)
+                problems += [f"populated full={full}: {name} differs from fresh candidate"
+                             for name in expected if observed[name] != expected[name]]
+            return problems
+        except UpgradeCheckUnavailable as error:
+            return [str(error)]
+
+
 def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
     """Return the problems an upgrade from ``previous`` to ``executable`` leaves behind."""
+    released = ["uvx", "--quiet", "--from", f"ai-session-search=={previous}", "aise"]
+    problems = check_populated_upgrade(released, executable)
     if previous == "1.0.0":
-        archive_problems = check_archive_write_paths(
-            ["uvx", "--quiet", "--from", "ai-session-search==1.0.0", "aise"], executable,
-        )
-        if archive_problems:
-            return archive_problems
+        problems += check_archive_write_paths(released, executable)
+        problems += check_downgrade(released, executable)
+    if problems:
+        return problems
     home = pathlib.Path(tempfile.mkdtemp(prefix="aise-upgrade-")).resolve()
     cleanup = True
     try:
@@ -301,9 +569,8 @@ def check_upgrade(previous: str, executable: pathlib.Path) -> list[str]:
         )
         if status.returncode != 0:
             return [f"integrations status failed after upgrading from {previous}: {status.stderr}"]
-        return [
-            line.replace(str(home), "~") for line in problems_in_status(status.stdout)
-        ]
+        problems = [line.replace(str(home), "~") for line in problems_in_status(status.stdout)]
+        return problems + _earlier_release_still_reads(previous, old, old_environment, clients, home)
 
     except BackgroundChildrenAlive as error:
         cleanup = False
@@ -357,7 +624,8 @@ def _check_all(versions: list[str], executable: pathlib.Path) -> int:
             for problem in problems:
                 print(f"  {problem}", file=sys.stderr)
         else:
-            print(f"upgrading from {previous}: its config loads and every integration is current")
+            print(f"upgrading from {previous}: its config loads, every integration is current, "
+                  f"and {previous} still loads both after a downgrade")
     if failed:
         return 1
     return 2 if unavailable else 0

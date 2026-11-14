@@ -12,6 +12,7 @@ use crate::config::{SearchScopeConfig, SearchScopeMode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum AccessRootOrigin {
     HarnessRoots,
     ExplicitConfig,
@@ -77,6 +78,7 @@ impl AccessRoot {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TrustedAccessInputs {
     pub harness_roots: Vec<PathBuf>,
     pub invocation_directory: Option<PathBuf>,
@@ -100,6 +102,7 @@ impl TrustedAccessInputs {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
+#[non_exhaustive]
 pub enum EffectiveAccessScope {
     All,
     AllowedRoots { roots: Vec<AccessRoot> },
@@ -158,6 +161,11 @@ impl EffectiveAccessScope {
         Ok(Self::AllowedRoots { roots })
     }
 
+    /// Check the policy variant in constant time.
+    #[deprecated(
+        since = "1.1.0",
+        note = "match EffectiveAccessScope for policy inspection; use CatalogService::list_sessions for scope-enforced reads"
+    )]
     pub const fn is_unrestricted(&self) -> bool {
         matches!(self, Self::All)
     }
@@ -173,6 +181,11 @@ impl EffectiveAccessScope {
         self.roots().iter().flat_map(AccessRoot::database_prefixes)
     }
 
+    /// Check lexical path containment against all configured root aliases; allocates the normalized path.
+    #[deprecated(
+        since = "1.1.0",
+        note = "use CatalogService::list_sessions for authoritative scope-enforced reads"
+    )]
     pub fn allows_workspace_path(&self, path: &Path) -> bool {
         match self {
             Self::All => true,

@@ -17,6 +17,711 @@ use std::os::unix::fs::PermissionsExt as _;
 mod support;
 use support::aise;
 
+#[test]
+fn upgrade_migrates_published_mcp_registrations_without_installing_skills() {
+    for client in [
+        "opencode",
+        "cursor",
+        "codex",
+        "foreign-bare",
+        "foreign-args",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let mut command = aise(root.path());
+        for key in include_str!("../harness-environment.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            command.env_remove(key);
+        }
+        let binary = env!("CARGO_BIN_EXE_aise");
+        let (relative, original) = match client {
+            "codex" => (".codex/config.toml", format!("[mcp_servers.ai-session-search]\ncommand = {}\nargs = ['mcp', 'serve']\n", serde_json::json!(binary))),
+            "cursor" => (".cursor/mcp.json", serde_json::json!({"mcpServers":{"ai-session-search":{"command":binary,"args":["mcp","serve"]}}}).to_string()),
+            _ => {
+                let args = match client {
+                    "foreign-bare" => vec![binary],
+                    "foreign-args" => vec![binary, "serve"],
+                    _ => vec![binary,"mcp","serve"],
+                };
+                (".config/opencode/opencode.json", serde_json::json!({"mcp":{"ai-session-search":{"command":args,"enabled":true}}}).to_string())
+            }
+        };
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, &original).unwrap();
+        assert!(!root.path().join("skill-install-manifest.json").exists());
+        let output = command
+            .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+            .args(["dates"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if client.starts_with("foreign") {
+            assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        } else if client == "codex" {
+            let text = fs::read_to_string(&path).unwrap();
+            let value: toml::Value = toml::from_str(&text).unwrap();
+            assert_eq!(
+                value["marketplaces"]["ai-session-search"]["source_type"].as_str(),
+                Some("local")
+            );
+            assert!(root
+                .path()
+                .join("codex-marketplace/plugins/ai-session-search/.mcp.json")
+                .exists());
+        } else {
+            let value: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            if client == "opencode" {
+                assert_eq!(
+                    value["mcp"]["servers"]["ai-session-search"]["type"],
+                    "local"
+                );
+                assert!(value["mcp"].get("ai-session-search").is_none());
+                assert_eq!(
+                    value["mcp"]["servers"]["ai-session-search"]["command"],
+                    serde_json::json!([binary, "mcp", "serve"])
+                );
+            } else {
+                assert_eq!(value["mcpServers"]["ai-session-search"]["type"], "stdio");
+                assert_eq!(value["mcpServers"]["ai-session-search"]["command"], binary);
+            }
+        }
+        assert!(!root.path().join("skill-install-manifest.json").exists());
+        assert!(!root.path().join("skills").exists());
+        assert!(!root.path().join(".agents/skills").exists());
+        assert!(!root.path().join(".claude.json").exists());
+        if client != "codex" {
+            assert!(!root.path().join(".codex/config.toml").exists());
+        }
+        if !client.starts_with("foreign") {
+            assert!(root.path().join("integrations-refreshed-version").is_file());
+            let before = fs::read(&path).unwrap();
+            let repeated = command.output().unwrap();
+            assert!(repeated.status.success());
+            assert!(!String::from_utf8_lossy(&repeated.stderr).contains("moved the aise MCP"));
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn empty_integration_refresh_is_cached_until_the_next_version() {
+    let root = tempfile::tempdir().unwrap();
+    let run = || {
+        let mut command = aise(root.path());
+        for key in include_str!("../harness-environment.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            command.env_remove(key);
+        }
+        let output = command
+            .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+            .args(["dates"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let configs = [
+        (
+            ".codex/config.toml",
+            "[mcp_servers.synthetic]\ncommand = '/synthetic/other'\nargs = ['serve']\n",
+        ),
+        (
+            ".claude.json",
+            r#"{"mcpServers":{"synthetic":{"command":"/synthetic/other","args":["serve"]}}}"#,
+        ),
+        (
+            ".config/opencode/opencode.json",
+            r#"{"mcp":{"ai-session-search":{"command":["/synthetic/other","serve"],"user_setting":true}}}"#,
+        ),
+    ];
+    for (relative, text) in configs {
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    assert!(run().stderr.is_empty());
+    let marker = root.path().join("integrations-refreshed-version");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("an empty refresh must record its version"),
+        format!("{}\n", env!("CARGO_PKG_VERSION"))
+    );
+    for (relative, text) in configs {
+        assert_eq!(
+            fs::read_to_string(root.path().join(relative)).unwrap(),
+            text
+        );
+    }
+    assert!(!root.path().join("skill-install-manifest.json").exists());
+    assert!(!root.path().join("skills").exists());
+
+    // A registration added after the completed check is left for the next version.
+    let path = root.path().join(configs[2].0);
+    let recognized = serde_json::json!({"mcp":{"ai-session-search":{"command":[env!("CARGO_BIN_EXE_aise"),"mcp","serve"]}}}).to_string();
+    fs::write(&path, &recognized).unwrap();
+    assert!(run().stderr.is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), recognized);
+    fs::write(&marker, "0.0.0\n").unwrap();
+    run();
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        after["mcp"]["servers"]["ai-session-search"]["type"],
+        "local"
+    );
+    assert!(after["mcp"].get("ai-session-search").is_none());
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        format!("{}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(!root.path().join("skill-install-manifest.json").exists());
+}
+
+#[test]
+fn integration_refresh_marker_failure_keeps_mcp_stdout_valid() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("integrations-refreshed-version");
+    fs::create_dir(&marker).unwrap();
+    let mut child = aise(root.path())
+        .args(["mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for message in [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"synthetic-marker-test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stdout must contain only MCP frames"))
+        .collect();
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 1 && response["result"].is_object()));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 2 && response["result"]["tools"].is_array()));
+    assert!(
+        marker.is_dir(),
+        "a failed marker write must not replace the destination"
+    );
+}
+
+#[test]
+fn automatic_mcp_refresh_preserves_unrecognized_duplicates() {
+    for case in ["opencode-old", "opencode-current", "claude", "codex"] {
+        let root = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let mut command = aise(root.path());
+            for key in include_str!("../harness-environment.txt")
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            {
+                command.env_remove(key);
+            }
+            command
+                .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let binary = env!("CARGO_BIN_EXE_aise");
+        let current =
+            serde_json::json!({"type":"local","command":[binary,"mcp","serve"],"timeout":123});
+        let foreign = serde_json::json!({"command":["/synthetic/other","serve"],"user_settings":{"keep":true}});
+        let client = if case.starts_with("opencode") {
+            "opencode"
+        } else {
+            case
+        };
+        let path = root.path().join(match client {
+            "opencode" => ".config/opencode/opencode.json",
+            "claude" => ".claude.json",
+            _ => ".codex/config.toml",
+        });
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = match case {
+            "opencode-old" => serde_json::json!({"mcp":{"servers":{"ai-session-search":current},"ai-session-search":foreign}}).to_string(),
+            "opencode-current" => serde_json::json!({"mcp":{"servers":{"ai-session-search":current,"aise":foreign}}}).to_string(),
+            "claude" => serde_json::json!({"mcpServers":{"ai-session-search":{"command":binary,"args":["mcp","serve"]}}}).to_string(),
+            _ => format!("[mcp_servers.ai-session-search]\ncommand = {}\nargs = ['mcp', 'serve']\n[mcp_servers.aise]\ncommand = '/synthetic/other'\nargs = ['serve']\nuser_setting = true\n", serde_json::json!(binary)),
+        };
+        fs::write(&path, &original).unwrap();
+        let old_path = root.path().join(".claude/.mcp.json");
+        let old_text = serde_json::json!({"mcpServers":{"ai-session-search":foreign}}).to_string();
+        if case == "claude" {
+            fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+            fs::write(&old_path, &old_text).unwrap();
+        }
+        for args in [
+            vec!["dates"],
+            vec![
+                "integrations",
+                "status",
+                "--client",
+                client,
+                "--no-aliases",
+                "--format",
+                "json",
+            ],
+        ] {
+            let output = run(&args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                original,
+                "preserve the customized duplicate: {case}"
+            );
+            if case == "claude" {
+                assert_eq!(fs::read_to_string(&old_path).unwrap(), old_text);
+            }
+            if args[0] == "integrations" {
+                let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(
+                    status["integrations"].as_array().unwrap().iter().any(
+                        |entry| entry["component"] == "mcp"
+                            // Compare as paths: the fixture joins a `/`-separated suffix,
+                            // and the report uses the host separator.
+                            && entry["path"].as_str().map(std::path::Path::new)
+                                == Some(path.as_path())
+                            && entry["state"] == "stale"
+                            && entry["current"] == false
+                    ),
+                    "{status}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn codex_marketplace_edits_survive_reinstall_refresh_and_uninstall() {
+    for action in ["install", "refresh", "uninstall"] {
+        for edited in [
+            "plugin",
+            "listing",
+            "server",
+            "registration",
+            "registration_comment",
+            "record",
+            "foreign",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let run = |args: &[&str]| {
+                let mut command = aise(root.path());
+                command
+                    .env_remove("CODEX_HOME")
+                    .args(args)
+                    .output()
+                    .unwrap()
+            };
+            let binary = env!("CARGO_BIN_EXE_aise");
+            let install = [
+                "integrations",
+                "install",
+                "--client",
+                "codex",
+                "--no-instructions",
+                "--no-aliases",
+                "--no-index-preparation",
+                "--binary",
+                binary,
+            ];
+            let config = root.path().join(".codex/config.toml");
+            let marketplace = root.path().join("codex-marketplace");
+            let files = [
+                marketplace.join(".agents/plugins/marketplace.json"),
+                marketplace.join("plugins/ai-session-search/.codex-plugin/plugin.json"),
+                marketplace.join("plugins/ai-session-search/.mcp.json"),
+            ];
+            if edited == "foreign" {
+                let skill = run(&[
+                    "integrations",
+                    "install",
+                    "--client",
+                    "codex",
+                    "--no-mcp",
+                    "--no-instructions",
+                    "--no-aliases",
+                    "--no-index-preparation",
+                ]);
+                assert!(
+                    skill.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&skill.stderr)
+                );
+                fs::create_dir_all(config.parent().unwrap()).unwrap();
+                fs::write(&config, format!("[mcp_servers.ai-session-search]\ncommand = {}\nargs = ['mcp', 'serve']\n\n# my marketplace\n[marketplaces.ai-session-search]\nsource_type = 'local'\nsource = '/synthetic/foreign-marketplace'\ncustom = true\n", serde_json::json!(binary))).unwrap();
+            } else {
+                let installed = run(&install);
+                assert!(
+                    installed.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&installed.stderr)
+                );
+                if edited == "record" {
+                    fs::write(marketplace.with_extension("install-manifest.json"), "{").unwrap();
+                } else if edited == "registration_comment" {
+                    let text = fs::read_to_string(&config).unwrap();
+                    fs::write(
+                        &config,
+                        text.replace(
+                            "[marketplaces.ai-session-search]",
+                            "# synthetic marketplace note\n[marketplaces.ai-session-search]",
+                        ),
+                    )
+                    .unwrap();
+                } else if edited == "registration" {
+                    let mut document: toml_edit::DocumentMut =
+                        fs::read_to_string(&config).unwrap().parse().unwrap();
+                    document["marketplaces"]["ai-session-search"]["custom"] =
+                        toml_edit::value("keep");
+                    fs::write(&config, document.to_string()).unwrap();
+                } else {
+                    let index = match edited {
+                        "listing" => 0,
+                        "plugin" => 1,
+                        _ => 2,
+                    };
+                    let mut value: serde_json::Value =
+                        serde_json::from_str(&fs::read_to_string(&files[index]).unwrap()).unwrap();
+                    if edited == "listing" {
+                        value["plugins"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(serde_json::json!({"name":"synthetic-other-plugin"}));
+                    } else {
+                        value["user_extension"] = serde_json::json!("keep");
+                    }
+                    fs::write(&files[index], format!("{value}\n")).unwrap();
+                }
+            }
+            let before_files: Vec<_> = files.iter().map(|path| fs::read(path).ok()).collect();
+            let before_record = fs::read(marketplace.with_extension("install-manifest.json")).ok();
+            let before_config = fs::read_to_string(&config).unwrap();
+            let before_table = before_config.parse::<toml_edit::DocumentMut>().unwrap()
+                ["marketplaces"]["ai-session-search"]
+                .to_string();
+            let output = match action {
+                "install" => run(&install),
+                "refresh" => run(&["dates"]),
+                _ => run(&[
+                    "integrations",
+                    "uninstall",
+                    "--client",
+                    "codex",
+                    "--keep-skill",
+                    "--keep-instructions",
+                    "--keep-aliases",
+                ]),
+            };
+            for (path, before) in files.iter().zip(before_files) {
+                assert!(
+                    fs::read(path).ok() == before,
+                    "{action} {edited}: {} changed",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                fs::read(marketplace.with_extension("install-manifest.json")).ok(),
+                before_record
+            );
+            let after_config = fs::read_to_string(&config).unwrap();
+            if edited == "registration_comment" {
+                assert!(after_config.contains("# synthetic marketplace note"));
+            }
+            let after_table = after_config.parse::<toml_edit::DocumentMut>().unwrap()
+                ["marketplaces"]["ai-session-search"]
+                .to_string();
+            assert_eq!(after_table, before_table, "{action} {edited}");
+            if action == "install" {
+                assert!(!output.status.success());
+                assert_eq!(
+                    after_config, before_config,
+                    "failed preflight must publish nothing"
+                );
+            } else {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn upgrade_preserves_mcp_launch_policy_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut command = aise(root.path());
+        for key in include_str!("../harness-environment.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            command.env_remove(key);
+        }
+        command
+            .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let installed = run(&[
+        "integrations",
+        "install",
+        "--client",
+        "claude",
+        "--no-mcp",
+        "--no-instructions",
+        "--no-aliases",
+        "--no-index-preparation",
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let args = serde_json::json!([
+        "--index-refresh",
+        "existing-only",
+        "--threads=1",
+        "mcp",
+        "serve"
+    ]);
+    let binary = env!("CARGO_BIN_EXE_aise");
+    let entry = serde_json::json!({"command":binary, "args":args, "env":{"SYNTHETIC":"keep"}});
+    let mut command = vec![serde_json::json!(binary)];
+    command.extend(args.as_array().unwrap().clone());
+    for (path, document) in [
+        (
+            ".claude/.mcp.json",
+            serde_json::json!({"mcpServers":{"ai-session-search":entry}}),
+        ),
+        (
+            ".cursor/mcp.json",
+            serde_json::json!({"mcpServers":{"ai-session-search":entry}}),
+        ),
+        (
+            ".config/opencode/opencode.json",
+            serde_json::json!({"mcp":{"ai-session-search":{"command":command,"enabled":true}}}),
+        ),
+        (
+            ".openclaw/openclaw.json",
+            serde_json::json!({"mcpServers":{"ai-session-search":entry}}),
+        ),
+    ] {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, document.to_string()).unwrap();
+    }
+    let codex = root.path().join(".codex/config.toml");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    let toml = format!(
+        "[mcp_servers.ai-session-search]\ncommand = {}\nargs = {args}\n",
+        serde_json::json!(binary)
+    );
+    fs::write(&codex, toml).unwrap();
+    if cfg!(target_os = "macos") {
+        let zed = root
+            .path()
+            .join("Library/Application Support/Zed/settings.json");
+        fs::create_dir_all(zed.parent().unwrap()).unwrap();
+        fs::write(
+            zed,
+            serde_json::json!({"context_servers":{"ai-session-search":entry}}).to_string(),
+        )
+        .unwrap();
+    }
+    let output = run(&["dates"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut paths = vec![
+        (".claude.json", vec!["mcpServers"]),
+        (".cursor/mcp.json", vec!["mcpServers"]),
+        (".config/opencode/opencode.json", vec!["mcp", "servers"]),
+        (".openclaw/openclaw.json", vec!["mcp", "servers"]),
+        (
+            "codex-marketplace/plugins/ai-session-search/.mcp.json",
+            vec!["mcpServers"],
+        ),
+    ];
+    if cfg!(target_os = "macos") {
+        paths.push((".config/zed/settings.json", vec!["context_servers"]));
+    }
+    for (path, keys) in paths {
+        let path = root.path().join(path);
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for key in keys {
+            value = value[key].clone();
+        }
+        let entry = &value["ai-session-search"];
+        if entry["command"].is_array() {
+            assert_eq!(
+                entry["command"],
+                serde_json::json!(command),
+                "{}",
+                path.display()
+            );
+        } else {
+            assert_eq!(entry["args"], args, "{}", path.display());
+        }
+        if path.ends_with(".cursor/mcp.json") {
+            assert_eq!(entry["type"], "stdio");
+        }
+    }
+    let after: toml::Value = toml::from_str(&fs::read_to_string(codex).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&after["mcp_servers"]["ai-session-search"]["args"]).unwrap(),
+        args
+    );
+    let reinstalled = run(&[
+        "integrations",
+        "install",
+        "--client",
+        "claude",
+        "--no-skill",
+        "--no-instructions",
+        "--no-aliases",
+        "--no-index-preparation",
+        "--binary",
+        binary,
+    ]);
+    assert!(
+        reinstalled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reinstalled.stderr)
+    );
+    let explicit: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.path().join(".claude.json")).unwrap())
+            .unwrap();
+    assert!(!explicit["mcpServers"]["ai-session-search"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|arg| arg == "--threads=1" || arg == "--index-refresh"));
+}
+
+#[test]
+fn upgrade_keeps_current_mcp_registration_over_obsolete_duplicates() {
+    for client in ["claude", "opencode"] {
+        let root = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let mut command = aise(root.path());
+            for key in include_str!("../harness-environment.txt")
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            {
+                command.env_remove(key);
+            }
+            command
+                .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let installed = run(&[
+            "integrations",
+            "install",
+            "--client",
+            "claude",
+            "--no-mcp",
+            "--no-instructions",
+            "--no-aliases",
+            "--no-index-preparation",
+        ]);
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let binary = env!("CARGO_BIN_EXE_aise");
+        let current = if client == "opencode" {
+            serde_json::json!({"type":"local", "command":[binary,"mcp","serve"], "env":{"SYNTHETIC":"current"}, "timeout":123})
+        } else {
+            serde_json::json!({"command":binary,"args":["mcp","serve"], "env":{"SYNTHETIC":"current"}, "timeout":123})
+        };
+        let obsolete = serde_json::json!({"command":[root.path().join("removed/aise"),"mcp","serve"], "env":{"SYNTHETIC":"obsolete"}, "obsolete_only":true});
+        let path = root.path().join(if client == "opencode" {
+            ".config/opencode/opencode.json"
+        } else {
+            ".claude.json"
+        });
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let document = if client == "opencode" {
+            serde_json::json!({"mcp":{"servers":{"ai-session-search":current}, "ai-session-search":obsolete}})
+        } else {
+            let legacy = root.path().join(".claude/.mcp.json");
+            fs::write(legacy, serde_json::json!({"mcpServers":{"ai-session-search":obsolete,"other":{"command":"keep"}}}).to_string()).unwrap();
+            serde_json::json!({"mcpServers":{"ai-session-search":current}})
+        };
+        fs::write(&path, format!("{document}\n")).unwrap();
+        let output = run(&["dates"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        if client == "opencode" {
+            assert_eq!(after["mcp"]["servers"]["ai-session-search"], current);
+            assert!(after["mcp"].get("ai-session-search").is_none());
+        } else {
+            assert_eq!(after["mcpServers"]["ai-session-search"], current);
+            let legacy: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(root.path().join(".claude/.mcp.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                legacy["mcpServers"],
+                serde_json::json!({"other":{"command":"keep"}})
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn skills_update_keeps_legacy_link_retirement_inside_the_selected_harness_home() {
@@ -599,6 +1304,14 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
             .len(),
         28
     );
+    assert!(specification["configured_default"]
+        .get("input_scope")
+        .is_none());
+    assert!(specification["registry"]["parameters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|descriptor| descriptor["parameter"] == "role"));
     assert!(specification["registry"]["rules"]
         .as_array()
         .unwrap()
@@ -847,6 +1560,139 @@ fn doctor_json_with_unindexed_explanations_is_one_structured_document() {
     assert_eq!(
         document["unindexed_file_explanations"],
         serde_json::json!([])
+    );
+}
+
+/// Runs `aise doctor` in `root` with `HOME` there and returns its standard output.
+fn doctor_output(root: &std::path::Path, config: Option<&std::path::Path>, format: &str) -> String {
+    let mut command = aise(root);
+    command.env("HOME", root).env("USERPROFILE", root);
+    match config {
+        Some(config) => command.arg("--config").arg(config),
+        None => command.env_remove("AI_SESSION_SEARCH_CONFIG"),
+    };
+    let output = command
+        .args([
+            "--index-refresh",
+            "existing-only",
+            "doctor",
+            "--format",
+            format,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// Writes a config file whose one unrecognized key `marker` shows up in `doctor` only when this
+/// is the file that was read.
+fn write_marked_config(path: &std::path::Path, marker: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, format!("[search]\n{marker} = 1\n")).unwrap();
+}
+
+/// A setting that has no effect is usually in a file aise is not reading. `doctor` names the file
+/// in use with how it was selected, in both formats, and that file is the one whose settings apply.
+#[test]
+fn doctor_names_the_config_file_in_use() {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let mut selected = fs::read_to_string(&config).unwrap();
+    selected.push_str("[search]\nmarker_selected = 1\n");
+    fs::write(&config, selected).unwrap();
+    ai_session_search::db::Db::open(&root.path().join("index.db")).unwrap();
+    write_marked_config(
+        &root.path().join(".ai-session-search/config.toml"),
+        "marker_unread",
+    );
+
+    let text = doctor_output(root.path(), Some(&config), "table");
+    assert!(
+        text.contains(&format!("Config: {} (cli --config)\n", config.display())),
+        "{text}"
+    );
+    assert!(text.contains("marker_selected"), "{text}");
+    assert!(!text.contains("marker_unread"), "{text}");
+
+    let document: serde_json::Value =
+        serde_json::from_str(&doctor_output(root.path(), Some(&config), "json")).unwrap();
+    assert_eq!(
+        document["config_file"],
+        serde_json::json!({"path": config, "origin": "cli --config", "exists": true})
+    );
+    assert!(document["config_files_not_read"].is_array());
+}
+
+/// `doctor` lists every other config file at a discovery location, never the active file under
+/// another spelling, and says when no file exists. Unix only: there the home directory follows
+/// `HOME`, while Windows asks the system for the profile directory and ignores the environment.
+#[cfg(unix)]
+#[test]
+fn doctor_lists_the_discovered_config_files_it_does_not_read() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().canonicalize().unwrap();
+    ai_session_search::db::Db::open(&home.join("index.db")).unwrap();
+    let app = home.join(".ai-session-search/config.toml");
+    let legacy = home.join(".config/ai-session-search/config.toml");
+
+    let text = doctor_output(&home, None, "table");
+    assert!(
+        text.contains(&format!(
+            "Config: {} (platform/legacy discovery; no file there, built-in defaults in use)\n",
+            app.display()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("Config file not read"), "{text}");
+
+    write_marked_config(&legacy, "marker_legacy");
+    let text = doctor_output(&home, None, "table");
+    assert!(
+        text.contains(&format!(
+            "Config: {} (platform/legacy discovery)\n",
+            legacy.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("marker_legacy"), "{text}");
+    assert!(!text.contains("Config file not read"), "{text}");
+
+    write_marked_config(&app, "marker_app");
+    let text = doctor_output(&home, None, "table");
+    assert!(
+        text.contains(&format!(
+            "Config: {} (platform/legacy discovery)\n",
+            app.display()
+        )),
+        "{text}"
+    );
+    assert!(text.contains("marker_app"), "{text}");
+    assert!(!text.contains("marker_legacy"), "{text}");
+    assert_eq!(text.matches("Config file not read: ").count(), 1, "{text}");
+    assert!(
+        text.contains(&format!("Config file not read: {}\n", legacy.display())),
+        "{text}"
+    );
+    let document: serde_json::Value =
+        serde_json::from_str(&doctor_output(&home, None, "json")).unwrap();
+    assert_eq!(
+        document["config_files_not_read"],
+        serde_json::json!([legacy])
+    );
+
+    // The active file named through a symbolic link is still the active file.
+    let alias = home.join("alias");
+    std::os::unix::fs::symlink(app.parent().unwrap(), &alias).unwrap();
+    let text = doctor_output(&home, Some(&alias.join("config.toml")), "table");
+    assert_eq!(text.matches("Config file not read: ").count(), 1, "{text}");
+    assert!(
+        text.contains(&format!("Config file not read: {}\n", legacy.display())),
+        "{text}"
     );
 }
 
@@ -2208,7 +3054,7 @@ fn a_reader_answers_while_another_process_holds_the_index_writer_lock() {
 }
 
 #[test]
-fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
+fn cli_resume_without_terminal_prints_command_without_prompt_or_provider() {
     let root = tempfile::tempdir().unwrap();
     let config = write_disabled_provider_config(root.path());
 
@@ -2266,7 +3112,8 @@ fn cli_resume_confirmation_reads_stdin_and_cancels_without_spawning_provider() {
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("codex resume resume-test"), "{stdout}");
-    assert!(stdout.contains("resume cancelled"), "{stdout}");
+    assert!(!stdout.contains("Execute resume command?"), "{stdout}");
+    assert!(!stdout.contains("resume cancelled"), "{stdout}");
 }
 
 /// A ceiling set in the registration `env` block is the ceiling the served result is measured
@@ -2848,7 +3695,7 @@ fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
 #[test]
 fn skills_validate_exits_nonzero_and_keeps_the_report_on_stdout() {
     let root = tempfile::tempdir().unwrap();
-    // One invalid SKILL.md and one invalid capability.toml prove diagnostics from both files are
+    // One invalid SKILL.md and one invalid aise-capability.toml prove diagnostics from both files are
     // reported in one run.
     write_test_skill(
         root.path(),
@@ -3271,4 +4118,114 @@ fn skills_update_works_with_a_config_outside_the_default_location() {
         String::from_utf8_lossy(&updated.stderr)
     );
     assert!(!skill.exists(), "a deleted skill must stay deleted");
+}
+
+fn deprecated_cli_output(arguments: &[&str]) -> std::process::Output {
+    let root = tempfile::tempdir().unwrap();
+    let config = write_disabled_provider_config(root.path());
+    let index = aise(root.path())
+        .args(["--config", config.to_str().unwrap(), "reindex"])
+        .output()
+        .unwrap();
+    assert!(
+        index.status.success(),
+        "{}",
+        String::from_utf8_lossy(&index.stderr)
+    );
+    aise(root.path())
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--index-refresh",
+            "existing-only",
+        ])
+        .args(arguments)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cli_repeat_limit_notice_names_max_candidates() {
+    let output = deprecated_cli_output(&["repeats", "--limit", "0"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated") && stderr.contains("--max-candidates"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn cli_cross_ref_pattern_notice_names_positional_argument() {
+    let output = deprecated_cli_output(&["files", "cross-ref", "--pattern", "*.rs"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated") && stderr.contains("aise files cross-ref PATTERN"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn cli_show_summary_notice_names_messages_evidence() {
+    let output = deprecated_cli_output(&[
+        "show",
+        "missing",
+        "--summary",
+        "--summary-items",
+        "2",
+        "--preview-chars",
+        "20",
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated") && stderr.contains("aise messages evidence"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn migrate_config_keeps_its_required_cache_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let paths = aise(root).args(["config", "paths"]).output().unwrap();
+    assert!(
+        paths.status.success(),
+        "{}",
+        String::from_utf8_lossy(&paths.stderr)
+    );
+    let source = root.join("legacy.json");
+    let destination = root.join("converted.toml");
+    let database = root.join("archive.db");
+    let cache = root.join("converted-cache");
+    std::fs::write(&source, "{}").unwrap();
+    let output = aise(root)
+        .args(["migrate", "config", "--source-json"])
+        .arg(&source)
+        .arg("--destination")
+        .arg(&destination)
+        .arg("--database-path")
+        .arg(&database)
+        .arg("--cache-dir")
+        .arg(&cache)
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(destination).unwrap();
+    let config: ai_session_search::config::Config = toml::from_str(&text).unwrap();
+    assert_eq!(config.cache_dir(), cache);
+    assert_eq!(config.db_path(), database);
 }

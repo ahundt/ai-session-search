@@ -84,27 +84,37 @@ fn fixture() -> Fixture {
         "tool" => Role::Tool,
         other => panic!("fixture role {other}"),
     };
-    let message = |seq: i64, role: Role, content: String| Message {
-        seq,
-        role,
-        ts: None,
-        tool_name: None,
-        kind: MessageKind::Conversation,
-        tool_call_id: None,
-        content,
-        is_compaction: false,
-        provenance: Default::default(),
+    let message = |seq: i64, role: Role, content: String| {
+        let mut value = Message::new(seq, role, content);
+        value.provenance = {
+            let mut provenance = ai_session_search::models::MessageProvenance::default();
+            provenance.authorship = if role == Role::User {
+                ai_session_search::models::MessageAuthorship::Human
+            } else {
+                ai_session_search::models::MessageAuthorship::Agent
+            };
+            provenance.record_relation = ai_session_search::models::MessageRecordRelation::Original;
+            provenance
+        };
+        value
     };
     let mut messages: Vec<Message> = spec["messages"]
         .as_array()
         .unwrap()
         .iter()
         .map(|m| {
-            message(
+            let mut message = message(
                 m["seq"].as_i64().unwrap(),
                 role(m["role"].as_str().unwrap()),
                 m["content"].as_str().unwrap().to_string(),
-            )
+            );
+            if let Some(provenance) = m.get("provenance") {
+                message.provenance = serde_json::from_value(provenance.clone()).unwrap();
+            }
+            if let Some(kind) = m.get("kind") {
+                message.kind = serde_json::from_value(kind.clone()).unwrap();
+            }
+            message
         })
         .collect();
     let bulk = &spec["bulk"];
@@ -145,32 +155,21 @@ fn fixture() -> Fixture {
     let session_id = spec["session_id"].as_str().unwrap().to_string();
     let db = Db::open(&db_path).unwrap();
     db.upsert_session(
-        &ParsedSession {
-            session: SessionRecord {
-                id: session_id.clone(),
-                provider: Provider::Claude,
-                provider_session_id: session_id.trim_start_matches("claude:").into(),
-                title: None,
-                summary: None,
-                cwd: None,
-                repo_root: None,
-                created_at: None,
-                updated_at: None,
-                last_message_at: None,
-                preview_text: String::new(),
-                source_path: "/fixture/parity.jsonl".into(),
-                message_count: Some(messages.len() as i64),
-                parse_version: "parity-fixture-v1".into(),
-                raw_metadata_json: None,
-                parse_warning: None,
-                discovery_source: "test-fixture".into(),
-                parent_session_id: None,
-                agent_label: None,
+        &ParsedSession::new(
+            {
+                let mut value = SessionRecord::new(
+                    session_id.clone(),
+                    Provider::Claude,
+                    session_id.trim_start_matches("claude:"),
+                    "/fixture/parity.jsonl",
+                    "parity-fixture-v1",
+                    "test-fixture",
+                );
+                value.message_count = Some(messages.len() as i64);
+                value
             },
-            transcript_text: String::new(),
             messages,
-            file_edits: Vec::new(),
-        },
+        ),
         0,
         0,
     )
@@ -223,6 +222,7 @@ fn expected(spec: &Value, value: &Value) -> Ids {
 /// deliberately surface-specific omitted limit.
 #[derive(Clone, Debug)]
 struct Search {
+    role: Option<String>,
     mode: String,
     /// `None` searches content; otherwise the snake_case field name MCP and Python use.
     field: Option<String>,
@@ -236,6 +236,7 @@ struct Search {
 impl Search {
     fn from_case(case: &Value) -> Self {
         Self {
+            role: case["role"].as_str().map(str::to_owned),
             mode: case["mode"].as_str().unwrap().into(),
             field: case["field"].as_str().map(str::to_string),
             query: case["query"].as_str().unwrap().into(),
@@ -252,6 +253,7 @@ fn service_search(f: &Fixture, surface: SearchSurface, search: &Search) -> anyho
     let config = Config::default();
     let service = MessageService::new(&config, &db, surface);
     let query = match search.mode.as_str() {
+        _ if search.query.is_empty() => MessageQuery::All,
         "literal" => MessageQuery::literal(&search.query)?,
         "regex" => MessageQuery::regex(&search.query)?,
         "fuzzy" => MessageQuery::fuzzy(&search.query)?,
@@ -268,6 +270,9 @@ fn service_search(f: &Fixture, surface: SearchSurface, search: &Search) -> anyho
         Some(other) => panic!("field {other}"),
     };
     let mut builder = MessageSearchRequest::builder(query, target).extent(extent);
+    if let Some(value) = &search.role {
+        builder = builder.role(value.parse::<Role>().unwrap());
+    }
     if search.latest_in_session {
         builder = builder
             .session_id(f.spec["session_id"].as_str().unwrap())?
@@ -332,6 +337,9 @@ fn cli_search(f: &Fixture, search: &Search) -> Result<Value, String> {
         "--offset",
         &search.offset.to_string(),
     ]);
+    if let Some(value) = &search.role {
+        command.args(["--role", value]);
+    }
     if let Some(field) = &search.field {
         command.args(["--field", &field.replace('_', "-")]);
     }
@@ -369,6 +377,9 @@ fn mcp_searches(f: &Fixture, searches: &[Search]) -> Vec<Result<Value, String>> 
                 "offset": search.offset,
                 "index_refresh": "existing-only",
             });
+            if let Some(value) = &search.role {
+                arguments["role"] = json!(value);
+            }
             if let Some(field) = &search.field {
                 arguments["field"] = json!(field);
             }
@@ -497,6 +508,7 @@ fn paging_one_row_at_a_time_reproduces_the_whole_order_on_every_interface() {
         let pages: Vec<Search> = (0..want.len() + page)
             .step_by(page)
             .map(|offset| Search {
+                role: walk["role"].as_str().map(str::to_owned),
                 mode: walk["mode"].as_str().unwrap().into(),
                 field: walk["field"].as_str().map(str::to_string),
                 query: walk["query"].as_str().unwrap().into(),
@@ -544,6 +556,7 @@ fn an_omitted_limit_keeps_its_documented_per_surface_meaning() {
     let all = spec["all_surfaces_but_mcp"].as_u64().unwrap() as usize;
     let mcp_page = spec["mcp_default_page"].as_u64().unwrap() as usize;
     let search = Search {
+        role: None,
         mode: "literal".into(),
         field: None,
         query: spec["query"].as_str().unwrap().into(),
@@ -582,6 +595,7 @@ fn an_omitted_limit_keeps_its_documented_per_surface_meaning() {
 fn fuzzy_all_results_is_refused_on_every_interface() {
     let f = fixture();
     let search = Search {
+        role: None,
         mode: "fuzzy".into(),
         field: None,
         query: f.spec["deliberate_differences"]["fuzzy_rejects_all_results"]["query"]
@@ -714,11 +728,12 @@ fn reading_a_shared_seq_returns_every_row_in_one_order_on_every_interface() {
             hit_ids(service.context(&session_id, seq, 0, 0).unwrap()),
             &want,
         );
-        let range = MessageFilters {
-            session_id: Some(session_id.clone()),
-            seq_from: Some(seq),
-            seq_to: Some(seq),
-            ..Default::default()
+        let range = {
+            let mut value = MessageFilters::default();
+            value.session_id = Some(session_id.clone());
+            value.seq_from = Some(seq);
+            value.seq_to = Some(seq);
+            value
         };
         check(
             name,
@@ -770,10 +785,11 @@ fn reading_a_shared_seq_returns_every_row_in_one_order_on_every_interface() {
         let name = read["name"].as_str().unwrap();
         let want = expected(&f.spec, &read["expected"]);
         let limit = read["limit"].as_u64().unwrap() as usize;
-        let newest = MessageFilters {
-            session_id: Some(session_id.clone()),
-            limit,
-            ..Default::default()
+        let newest = {
+            let mut value = MessageFilters::default();
+            value.session_id = Some(session_id.clone());
+            value.limit = limit;
+            value
         };
         check(
             name,
@@ -806,4 +822,267 @@ fn reading_a_shared_seq_returns_every_row_in_one_order_on_every_interface() {
         failures.len(),
         failures.join("\n")
     );
+}
+
+#[test]
+fn asymmetric_context_reads_agree_across_surfaces() {
+    let f = fixture();
+    let db = Db::open(&f.db_path).unwrap();
+    let config = Config::default();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    let session = f.spec["session_id"].as_str().unwrap();
+    for read in f.spec["context_reads"].as_array().unwrap() {
+        let seq = read["seq"].as_i64().unwrap();
+        let before = read["before"].as_i64().unwrap();
+        let after = read["after"].as_i64().unwrap();
+        let want = expected(&f.spec, &read["expected"]);
+        assert_eq!(
+            hit_ids(service.context(session, seq, before, after).unwrap()),
+            want
+        );
+        assert_eq!(
+            cli_read(
+                &f,
+                &[
+                    "--seq".into(),
+                    seq.to_string(),
+                    "--context-before".into(),
+                    before.to_string(),
+                    "--context-after".into(),
+                    after.to_string()
+                ]
+            ),
+            want
+        );
+        for parameter in read["seq_parameters"].as_array().unwrap() {
+            let mut arguments =
+                json!({"session_id":session,"context_before":before,"context_after":after});
+            arguments[parameter.as_str().unwrap()] = json!(seq);
+            let results = mcp_calls(&f, &[("get_session", arguments)]);
+            assert_eq!(read_rows(results[0].as_ref().unwrap()), want);
+        }
+    }
+}
+
+#[test]
+fn timeline_keeps_all_rows_when_search_has_an_operation_default() {
+    let f = fixture();
+    let mut config = std::fs::read_to_string(&f.config).unwrap();
+    config.push_str("\n[search.message-search]\ndefault_limit = 1\n");
+    std::fs::write(&f.config, config).unwrap();
+    let session = f.spec["session_id"].as_str().unwrap();
+    let difference = &f.spec["deliberate_differences"]["timeline_operation_limit"];
+    let timeline = aise(&f)
+        .args([
+            "messages",
+            "timeline",
+            session,
+            "--grep",
+            "bulk row",
+            "--format",
+            "json",
+            "--index-refresh",
+            "existing-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        timeline.status.success(),
+        "{}",
+        String::from_utf8_lossy(&timeline.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&timeline.stdout).unwrap();
+    assert_eq!(
+        rows.as_array().unwrap().len(),
+        difference["timeline_rows"].as_u64().unwrap() as usize
+    );
+    let search = aise(&f)
+        .args([
+            "messages",
+            "search",
+            "bulk row",
+            "--session-id",
+            session,
+            "--format",
+            "json",
+            "--index-refresh",
+            "existing-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        search.status.success(),
+        "{}",
+        String::from_utf8_lossy(&search.stderr)
+    );
+    let rows: Value = serde_json::from_slice(&search.stdout).unwrap();
+    assert_eq!(
+        rows["results"].as_array().unwrap().len(),
+        difference["search_rows"].as_u64().unwrap() as usize
+    );
+    let help = aise(&f)
+        .args(["messages", "timeline", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("ignores message-search operation limits")
+    );
+}
+
+#[test]
+fn show_json_preserves_the_shared_transcript_window() {
+    let f = fixture();
+    let db = Db::open(&f.db_path).unwrap();
+    let read = &f.spec["transcript_read"];
+    let mut parsed = ParsedSession::new(
+        SessionRecord::new(
+            "claude:show",
+            Provider::Claude,
+            "show",
+            "/fixture/show.jsonl",
+            "test",
+            "fixture",
+        ),
+        vec![],
+    );
+    parsed.transcript_text = read["source"].as_str().unwrap().into();
+    db.upsert_session(&parsed, 0, 0).unwrap();
+    let expected = ai_session_search::service::CatalogService::new(&db)
+        .transcript("claude:show", -2)
+        .unwrap();
+    let output = aise(&f)
+        .args([
+            "show",
+            "claude:show",
+            "--transcript-lines",
+            "-2",
+            "--format",
+            "json",
+            "--index-refresh",
+            "existing-only",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let got: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(got["text"], expected.text);
+    assert_eq!(got["text"], read["expected"]);
+    assert_eq!(got["total_lines"], read["total_lines"]);
+    assert_eq!(got["lines_returned"], read["lines_returned"]);
+    assert_eq!(got["edge"], "tail");
+    assert_eq!(got["complete"], false);
+    assert!(got["session"].get("raw_metadata_json").is_none());
+}
+
+#[test]
+fn timeline_and_repeats_query_mode_regex_preserves_legacy_matches() {
+    let f = fixture();
+    let session = f.spec["session_id"].as_str().unwrap();
+    let pattern = f.spec["regex_alias"]["pattern"].as_str().unwrap();
+    for command in ["timeline", "repeats"] {
+        let run = |legacy: bool, mode: &str| {
+            let mut cli = aise(&f);
+            if command == "timeline" {
+                cli.args(["messages", "timeline", session]);
+                if legacy {
+                    cli.args(["--regex", pattern]);
+                } else {
+                    cli.args(["--grep", pattern, "--query-mode", mode]);
+                }
+            } else {
+                cli.args([
+                    "repeats",
+                    pattern,
+                    "--session-id",
+                    session,
+                    "--phrase-min-words",
+                    "1",
+                    "--phrase-max-words",
+                    "2",
+                    "--min-matches",
+                    "2",
+                ]);
+                if legacy {
+                    cli.arg("--regex");
+                } else {
+                    cli.args(["--query-mode", mode]);
+                }
+            }
+            let output = cli
+                .args(["--format", "json", "--index-refresh", "existing-only"])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{command}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if legacy {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("deprecated") && stderr.contains("--query-mode regex"),
+                    "{stderr}"
+                );
+            }
+            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+        };
+        let canonical = run(false, "regex");
+        assert!(!canonical.as_array().unwrap().is_empty(), "{command}");
+        assert_eq!(canonical, run(true, "regex"), "{command}");
+        assert!(
+            run(false, "literal").as_array().unwrap().is_empty(),
+            "{command}"
+        );
+    }
+}
+
+#[test]
+fn cli_empty_search_hints_are_conditional_and_preserve_machine_output() {
+    let f = fixture();
+    let run = |format: &str, extra: &[&str]| {
+        let output = aise(&f)
+            .args([
+                "messages",
+                "search",
+                "harness-only sentinel",
+                "--format",
+                format,
+                "--index-refresh",
+                "existing-only",
+            ])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    for format in ["table", "plain"] {
+        let missing = run(format, &[]);
+        let stderr = String::from_utf8_lossy(&missing.stderr);
+        assert!(stderr.contains("--kinds harness-notice"), "{stderr}");
+        assert!(
+            stderr.contains("--field tool-argument") && stderr.contains("aise files search"),
+            "{stderr}"
+        );
+        let included = run(format, &["--kinds", "harness-notice"]);
+        assert!(String::from_utf8_lossy(&included.stdout).contains("harness-only sentinel"));
+        assert!(!String::from_utf8_lossy(&included.stderr).contains("Harness notices are excluded"));
+        let explicit = run(format, &["--kinds", "conversation"]);
+        assert!(!String::from_utf8_lossy(&explicit.stderr).contains("[hint]"));
+    }
+    let json = run("json", &[]);
+    assert!(!String::from_utf8_lossy(&json.stderr).contains("[hint]"));
+    let value: Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert!(value["results"].as_array().unwrap().is_empty());
+    assert!(value["effective_request"]
+        .get("harness_notices_excluded")
+        .is_none());
 }

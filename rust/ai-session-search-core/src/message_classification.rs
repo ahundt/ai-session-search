@@ -20,6 +20,7 @@ use crate::corrections::{
 use crate::hashing::sha256;
 
 pub(crate) const MESSAGE_CLASSIFICATION_SCHEMA_VERSION: u32 = 1;
+// Bounds definition parsing only; classification output still obeys MCP schema/result limits.
 pub(crate) const MAX_LOADED_CAPABILITY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]

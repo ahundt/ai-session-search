@@ -5,6 +5,9 @@
 //! large inputs must never panic the indexer, must keep the message FTS in sync,
 //! and must round-trip messages + file edits through reindex without drift.
 
+// Exercise retained low-level storage and tail-parser compatibility guarantees.
+#![allow(deprecated)]
+
 use std::path::Path;
 
 use ai_session_search::config::Config;

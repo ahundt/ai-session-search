@@ -113,7 +113,7 @@ identity and does not determine priority.
   adjacent, deterministic, closed-schema capability declarations.
 - `REQ023-accept-capability-parameters` — Expose typed runtime scope, selector, paging, and
   composition parameters through Rust, Python, CLI, and MCP in addition to selecting a
-  `capability.toml` package.
+  `aise-capability.toml` package.
 - `REQ024-delegate-package-updates` — Detect the verified package owner and delegate updates to it;
   never silently replace source, URL, path, Git, or unknown installations.
 - `REQ025-justify-timeouts` — Default search and native-query time limits to disabled; add a finite

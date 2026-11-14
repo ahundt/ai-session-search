@@ -11,225 +11,245 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-11
+
+1.1.0 keeps indexed history when an agent shortens or rewrites its transcript, finds recorded human
+input across message roles, and adds typed library routes for SQL, repeats, word counts, transcript
+reads, and resume commands. See the [library guide](docs/development/library-api.md) and
+[full diff](https://github.com/ahundt/ai-session-search/compare/v1.0.0...v1.1.0).
+
+### Upgrade notes
+
+1. Stop running aise processes, including MCP servers in harnesses, before upgrading. The first
+   writable open promotes the index to generation 6. A newly started 1.0.0 refuses that index, but an already
+   running 1.0.0 process can still delete archived history. A healthy generation-5 index upgrades
+   its storage in place without reparsing transcripts; refresh applies current provider parsers.
+   To downgrade, stop processes, move the index and its WAL files aside, and use 1.0.0
+   `aise reindex --full` to rebuild from source transcripts.
+   Keep the moved files to retain archived history. Follow the
+   [downgrade steps](docs/development/installation.md#update-and-uninstall).
+2. Rust public structs and enums are now `#[non_exhaustive]`. Replace struct literals with a
+   constructor or `T::default()` followed by field assignment or `with_*` setters; add wildcard
+   arms to enum matches. For example, use
+   `SearchFilters::default().with_path_prefix(dir)` instead of a `SearchFilters { ... }` literal.
+   `util::apply_user_role_authorship` and `util::UserRoleAuthorshipEvidence` remain callable
+   deprecated paths; use `RawMessage::with_authorship` before normalization.
+3. Rust keeps empty-index reads through `load()`, `open()`, and `open_with_access_inputs()`.
+   Use `open_strict()` or `open_strict_with_access_inputs()` to receive
+   `ServiceError::IndexNotRefreshed` until `app.index().prepare_for_read()` applies the refresh
+   policy. `MessageService::context` keeps exact-ID lookup and empty missing results;
+   `context_resolved` adds prefix lookup and `ServiceError::SessionNotFound`.
+4. Python file queries return every matching file or version by default, instead of stopping at
+   50. Supply a positive limit for a page. Omitted session-list and ranked-search limits now
+   follow `[search].default_limit`; explicit zero still returns every session.
+   Omitted `query_mode` on Python `search_messages()` and `search_message_batches()` now follows
+   the request mode instead of overriding it with `literal`; pass `query_mode="literal"` to
+   preserve that override.
+5. Scripts can see fewer duplicate search results and file edits: Claude Code saved API request
+   copies and repeated record identities no longer add extra turns or edits. Queued Claude submissions
+   appear once when delivered through a queued-command attachment or directly after a dequeue,
+   including after an earlier entry was cancelled or cleared. Independent same-text submissions
+   stay distinct.
+   Copied parent history in Codex forks stays searchable but does not count as new human input.
+6. Date input keeps the published UTC default and fixed-duration shorthand: `m` or `M` means
+   30 days, and `y` or `Y` means 365 days. Use `min` for minutes, `mo` or `P1M` for calendar
+   months, and `P1Y` for calendar years. A trailing zone such as `[America/New_York]` selects a
+   local calendar explicitly. JSON, MCP, and Python timestamps use UTC `Z`; human displays use
+   local time with an offset.
+7. The bundled SQLite binding moves from rusqlite 0.40 to 0.41 to fix RUSTSEC-2026-0459.
+   Rust callers of the six deprecated `trigram_index` helpers (`ensure_schema`,
+   `schema_is_compatible`, `base_max_id`, `build`, `build_in_current_transaction`, and
+   `candidates`) must use rusqlite 0.41 connections, available through
+   `ai_session_search::rusqlite` without a separate dependency. Replace these helpers with
+   `IndexService::reindex_report` for index preparation and `MessageService::search` for queries.
+8. An upgraded index can stay larger on disk than one built fresh, because the refresh leaves
+   unused pages behind. Running `aise compact` once after the first refresh is optional and
+   reclaims that space. It rebuilds the full-text indexes and rewrites the database while holding
+   the writer lock, so its time grows with the size of the whole index and it needs up to twice
+   the index size in temporary disk space.
+
 ### Added
 
-1. `Db::classify_injected_messages`: labels legacy user-role harness output as harness notices
-   and deletes nothing. See Fixed item 6.
-2. AI Session Search appears in the Codex desktop app's Plugins list. Codex lists only plugins
-   from a marketplace, so `aise integrations install` registers its own `ai-session-search`
-   marketplace in `~/.codex/config.toml` and an MCP-only plugin beside the skill packages, which
-   the user can install from Settings > Integrations > Plugins. The existing `[mcp_servers]` entry
-   keeps serving the tools, and the plugin shares its name, so Codex runs one server. Upgrading
-   adds the plugin to an existing Codex install; uninstall removes the marketplace, the plugin
-   and Codex's record of installing it.
-3. Integration destinations honor harness environment variables and optional
-   `[integrations.paths.<surface>]` paths for MCP configs, instructions, and skill discovery.
-   Install, status, uninstall, and post-upgrade refresh share the resolved paths; existing CLI
-   path flags continue to add extra targets.
-4. `--harness-home PATH` and `AI_SESSION_SEARCH_HARNESS_HOME` select a separate home for harness
-   files without changing application state. Exact integration destinations retain their
-   existing precedence.
-5. `aise integrations install --no-index-preparation` installs integrations without starting
-   background indexing. Omission keeps the existing preparation behavior.
-6. `aise config check` validates settings without opening the index and exits nonzero on unknown
-   keys. Doctor and JSON index status list ignored ordinary keys with spelling suggestions.
-7. Migration receipts carry `format_version=1`; receipts without a version remain readable.
-   Unsupported formats refuse before recovery changes any artifact, and supported rewrites preserve
-   additive fields.
-8. Skill manifests preserve additive fields at every level. A 1.0.0 reader still rejects unknown
-   top-level fields and drops unknown nested fields on rewrite; 1.0.1 cannot recover discarded fields.
-9. Background refresh reports stay readable when an optional failure kind is unfamiliar; an unknown
-   refresh state stays explicitly unrecognized.
-10. Native-archive ownership checks tolerate additive receipt metadata while continuing to require
-   the supported schema, package identity, and executable hash.
+1. Search Claude Code attached files, edited snippets, memory and plan text, and invoked skill
+   contents. Find injected instructions, session context, hook feedback, and read-truncation
+   notices with `--kinds harness-notice`. Doctor and index-status reports name unrecognized record
+   and attachment types; malformed attachments and skipped binary payloads produce parse warnings.
+2. `--include-unattributed-input` on corrections and repeats includes queued messages with no
+   recorded sender. Reports count excluded input as `unattributed_input_count` and record the
+   opt-in as `unattributed_input_included`; `aise repeats --format json --report` returns the
+   complete report object. MCP `run_skill_capability` and both libraries expose the same opt-in.
+   SQL message rows expose input origin and delivery state.
+3. Rust adds `ServiceError` codes for lookup, ambiguity, invalid arguments, missing or unrefreshed
+   indexes, file versions, and destination collisions. `SessionSearch::sql()` runs scoped read-only
+   SQL; `AnalysisService::repeats` and `vocabulary` return typed reports; `CatalogService` supplies
+   configured ranking, transcript windows, and resume argv. `SessionQuery` applies configured
+   session limits through `list_query` and `search_query`. Requests have constructors or `with_*`
+   setters, and service request/result types are re-exported from the crate root.
+4. Python adds `classify_messages()`, `repeats()`, `vocabulary()`, `query_sql()`, `resume_command()`,
+   `transcript()`, and `doctor()`. Named compatible exceptions distinguish lookup and argument
+   failures. Request/result values support equality, readable representations, and `to_dict()`;
+   result classes are exported from `ai_session_search`. Paths accept `os.PathLike`, dates accept
+   Python dates and datetimes, session queries accept offsets and shared scopes, and services can
+   be closed explicitly or used as context managers. `prepare_for_read()` applies explicit index
+   refresh policies; existing-only reads refuse a missing index without creating it.
+5. `aise show --format json|jsonl|csv|plain` returns transcript text with line counts and completeness.
+   Focused reads accept independent `--context-before` and `--context-after`; MCP uses
+   `context_before` and `context_after`. Session range reads accept `kinds` in CLI, MCP, and Python.
+   Structured message-search hits include nullable timestamps.
+6. Integrations support `--harness-home`, `AI_SESSION_SEARCH_HARNESS_HOME`, and per-surface
+   `[integrations.paths]` destinations. `--no-index-preparation` installs integrations without
+   starting background indexing. Codex receives a marketplace-backed MCP plugin listing;
+   Pi and Prime Agent receive native MCP registrations and instructions.
+7. `aise config check` validates settings without opening the index and rejects unknown keys. Doctor
+   and index status report ignored ordinary keys with spelling suggestions. `aise doctor` names the
+   config file in use, how it was selected, and any other config file at a discovery location that
+   is not read; its JSON adds `config_file` and `config_files_not_read`. Duration input also accepts
+   ISO 8601, compound, and spelled-out forms; date ranges accept EDTF open intervals and trailing
+   IANA zones such as `2026-01-15[Europe/Berlin]`.
 
 ### Changed
 
-1. Duration shorthand reads `m` as minutes and `M` or `mo` as months, as humantime and systemd
-   do. `--since 1m` meant 30 days and now means 1 minute; write `--since 1M` for a month.
-   Months and years now step back calendar months, so `1M` from March 31 starts on the last
-   day of February instead of March 1.
-2. Timestamps have one machine form and one for people. JSON output, MCP results and the Python
-   binding end in `Z` (`2026-11-07T20:31:22.663Z`), the form chrono's serde,
-   JavaScript and Python 3.12 read; `messages`, `files`, analytics and parts of MCP used to write
-   `+00:00`. Tables and `aise show` print local time with its offset
-   (`2026-11-07T15:31:22.663-05:00`), which can be pasted into `--since`. Stored timestamps are
-   unchanged.
-3. A date or time without an offset is read in your local time zone, as
-   [EDTF](https://www.loc.gov/standards/datetime/) and ISO 8601 define it. At 8 pm in New York,
-   `--when yesterday` and `--when 2026-11-07` now mean your day, not the UTC day. `TZ` overrides
-   the system zone. To read one value in another zone, append the zone in
-   [RFC 9557](https://www.rfc-editor.org/rfc/rfc9557) form: `--since '2026-01-15[Europe/Berlin]'`.
-   CLI flags, MCP `since`/`until`/`when` and the Python `DateRange` accept the same strings, and
-   `reference_time` takes that form too. Days that daylight saving shortens or lengthens are
-   covered, and a time a clock change skips or repeats resolves as
-   [RFC 5545](https://www.rfc-editor.org/rfc/rfc5545) specifies. `aise dates` shows the zone in
-   use.
-4. Durations also accept ISO 8601 (`P1M`, `PT2H`), compound (`1y6M`, `1d12h`) and spelled-out
-   (`2 weeks`) forms; `3 days ago` still selects that whole day. EDTF open intervals
-   (`2026-01/..`, `../2026-03`) select everything after or before a date, and a space may
-   separate date and time (`2026-01-15 14:30`), as RFC 3339 allows.
-5. Index generation 6 protects archived messages and file edits from older writers. Healthy
-   generation-5 indexes receive a metadata-only promotion; it does not reread transcripts or rebuild
-   FTS indexes. Stop running aise processes (restart harnesses) before upgrading an index used by
-   1.0.0: an already-open old writer can still erase retained history. New 1.0.0 data opens refuse
-   generation 6; keep the archive and upgrade the executable again to read it.
+1. Corrections, repeats, and analysis include queued input when the source identifies a human
+   sender. The shipped correction categories remain a small starter set of fixed phrasings:
+   inspect recorded input with context to find corrections worded for a particular situation.
+   Add categories for recurring wording using the [package creation steps](skills/ai-session-search/SKILL.md#create-your-own-classification-package).
+2. `aise resume ID` prints the native command and exits successfully when stdin or stdout is
+   redirected. `--dry-run` requests that behavior in a terminal.
+3. Empty message-search hints point to harness notices, tool arguments, or recoverable files as
+   other places to look. A hint means the current query found no matches; it does not promise an
+   answer in those alternatives.
+4. `aise vocab` remains callable as a hidden compatibility command. Use Python `vocabulary()` or
+   Rust `AnalysisService::vocabulary` for word counts in applications.
+5. Unknown configuration keys in ordinary tables are reported and ignored, so a configuration
+   written for a newer release still loads; access-restricting and search policy tables remain
+   strict. Upgrades preserve existing configuration without adding active keys. Install records
+   written by a newer release keep their extra fields, and migration recovery refuses a receipt
+   in an unsupported format before it writes anything.
+6. MCP keeps `purpose` and `purpose_version` in its schema when no search presets are configured;
+   configured presets supply the accepted purpose names.
+   Server instructions name `aise files extract`, `aise export`, `aise analyze`, and `aise reindex`
+   for operations performed through the CLI or libraries.
 
 ### Deprecated
 
-1. `Db::purge_injected_messages`: it now relabels through `Db::classify_injected_messages`
-   and deletes nothing. Call that instead.
+1. `aise planning` → `aise slash-commands`.
+2. `aise repeats --limit N` → `--max-candidates N` to bound examined messages; `--max-groups N`
+   bounds returned groups. `aise repeats --regex` → `--query-mode regex`.
+3. `aise messages timeline --regex PATTERN` → `--grep PATTERN --query-mode regex`.
+4. `aise files cross-ref --pattern PATTERN` → `aise files cross-ref PATTERN`.
+5. `aise show --summary`, `--summary-items`, and `--preview-chars` → `aise messages evidence ID`
+   with the corresponding evidence options.
+6. `aise messages search --include raw_provider_metadata` → `--include raw-metadata`.
+   Classification `--limit 0` → `--all-results`.
+7. MCP `get_session.message_seq` → `seq`; `response_format=concise|detailed` → `detail=compact|full`.
+   Compatible aliases remain accepted; conflicting simultaneous values fail.
+8. Python `search_sessions("")` → `list_sessions(request)`; `diagnostics()` → `doctor()`.
+   Both emit `DeprecationWarning`.
+9. Rust compatibility items remain callable with compiler warnings:
+
+   | Rust items | Replacement |
+   | --- | --- |
+   | `EffectiveAccessScope::allows_workspace_path` | CatalogService::list_sessions for authoritative scope-enforced reads |
+   | `EffectiveAccessScope::is_unrestricted` | match EffectiveAccessScope for policy inspection; use CatalogService::list_sessions for scope-enforced reads |
+   | `IndexService::reindex` | IndexService::reindex_report |
+   | `MessageSearchBatch::into_parts` | MessageService::search, or borrow batch results, context_windows, and included |
+   | `MessageSearchResponse::into_hits` | MessageService::search and MessageSearchResponse::results |
+   | `MessageSearchResponse::into_rows` | MessageService::search and borrow results and context_windows |
+   | `MessageService::search_legacy`, `MessageService::search_with_explain` | MessageService::search |
+   | `SkillNameSelector` | SkillSelector::name |
+   | `SkillPathSelector` | SkillSelector::path |
+   | `dates::parse_bound`, `dates::parse_span` | DateRange::resolve and pass the result to CatalogService or MessageService |
+   | `db::Db::clear_all` | no service deletes the archive; IndexService::reindex_report refreshes while preserving history |
+   | `db::Db::counts_by_provider` | CatalogService::list_sessions and group its typed provider rows |
+   | `db::Db::explain_message_search` | MessageService::plan or MessageService::search with a receipt level |
+   | `db::Db::file_edit_count` | FileService::search for typed file summaries |
+   | `db::Db::file_edits_for` | FileService::history or FileService::reconstruct for typed recovery |
+   | `db::Db::file_edits_for_session_id` | FileService::history with a session-scoped FileQuery |
+   | `db::Db::is_file_current` | IndexService::prepare_for_read for coordinated freshness checks |
+   | `db::Db::messages_fts_count` | MaintenanceService::diagnostics for index health |
+   | `db::Db::purge_injected_messages` | reclassifies instead of deleting; call `classify_injected_messages` |
+   | `db::Db::replace_session` | IndexService::reindex_report for coordinated parser upgrades |
+   | `files::run` | FileService::search, history, cross_reference, or reconstruct |
+   | `indexer::auto_reindex` | IndexService::prepare_for_read or IndexService::refresh |
+   | `mcp_schema_budget::LEDGER_STAGES` | run_cli_from for the schema-budget stage ledger; mcp_schema_budget::evaluate_all evaluates catalogue limits |
+   | `mcp_schema_budget::ceiling_for`, `mcp_schema_budget::codex_strips_descriptions` | mcp_schema_budget::evaluate_all; run_cli_from exposes the schema-budget command |
+   | `messages::run` | MessageService::search or read_session, or CatalogService::inspect |
+   | `skills::SkillCategoryRow`, `skills::SkillDiagnostic`, `skills::SkillSummary` | run_cli_from for skill metadata or AnalysisService::run_skill for capability execution |
+   | `skills::run` | run_cli_from for skill management or AnalysisService::run_skill for capability execution |
+   | `sql_query::DbQueryArgs::resolve` | SqlService::query with SqlQuery, which resolves configured defaults |
+   | `sql_query::run` | SessionSearch::sql or SqlService::new(&config) and render the QueryResult |
+   | `tail::tail_parse` | IndexService::reindex_report for guarded incremental parsing |
+   | `trigram::trigram_prefilter_all` | MessageService::search with MessageQuery::regex for verified results |
+   | `trigram_index::base_max_id`, `trigram_index::build`, `trigram_index::build_in_current_transaction`, `trigram_index::candidates`, `trigram_index::ensure_schema`, `trigram_index::schema_is_compatible` | IndexService::reindex_report for index preparation and MessageService::search for verified queries |
+   | `util::LegacyRawMessage`, `util::to_messages`, `util::to_messages_with_tools` | RawMessage constructors; IndexService::reindex_report owns provider normalization |
+   | `util::UserRoleAuthorshipEvidence`, `util::apply_user_role_authorship` | RawMessage::with_authorship before normalization |
+   | `util::to_messages_with_tools_in_scope` | RawMessage constructors; IndexService::reindex_report owns scoped provider normalization |
 
 ### Fixed
 
-1. Searches find text in Cherokee, Georgian Mtavruli, Osage, Adlam and other scripts whose
-   case pairs SQLite's full-text tokenizer does not fold (445 lowercase letters). Cherokee text
-   returned nothing, even searched by its exact spelling. Literal and regex searches now return
-   every row the matcher accepts.
-2. A needle ending in `i` matches a dotted capital `İ` in the text, so `abi` finds `abİ`.
-3. Messages that tie on session and sequence number come back in one fixed order. Their order
-   was undefined, so `--match-window latest` could keep the wrong message, and literal or fuzzy
-   paging could move one between pages.
-4. `aise corrections` returned messages tied on timestamp, session and sequence number in
-   reverse insertion order, and `aise repeats` did the same under its default user-role filter.
-   Both now page in one order whatever the filters. Context windows and file-edit history use
-   the same tie-breaker, so several edits made by one message replay in the order they were
-   written.
-5. Appending to an indexed session could give two messages the same sequence number. On one
-   40,180-message Codex session, three sequence numbers each named two messages written a day
-   apart. New messages now continue after the highest stored sequence number, and a reindex of
-   a session with gaps in its numbering replaces it from the parse.
-6. A full reindex deleted stored user-role rows starting with `<environment_context>`,
-   `<turn_aborted>` or `<local-command-*>`, records the parsers now keep on purpose. These rows
-   are now labelled harness notices, which default search, corrections and repeat mining leave
-   out, and nothing is deleted.
-7. A reindex no longer deletes stored messages when a harness shrinks or rewrites its
-   transcript. One Codex session went from 4,720 indexed messages to 16 after Codex rewrote
-   its file. With the same parser version, aise keeps the stored messages and file edits and
-   adds the new ones:
-   - session search, the session's dates and its message count cover both;
-   - a new file edit replays before the stored edits that followed it in the source;
-   - a source that gets a new session id moves its rows to that id, skipping rows the id
-     already holds. They used to be deleted with the old id.
-
-   A new parser version may correct metadata when every stored message and file edit remains
-   represented. If the parse lacks archived evidence, aise refuses the session update and keeps
-   its prior transaction intact. On a 20,000-message session the kept reindex takes 43 ms; the full replace it
-   avoids took 1.65 s.
-
-8. Codex sessions that Codex compressed are indexed. After 7 idle days Codex rewrites a rollout
-   as `rollout-*.jsonl.zst` and deletes the plain file; aise read only `.jsonl`, so it missed
-   everything Codex wrote after its last read of such a session. The compressed file is now the
-   same source as its plain form, and the session keeps its id and stored messages. A `.zst`
-   that cannot be decompressed is a warned parse failure for a session not yet indexed. For an
-   indexed session, aise keeps the stored messages, reports the failure in `aise reindex` and
-   `aise doctor`, and reads the file again on the next refresh.
-9. OpenCode loads the aise MCP server. aise wrote it directly under `mcp`, which OpenCode 2
-   ignores, so `opencode mcp list` reported no servers. It is now written to
-   `mcp.servers.ai-session-search` with `type: "local"`, and `aise integrations install` moves
-   an entry left in the old place.
-10. Zed on macOS loads the aise MCP server. aise wrote it to
-    `~/Library/Application Support/Zed/settings.json`, but Zed reads `~/.config/zed/settings.json`
-    there. Install now writes the file Zed reads and removes aise's entry from the old one,
-    keeping any other servers in it. Linux and Windows paths were already correct.
-11. `aise integrations install` edits client JSON files that contain comments or trailing
-    commas, as Zed's settings and VS Code's `mcp.json` allow. One such file made the whole
-    install fail for every client. aise now changes only its own entry and leaves the comments,
-    commas and other settings as they were.
-12. The Kilo Code CLI and JetBrains plugin load the aise MCP server. aise wrote only the VS Code
-    extension's `mcp_settings.json`, which Kilo 7 reads only inside VS Code. Install now also
-    writes `mcp.ai-session-search` into `~/.config/kilo/kilo.jsonc`, which every Kilo 7 surface
-    reads.
-13. OpenClaw loads the aise MCP server. aise wrote a top-level `mcpServers` in
-    `~/.openclaw/openclaw.json`, but OpenClaw reads servers from `mcp.servers`, and its file is
-    JSON5, which aise could not parse. Install now writes `mcp.servers.ai-session-search`, removes
-    the old entry, and keeps the file's comments and JSON5 syntax.
-14. Upgrading moves these MCP entries without a manual step. The first command after an upgrade
-    already refreshed installed skills and instruction blocks; it now also moves an aise MCP
-    entry an earlier release left where its client no longer reads it, keeping the executable
-    that entry named. Clients without an existing aise integration are left alone.
-
-15. Pi 0.99.0 and newer receive the aise MCP server in `~/.pi/agent/mcp.json` and MCP-first
-    instructions. Earlier installs provided only CLI guidance. Untouched CLI-only integrations
-    gain the MCP registration during the post-upgrade refresh.
-
-16. Prime Agent receives a local aise MCP registration under `mcpServers` in
-    `~/.prime/agent/settings.json` with its required `type: "stdio"`. It previously received only
-    CLI guidance; untouched CLI-only integrations also gain the registration during refresh.
-
-17. Cursor receives the required `type: "stdio"` in `~/.cursor/mcp.json`. aise omitted the
-    field; install and the post-upgrade refresh now add it to earlier untyped registrations.
-
-18. Claude Code no longer receives an aise entry in `~/.claude/.mcp.json`, which is not its
-    user MCP configuration. Install writes `~/.claude.json` and removes aise entries from the old
-    file; the post-upgrade refresh also moves an entry left there, preserving other content.
-
-19. Gemini CLI uses `<gemini home>/.agents/skills/ai-session-search`, where Gemini home is
-    `GEMINI_CLI_HOME` or the real home; Codex keeps `~/.agents/skills/ai-session-search`.
-    Matching paths share one link, avoiding a duplicate skill warning; different paths get separate
-    links, and uninstalling either harness preserves the other's link. Install and upgrade refresh
-    remove untouched aise-owned entries from `<gemini home>/.gemini/skills/ai-session-search`;
-    modified or foreign entries are preserved and reported.
-
-20. MCP registrations retain explicitly selected config, database, cache, and harness paths
-    when a client starts the server without the installer's environment. Reinstall preserves
-    the entry's environment and unknown fields, and refuses conflicting state selections before
-    writing. Config-file database and cache settings remain editable without reinstalling.
-21. `aise config init` records CLI- or environment-selected database and cache paths instead
-    of platform defaults. `aise package update` passes state selections to the replacement
-    executable's skill refresh.
-22. Configs with newer ordinary keys load on 1.0.1 and later. Interactive CLI commands name ignored
-    keys on stderr; MCP serving emits no unknown-key warnings. Provider source restrictions, search
-    scope, hard search budgets, and purpose/policy tables still reject unknown keys with recovery
-    guidance. The released 1.0.0 binary remains strict: automatic upgrades never add active keys to
-    an existing config, and `config init` keeps new defaults commented.
+1. Indexed history survives transcripts that shrink, are rewritten, or change session id, as it
+   already did for transcripts that disappear. Parser upgrades reconcile matching rows while
+   preserving archived messages and file edits. Codex compressed `.jsonl.zst` rollouts retain
+   their identity; decompression failures preserve an existing index snapshot and remain
+   retryable. Refresh detects records rewritten in place within the last 1 MiB of a growing
+   transcript and reindexes that transcript, keeping archived history and sequence numbers; a
+   rewrite between the head fingerprint and that overlap needs `aise reindex --full`.
+2. Literal and regex search find case pairs SQLite's tokenizer does not fold, including Cherokee,
+   Georgian Mtavruli, Osage, and Adlam. A query ending in `i` also matches dotted capital `İ`.
+3. Equal session/sequence or timestamp keys have a stable tie-breaker for search, corrections,
+   repeats, context, and file replay. Appended messages continue after the highest stored sequence.
+4. Full reindexing reclassifies stored harness notices instead of deleting them. Claude tool-call
+   arguments stay in tool rows rather than also appearing as assistant prose. Interrupt markers
+   and generated wrappers stay outside human-input analytics.
+5. Recorded queued submissions and linked interactive answers remain searchable across providers;
+   Gemini CLI context patches preserve original input. Antigravity checkpoints are compaction
+   records, and system/error messages are harness notices.
+6. MCP installation uses the locations and formats read by OpenCode, Zed on macOS, Kilo Code,
+   OpenClaw, Claude Code, and Cursor. JSONC/JSON5 comments and unrelated settings survive edits.
+   Post-upgrade refresh relocates existing owned entries and preserves their executable paths.
+   Gemini and Codex share a skill discovery link when their resolved paths match.
+   Recognized MCP registrations migrate on the first ordinary command after an upgrade even
+   without a skill install; set `[integrations] refresh_after_upgrade = false` to opt out.
+   Automatic migration preserves launch arguments such as `--index-refresh existing-only`, while
+   explicit `aise integrations install` regenerates them; unrecognized same-name entries stay
+   unchanged and `aise integrations status` reports them, and homes with nothing to migrate are
+   checked once per version when the check can be recorded.
+7. MCP registrations retain explicit application and harness paths across client restarts;
+   reinstall preserves unrelated environment and fields. `aise config init` and package-update
+   refresh retain selected database and cache paths. `aise migrate config` accepts its required
+   `--cache-dir` and writes it to the converted configuration.
+8. File recovery errors identify the first version that cannot be reconstructed and the missing
+   information; earlier recoverable versions remain extractable. Codex forks omit a copied file
+   edit only when an equivalent edit is retained in the index under a session in their ancestry,
+   including forks of forks; otherwise they keep their recoverable copy. Reconciliation checks
+   each fork's own edits; a parent edit reparses a fork only when that fork holds a matching edit.
+9. Codex marketplace ownership is recorded at install: reinstall refuses files edited since
+   install, and uninstall preserves them.
+10. A writable open attempts to return an index published by `aise migrate` to WAL without waiting
+    for the writer lock. If the lock is unavailable or a reader prevents conversion, a later
+    writable open retries.
 
 ### Performance
 
-1. Limited literal and regex searches stop once the page is full. On an index of 5.7 million
-   messages, `aise messages search error --limit 50` went from 32 s to 0.19 s, and
-   `aise messages search "permission denied" --limit 50` from 3.5 s to under 1 s.
-2. A needle containing `İ` uses the trigram index for the rest of its text.
-   `aise messages search İstanbul --all-results` went from 4.6-6.3 minutes to 3.9-5.2 s on the
-   same index.
-3. The literal matcher skips positions that cannot start a match: about 3x faster when every
-   candidate has to be checked.
-4. Reindexing a source whose parse matches what is stored writes nothing. A file whose
-   timestamp changed but whose content did not now takes 27 ms on a 20,000-message session,
-   down from 1.65 s.
+These subsystem measurements use generated benchmark fixtures and unoptimized debug builds;
+they describe the named workloads, not a release-build latency guarantee.
+
+1. On a generated fixture of 128 sessions and 4,096 messages, 16 repeated MCP literal searches
+   took a median 129 ms instead of 139 ms across 25 repetitions after catalogue reuse.
+2. With that generated fixture plus a synthetic 1,537-message Claude session, four incremental
+   refreshes of a growing transcript took a median 163 ms instead of 1,134 ms across 15
+   repetitions. With unchanged sidecar metadata, incremental refresh reads appended bytes plus
+   at most 1 MiB of overlap. It reparses the transcript for an older checkpoint without an overlap
+   digest, a parser-version change, changed overlap bytes, or a new record changing an indexed row:
+   queued Claude delivery, a linked interactive answer, or Codex fork replay closure. A queued delivery needs
+   at most one full parse; queue records that only add rows stay incremental.
 
 ### Security
 
-1. Upgrade bundled SQLite from 3.53.2 to 3.54.1 to resolve RUSTSEC-2026-0459, which can expose
-   uninitialized memory when opening a crafted database and WAL. Source builds now require
-   Rust 1.89 or newer, up from 1.88; prebuilt CLI and MCP users do not need a Rust compiler.
-
-### For contributors
-
-1. `Cargo.lock` takes the newest release of each dependency that is semver-compatible, builds
-   with the minimum supported Rust (1.88), and is at least 7 days old as of November 7, 2026,
-   the cooldown `.github/dependabot.yml` applies. Among them: `rmcp` 3.4.0 to 3.8.0, `tokio`
-   1.53.3 to 1.54.1, `pyo3` 0.29.2 to 0.29.3, `ureq` 3.4.2 to 3.5.0, and `uuid` 1.24.0 to
-   1.26.1. `jiff` stays at 0.2.39, which `main` already uses. `pyo3` 0.30 and `rusqlite` 0.41
-   fell outside that refresh's version requirements; the SQLite security upgrade above is a
-   separate change.
-   A later security update selects `rmcp` 3.9.0 to resolve RUSTSEC-2026-0462.
-2. The workspace uses Cargo's resolver 3, so `cargo update` selects only versions that build
-   with the declared `rust-version`.
-3. `dirs` 6.0.0 to 7.0.0. Its only source change moves Windows `preference_dir()` from Local to
-   Roaming AppData; aise calls `home_dir`, `config_dir`, `data_dir`, `data_local_dir`, and
-   `cache_dir`, which return the same paths, so existing configuration and indexes stay where
-   they are.
-4. `./run_ci_local.sh` now runs the required MSRV library-test build and API-consumer check
-   when the workspace's minimum Rust toolchain is installed. Otherwise it reports named skips
-   with the exact install command; contract tests keep the commands aligned with CI.
-5. Python tests and runtime verifiers share an allowlisted environment builder with temporary
-   application and harness state and disabled transcript providers. Pytest sanitizes its
-   environment before collection; Rust process tests use a per-test command factory. Demo homes
-   are unique temporary directories.
-2. Temporary integration verifiers skip background index preparation. Historical upgrade
-   checks stop and wait for their process groups before removing temporary roots. Demo commands
-   use owned homes and an isolated Python launcher when the executable is a console script.
+1. Bundled SQLite 3.54.1 fixes RUSTSEC-2026-0459, which could expose process memory when opening
+   a database beside a crafted write-ahead-log file with a different page size.
+2. `rmcp` moves to 3.9.0 to address RUSTSEC-2026-0462. Source builds require Rust 1.89 or newer;
+   prebuilt CLI and MCP installations need no Rust compiler.
 
 ## [1.0.0] - 2026-11-05
 
@@ -237,7 +257,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 formats into one index and searches it from the command line, a Rust crate, a Python package, or
 an MCP server.
 
-Stable release based on 1.0.0rc4, with the dependency updates under Security below.
+Stable release based on 1.0.0rc4, with the dependency updates under Security below. The notes for
+the four release candidates, 1.0.0rc1 to 1.0.0rc4, are in
+[docs/history/changelog-1.0.0-release-candidates.md](docs/history/changelog-1.0.0-release-candidates.md).
 
 ### Highlights
 
@@ -301,297 +323,6 @@ Stable release based on 1.0.0rc4, with the dependency updates under Security bel
    this class was missed then. `DateRange` keeps its `Default`, which is how the Python binding
    and any other caller build one.
 
-## [1.0.0rc4] - 2026-09-28
-
-Upgrading is now one step: after any package manager replaces `aise`, the first command brings
-the installed skill and aise's instructions up to date, and a `config.toml` written for 1.0.0rc2
-loads again. Upgrading from 1.0.0rc3 needs no action.
-
-### Added
-
-1. `aise integrations status --format json` reports each integration's `component`, `client`,
-   `path`, `state`, and `current`, which is true when it matches the running version.
-
-### Changed
-
-1. Upgrading no longer needs `aise integrations install`. After `uv tool upgrade`, pip, Cargo, or
-   a native archive replaces `aise`, the first command or MCP server start updates the installed
-   `ai-session-search` skill and the aise block in each harness's CLAUDE.md, AGENTS.md, or
-   GEMINI.md, once, and prints a line for each one it updates. Blocks stay where they are, edits
-   are kept and reported once, and deleted files stay deleted. To turn this off, set
-   `[integrations] refresh_after_upgrade = false`.
-2. The automatic update covers installs that included the skill, which is the default. If you
-   installed with `--no-skill`, or added instruction files with `--claude-md`, `--agents-md`, or
-   `--gemini-md`, run `aise integrations install` after upgrading.
-3. `aise config init` writes every setting commented out except the database and cache paths, so
-   settings you leave alone follow the built-in defaults, including ones a later release changes.
-   Existing config files are not touched, and since no default changed in 1.0.0rc4, a file an
-   earlier release wrote needs no edit.
-
-### Fixed
-
-1. A `config.toml` that sets `[ui].preview_lines`, the 1.0.0rc2 name for
-   `[ui].preview_body_lines`, loads again. 1.0.0rc3 refused it with
-   ``unknown field `preview_lines` ``. A file that sets both uses `preview_body_lines`.
-2. With a config file outside the default location, set by `AI_SESSION_SEARCH_CONFIG` or
-   `--config`, `aise skills update` failed with ``selected as both app and custom`` after a
-   successful `aise integrations install`, and so did the skill update at the end of
-   `aise package update`. It now updates the skill.
-3. `aise skills update`, and so `aise package update`, put back a skill directory you had deleted
-   and wrote a skill for a harness installed with `--no-skill`. It now updates only skill
-   directories that exist; `aise integrations install` adds one.
-
-### For contributors
-
-1. CI and the local gate on every change, and the publish workflow before anything is signed,
-   fail when upgrading from any published release would need a manual step. For each release
-   they install its integrations for every harness it supports that writes files and its printed
-   config, run one command with the new executable, and require the config to load and
-   `aise integrations status --format json` to report every integration current.
-2. The metadata gate checks the released changelog section's shape (summary first, known headings
-   in order, numbered items) and appends a generated footer with the upgrade and install commands,
-   download guide, and diff link. `--notes-only` renders the body for an already published tag.
-3. Dependency updates: maturin 1.15.0, ruff 0.16.9, mypy 2.3.1, the current `setup-uv` and
-   `rust-toolchain` actions, rmcp 3.4.0, clap 4.6.7, yaml-rust2 0.13, and patch releases of toml,
-   toml_edit, ureq, and unicode-width. The rmcp requirement rises to 3.4.0, the first release
-   with the `ServerConfig` name the MCP server now uses.
-
-## [1.0.0rc3] - 2026-09-16
-
-This release reworks the terminal browser, `aise tui`: typing no longer waits for a search, and you
-can filter sessions, edit the query in place, rebind any key, and press `?` to list them. Three
-changes can affect you: a `config.toml` that sets `[ui].preview_lines` stops every `aise` command,
-including the MCP server your AI tools start, until you rename it right after upgrading (Changed,
-item 1); the preview now scrolls with `K`/`J` instead of `h`/`l` (item 2); and Rust code that
-builds config structs with a struct literal must start from `Default::default()` (item 3). The
-index format is unchanged, so no reindex is needed. A `rustls` security update is included.
-
-### Highlights
-
-1. Typing responds immediately. Searches run on a background thread, a new keystroke cancels the
-   search in progress, and the previous results stay on screen until new ones arrive. The TUI
-   searches once the query has been still for `[ui].search_debounce_ms` (150 ms by default), so on
-   a 36.5 GB index a five-letter word starts one search instead of five. Enter searches right away,
-   and setting it to `0` searches on every keystroke.
-2. Filter keys: `p` cycles the provider, `f` the session kind, `s` the time window (1, 7, or 30
-   days), and `w` shows only sessions with warnings. The status bar shows which filters are on.
-   They are the same filters the CLI, MCP server, and Python API accept.
-3. `?` lists every command and the keys bound to it, built from your current bindings. The preview
-   scroll and page keys scroll the list when it is taller than the terminal; any other key closes
-   it.
-4. The search box edits like a text field. Left and Right move the cursor, Home/Ctrl+A and
-   End/Ctrl+E jump to the ends, Delete removes forward, Ctrl+W deletes a word, and Ctrl+U clears the
-   query. The status bar names Ctrl+U, Ctrl+W, and Home/End while the box has focus.
-5. `[ui.keys]` rebinds any of the 28 TUI commands: list the keys a command answers to, or `[]` to
-   unbind it. A configuration that gives one key two meanings in the same mode, or unbinds both
-   `quit` and `interrupt`, is rejected. `config.example.toml` lists the command names.
-6. Ctrl+C quits: the first press warns in the status bar, the second exits, and any other key
-   cancels. It used to type a `c` into the search box.
-7. `[ui].unicode` and `[ui].color` (`auto`, `on`, or `off`) control box-drawing characters and
-   colour. `auto` falls back to ASCII when the locale cannot display Unicode and drops colour under
-   `NO_COLOR` or `TERM=dumb`. The selected row carries a marker, so it stays visible without colour.
-8. An empty session list says what to press next: the filter keys when a filter hid everything, or
-   `aise reindex` when the index has no sessions.
-9. When a transcript is longer than the preview pane, the pane title shows the visible rows and the
-   total.
-
-### Added
-
-New and renamed `[ui]` settings, each documented in `config.example.toml`:
-
-| Setting | Default | Controls |
-| --- | --- | --- |
-| `preview_body_lines` | 34 | Transcript lines in the preview (the rc2 name was `preview_lines`) |
-| `search_debounce_ms` | 150 | Quiet time before a typed query is searched |
-| `idle_poll_interval_ms` | 150 | How often an idle TUI checks for work |
-| `list_page_rows` | 10 | Rows moved by Page Up/Page Down in the session list |
-| `preview_scroll_rows` | 5 | Rows moved by one preview scroll |
-| `preview_page_rows` | 15 | Rows moved by one preview page |
-| `provider_label_width` | 9 | Provider column width, widened to fit the longest label |
-| `list_pane_percent` | 45 | Share of the width given to the session list, 10 to 90 |
-| `unicode`, `color` | `auto` | Box-drawing characters and colour |
-| `[ui.keys]` | shipped keys | Key bindings for the 28 TUI commands |
-
-### Changed
-
-1. `[ui].preview_lines` is now `[ui].preview_body_lines`, and it takes effect: 1.0.0rc2 accepted
-   `preview_lines` but never read it. While `config.toml` still sets the old name, every 1.0.0rc3
-   command, including `aise mcp serve`, exits with ``unknown field `preview_lines` ``. 1.0.0rc2
-   rejects the new name, so rename it right after upgrading:
-
-   ```toml
-   [ui]
-   preview_body_lines = 34
-   ```
-
-   The next release accepts both names.
-2. The preview scrolls with `K`/`J` and Shift+Up/Shift+Down. `h`, `l`, Left, and Right no longer
-   scroll it. To keep them as well:
-
-   ```toml
-   [ui.keys]
-   preview_scroll_up = ["K", "shift+up", "h", "left"]
-   preview_scroll_down = ["J", "shift+down", "l", "right"]
-   ```
-
-3. Rust API: configuration structs read from `config.toml` are `#[non_exhaustive]`, so a struct
-   literal no longer compiles. Start from `Default::default()` and assign the fields you need.
-   `ConfigOverrides` is unchanged. Adding a setting is now a minor release rather than a breaking
-   one.
-4. A zero preview, pacing, step, or label-width setting, or a pane percentage outside 10 to 90, is
-   rejected when the configuration loads instead of silently doing nothing.
-5. The TUI labels Antigravity `ANTIGRAV` and Gemini CLI `GEMINICLI`; the old `GEMINI` and `Gemini`
-   labels were easy to confuse.
-6. The session list title shows whether results are ordered by recency or by rank.
-7. Preview scrolling stops when the last line reaches the bottom of the pane.
-8. The bundled SQLite is 3.53.2, up from 3.50.2. Across 52 paired benchmark cases the results were
-   identical and peak memory changed by between −10% and +2.6%.
-
-### Fixed
-
-1. Chorded keys ran the command bound to their plain letter: Ctrl+Q quit, and Ctrl+H, which many
-   terminals send for Backspace, scrolled the preview. A chord now matches only its own binding.
-2. Typing moved the selection back to the first row. The selection and preview scroll now stay put
-   when the new results still contain the selected session.
-3. A database error while typing closed the TUI. The error now shows on its own line, shortened in
-   the middle so the suggested fix at its end stays visible.
-
-### Security
-
-1. `rustls` 0.23.45 fixes
-   [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285): a TLS 1.3 peer could send
-   in plaintext handshake messages that should have been encrypted. It could not alter or complete
-   a handshake. `aise` uses TLS only to fetch release metadata.
-
-### For contributors
-
-1. Benchmark reports compare each case's registered result digest rather than hashing timing noise.
-   The renderer rejects missing or duplicate samples, refuses a `GO` decision without relevance
-   evidence, prints commands that reproduce a paired run, and alternates which build runs first.
-2. The TUI latency benchmark checks the ordered session IDs and the rendered total over a
-   128-session workload that includes one transcript larger than the 8 MiB scoring batch. Release
-   samples measure the TUI process tree alone.
-3. The local release gate installs and smoke-tests the exact sdist before a tag is pushed.
-4. The TUI worker holds at most one pending search and one pending preview, and request
-   generations keep a stale response from replacing current results. Cancellation is checked every
-   64 KiB, the preview reads one SQLite snapshot, scoring shares the process's Rayon pool, and a
-   settled TUI waits once per `idle_poll_interval_ms` instead of waking 100 times a second.
-5. With rusqlite 0.40, installing a SQLite progress handler or authorizer can fail. An MCP tool call
-   now reports when it could not arm cancellation, and `query_session_index` is refused when its
-   read-only restriction cannot be installed, rather than running without it.
-6. `deny.toml` no longer ignores any advisory. Its one exception, for the unmaintained `paste`
-   crate, went away when ratatui 0.30.2 stopped depending on it.
-
-## [1.0.0rc2] - 2026-08-22
-
-### Upgrading and breaking changes
-
-No command, flag, or configuration key was removed. What does change:
-
-Run `aise integrations install` after upgrading. The packaged skill gained a reference file, and
-`aise integrations status` reports `incomplete: 1 of 5 managed files missing` until the install
-copies it.
-
-The first search after upgrading refreshes the index, because provider parsing changed. Watch it
-with `aise doctor`; searches keep answering from the previous index while the refresh runs. The
-index layout stays complete for a 1.0.0rc1 process reading the same file, with one exception: once
-the index holds Prime Agent sessions, an older build refuses it and names the version to install.
-
-Two structured outputs changed shape. MCP tools stopped advertising a JSON-Schema `default`, so a
-client reading defaults out of the schema finds them in the tool description text instead. And
-message-search receipts give `corpus` and `candidates` a single meaning across every surface, so a
-consumer comparing receipt numbers with 1.0.0rc1 sees different values for some query modes.
-
-### Added
-
-- Prime Agent sessions, bringing the searchable set to nine local formats: Claude Code CLI and
-  Desktop, Claude Desktop local agent, ChatGPT Codex desktop and CLI/IDE, Cursor, Antigravity,
-  Pi, Prime Agent, Google AI Studio, and Gemini CLI.
-- Resume commands for subagent runs. Pi and Prime Agent children resume by transcript path, and a
-  Claude Code child names the session that spawned it.
-- Gemini CLI tool calls, tool results, and the notices its harness injects are indexed, so
-  `--field tool-name` and `--field tool-argument` searches reach them.
-- `aise skills` accepts custom message-classification packages. Write an `aise-capability.toml`,
-  register it with `aise integrations install --skill-root`, and run it from the CLI or through the
-  `run_skill_capability` MCP tool.
-- Recovery receipts from `aise files extract` name the session each version came from and print the
-  recovered content's checksum, including in bulk recoveries.
-- Pi and Prime Agent installs receive the packaged skill and `AGENTS.md` guidance. Neither runs an
-  MCP client, so they get the CLI workflow instead.
-
-### Changed
-
-- `aise --help` groups the root commands, and `aise messages search --help` sections its options
-  under headings rather than listing them flat.
-- `aise search` with no query prints the equivalent `aise list` invocation, carrying over the
-  session filters and output options that were supplied.
-- A retired flag spelling on `aise messages search`, such as `--project` or `--regex`, is answered
-  with the spelling that replaced it rather than the parser's nearest guess. These spellings were
-  already rejected; only the message changed.
-- `aise integrations status` distinguishes a package whose files are all absent from one missing
-  some, reporting the count and the command that restores them.
-- An index refresh stopped by a full disk reports `postponed` with a retry interval and states that
-  the last completed index remains intact. After space is freed it names the incremental
-  `aise reindex` retry and `aise doctor` verification instead of promising an ownerless timer or
-  asking for `aise reindex --full`, which would fail again while the disk is full.
-- A command that runs out of disk space says what survived and what to do next. The Python API
-  raises `OSError` for that case, matching what Python callers already catch for a full disk.
-- The `search_messages` MCP description states what computing a receipt's corpus count costs, so a
-  caller can decide whether to ask for one.
-- Path filters state that they match on directory-component boundaries, so `--path /a/b` does not
-  select `/a/bc`.
-- Search runs faster on a synthetic benchmark corpus. Comparing 1.0.0rc1 with this version over
-  three repetitions each: exact content 27.9 ms to 14.3 ms, fuzzy content 50.8 ms to 20.6 ms, regex
-  content 20.9 ms to 14.8 ms. All seven benchmark cases returned an identical result digest on both
-  versions. Personal session histories are larger than that corpus, and their timings differ.
-- Message-search receipts count the corpus from indexes rather than scanning message rows. On one
-  2.7-million-message index that cut a receipt from tens of seconds to a fraction of a second.
-
-### Fixed
-
-- MCP clients that fill in a schema's advertised `default` no longer break `get_session`. Calling
-  `get_session` with `message_seq` or `summary` from Claude Code was rejected with "Use only one
-  get_session output selector", because the client also sent the advertised `transcript_lines`
-  default. No tool advertises a JSON-Schema `default` now, and the omission values appear in the
-  tool descriptions instead.
-- `aise repeats --regex` applies the pattern. It previously discarded the query and mined every
-  message.
-- Reindexing no longer aborts on a session whose recorded start falls after its recorded end.
-- A literal search finds a Greek word ending in sigma. Searching for `ΟΔΟΣΣ` missed a message
-  containing that exact word: Greek writes lowercase sigma as `ς` at the end of a word and `σ`
-  elsewhere, the query was lowercased as a whole string and the stored text character by character,
-  and the two sides then disagreed on the last letter.
-- Snippets keep the first character of a match that ends inside a character whose lowercase form is
-  longer than the original.
-- Session date filters compare against the widest event time a session contains, so a filter no
-  longer misses sessions whose first and last parsed records are not their earliest and latest.
-- Pi discovery reads a configured root that holds both its own transcripts and a `sessions` child,
-  and reports each transcript once when configured roots overlap.
-- `aise repeats` and the corrections capability exclude text a coding harness injected into the
-  user's turn, so an automated notice no longer counts as something a person repeated.
-
-### Removed
-
-- A full-text index over session titles, summaries, and whole transcripts that every session write
-  maintained and no query read. It is retired in place, so a 1.0.0rc1 process sharing the same index
-  file still sees a complete layout. On one 2.7-million-message index this reclaimed about 460 MB.
-
-### Security
-
-- Published wheels no longer record the directory they were built in. The embedded CycloneDX SBOM
-  names workspace crates by relative path, and artifact verification rejects a wheel that still
-  carries a build directory.
-- Wheels build reproducibly from a pinned `SOURCE_DATE_EPOCH`, and artifact verification proves the
-  build received it.
-- Build provenance attestation runs only for a real tag push.
-
-## [1.0.0rc1] - 2026-08-11
-
-First published release. See the [tag](https://github.com/ahundt/ai-session-search/releases/tag/v1.0.0rc1).
-
-[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ahundt/ai-session-search/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc4...v1.0.0
-[1.0.0rc4]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc3...v1.0.0rc4
-[1.0.0rc3]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc2...v1.0.0rc3
-[1.0.0rc2]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc1...v1.0.0rc2
-[1.0.0rc1]: https://github.com/ahundt/ai-session-search/releases/tag/v1.0.0rc1
