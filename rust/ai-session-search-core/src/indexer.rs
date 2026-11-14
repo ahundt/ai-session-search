@@ -2766,6 +2766,200 @@ mod tests {
     }
 
     #[test]
+    fn codex_parent_publication_commits_when_fork_reparse_fails_and_retries() {
+        use std::io::Write as _;
+
+        for full_parse in [false, true] {
+            for failure in ["missing", "unreadable", "malformed", "changed-during-read"] {
+                #[cfg(not(unix))]
+                if failure == "unreadable" {
+                    continue;
+                }
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().canonicalize().unwrap();
+                let parent_root = root.join("parent");
+                let fork_root = root.join("fork");
+                std::fs::create_dir_all(&parent_root).unwrap();
+                std::fs::create_dir_all(&fork_root).unwrap();
+                let parent = "00000000-0000-4000-8000-000000000011";
+                let fork = "00000000-0000-4000-8000-000000000012";
+                let parent_path = parent_root.join(format!("rollout-{parent}.jsonl"));
+                let fork_path = fork_root.join(format!("rollout-{fork}.jsonl"));
+                let mutation = |call: &str, file: &str| {
+                    let input = format!(
+                "*** Begin Patch\n*** Add File: /synthetic/{file}.rs\n+synthetic {file} content\n*** End Patch"
+            );
+                    let output = format!(
+                "Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/{file}.rs\n"
+            );
+                    format!(
+                        "{}\n{}\n",
+                        serde_json::json!({"type":"response_item","timestamp":"2026-11-01T00:00:01Z","payload":{"type":"custom_tool_call","call_id":call,"name":"apply_patch","input":input}}),
+                        serde_json::json!({"type":"response_item","timestamp":"2026-11-01T00:00:01Z","payload":{"type":"custom_tool_call_output","call_id":call,"output":output}})
+                    )
+                };
+                let parent_header = serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": parent, "timestamp": "2026-11-01T00:00:00Z"}
+                });
+                let fork_header = serde_json::json!({
+                    "type": "session_meta",
+                    "payload": {"id": fork, "forked_from_id": parent, "timestamp": "2026-11-01T00:00:00Z"}
+                });
+                let settings = serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {"type": "thread_settings_applied"}
+                });
+                std::fs::write(
+                    &parent_path,
+                    format!(
+                        "{parent_header}\n{}{}",
+                        mutation("shared", "shared"),
+                        mutation("parent-only", "parent-only")
+                    ),
+                )
+                .unwrap();
+                std::fs::write(
+                    &fork_path,
+                    format!(
+                        "{fork_header}\n{}{}{settings}\n{}",
+                        mutation("shared", "shared"),
+                        mutation("fork-only", "fork-only"),
+                        mutation("fork-own", "fork-own")
+                    ),
+                )
+                .unwrap();
+
+                let db_path = dir.path().join("index.db");
+                let mut config = config_with_single_claude_fixture(&db_path, &fork_root);
+                config.providers.claude.enabled = false;
+                config.providers.codex.enabled = true;
+                config.providers.codex.paths =
+                    vec![normalize_path(&parent_root), normalize_path(&fork_root)];
+                let db = Db::open(&db_path).unwrap();
+                reindex(&config, &db, false, None).unwrap();
+                assert_eq!(db.file_edit_count().unwrap(), 4);
+
+                // The parent publication must commit even when the dependent fork disappears while the
+                // writer is reconciling it. Its receipt is invalidated so a later refresh retries it.
+                let saved = fork_path.with_extension("saved");
+                std::fs::copy(&fork_path, &saved).unwrap();
+                match failure {
+                    "missing" => {
+                        std::fs::rename(&fork_path, fork_path.with_extension("unavailable"))
+                            .unwrap()
+                    }
+                    "unreadable" => {
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::PermissionsExt;
+                            std::fs::set_permissions(
+                                &fork_path,
+                                std::fs::Permissions::from_mode(0o000),
+                            )
+                            .unwrap();
+                        }
+                    }
+                    "malformed" => {
+                        std::fs::write(&fork_path, "{malformed\n").unwrap();
+                        // Match the receipt so this exercises parsing, rather than the pre-read check.
+                        let metadata = std::fs::metadata(&fork_path).unwrap();
+                        let conn = rusqlite::Connection::open(&db_path).unwrap();
+                        conn.execute(
+                            "update files_seen set mtime_ns=?1, size_bytes=?2 where source_path=?3",
+                            rusqlite::params![
+                                metadata
+                                    .modified()
+                                    .unwrap()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_nanos() as i64,
+                                metadata.len() as i64,
+                                normalize_path(&fork_path)
+                            ],
+                        )
+                        .unwrap();
+                    }
+                    "changed-during-read" => crate::db::CODEX_FORK_AFTER_READ.with(|hook| {
+                        hook.set(Some(|path| {
+                            std::fs::OpenOptions::new()
+                                .append(true)
+                                .open(path)
+                                .unwrap()
+                                .write_all(b"\n")
+                                .unwrap();
+                        }))
+                    }),
+                    _ => unreachable!(),
+                }
+                // Publish only the parent; retrying the fork is a separate refresh.
+                config.providers.codex.paths = vec![normalize_path(&parent_root)];
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&parent_path)
+                    .unwrap()
+                    .write_all(mutation("parent-later", "parent-later").as_bytes())
+                    .unwrap();
+                reindex(&config, &db, full_parse, None).unwrap();
+                assert!(crate::db::CODEX_FORK_AFTER_READ
+                    .with(|hook| hook.take())
+                    .is_none());
+                let stored = rusqlite::Connection::open(&db_path).unwrap();
+                assert_eq!(
+            stored
+                .query_row(
+                    "select count(*) from file_edits where session_id = ?1 and file_name = 'parent-later.rs'",
+                    rusqlite::params![format!("codex:{parent}")],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "parent edits commit despite a failed dependent fork read"
+        );
+                let invalidated: (String, Option<i64>, Option<String>) = stored.query_row(
+            "select parse_version,tail_byte_offset,prefix_fingerprint from files_seen where source_path=?1",
+            [normalize_path(&fork_path)], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                assert_eq!(
+                    invalidated,
+                    (String::new(), None, None),
+                    "{failure}, full={full_parse}"
+                );
+                #[cfg(unix)]
+                if failure == "unreadable" {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&fork_path, std::fs::Permissions::from_mode(0o600))
+                        .unwrap();
+                }
+                if failure != "unreadable" {
+                    std::fs::copy(&saved, &fork_path).unwrap();
+                }
+                config
+                    .providers
+                    .codex
+                    .paths
+                    .push(normalize_path(&fork_root));
+                reindex(&config, &db, false, None).unwrap();
+                assert_eq!(db.file_edit_count().unwrap(), 5);
+                let receipt: (String, Option<i64>, Option<String>) = stored.query_row(
+            "select parse_version,tail_byte_offset,prefix_fingerprint from files_seen where source_path=?1",
+            [normalize_path(&fork_path)], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+                assert!(!receipt.0.is_empty(), "retry succeeded for {failure}");
+                assert_eq!(
+                    stored
+                        .query_row(
+                            "select count(*) from file_edits where file_name = 'parent-later.rs'",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap(),
+                    1,
+                    "the repaired fork keeps the parent publication"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn codex_fork_keeps_recoverable_edits_when_parent_lacks_them() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("codex");

@@ -135,14 +135,14 @@ pub(crate) enum SchemaState {
 /// Compatibility levels are positive SQLite integers, independent of package/parser versions.
 /// Legacy generations may omit them; generation 6 must carry both before any read or write.
 pub(crate) fn index_write_compatible(conn: &Connection) -> Result<bool> {
-    let generation: i64 = conn.query_row("pragma user_version", [], |row| row.get(0))?;
+    let generation: i64 = conn
+        .prepare_cached("pragma user_version")?
+        .query_row([], |row| row.get(0))?;
     anyhow::ensure!((0..=SCHEMA_VERSION).contains(&generation),
         "index uses schema generation {generation}, newer than this aise build supports ({SCHEMA_VERSION}); upgrade aise before opening it");
-    let has_metadata: bool = conn.query_row(
+    let has_metadata: bool = conn.prepare_cached(
         "select exists(select 1 from sqlite_schema where type='table' and name='index_metadata')",
-        [],
-        |row| row.get(0),
-    )?;
+    )?.query_row([], |row| row.get(0))?;
     let mut levels = [1, 1];
     for (index, key) in [
         "minimum_reader_compatibility",
@@ -152,12 +152,9 @@ pub(crate) fn index_write_compatible(conn: &Connection) -> Result<bool> {
     .enumerate()
     {
         let value = if has_metadata {
-            conn.query_row(
-                "select value from index_metadata where key=?1",
-                [key],
-                |row| row.get::<_, rusqlite::types::Value>(0),
-            )
-            .optional()?
+            conn.prepare_cached("select value from index_metadata where key=?1")?
+                .query_row([key], |row| row.get::<_, rusqlite::types::Value>(0))
+                .optional()?
         } else {
             None
         };
@@ -604,6 +601,15 @@ pub struct Db {
     observed_refreshed: std::cell::Cell<bool>,
 }
 
+// Derived lookup only: existing generation readers need no new columns or meaning.
+const CODEX_FORK_PARENT_INDEX_SQL: &str =
+    "create index if not exists idx_sessions_codex_fork_parent on sessions(
+        case when json_valid(raw_metadata_json)
+            then 'codex:' || json_extract(raw_metadata_json, '$.forked_from_id') end
+     ) where provider = 'codex' and
+         (case when json_valid(raw_metadata_json)
+          then 'codex:' || json_extract(raw_metadata_json, '$.forked_from_id') end) is not null;";
+
 const MESSAGE_INPUT_INDEXES_SQL: &str =
     "create index if not exists idx_messages_session_authorship_relation_seq
                  on messages(session_id, authorship, record_relation, seq, input_origin);
@@ -1022,6 +1028,19 @@ impl Db {
         } else {
             db.with_open_writer_permit(path, || db.init())
         };
+        let preparation = preparation.and_then(|()| {
+            let installed: bool = db.conn.query_row(
+                "select exists(select 1 from sqlite_schema where name='idx_sessions_codex_fork_parent')",
+                [], |row| row.get(0),
+            )?;
+            if !installed {
+                db.with_open_writer_permit(path, || db.with_immediate_transaction(|| {
+                    db.conn.execute_batch(CODEX_FORK_PARENT_INDEX_SQL)?;
+                    Ok(())
+                }))?;
+            }
+            Ok(())
+        });
         preparation.with_context(|| {
             format!(
                 "failed to upgrade index {}; stop aise processes and retry `aise reindex --full`; \
@@ -1657,6 +1676,7 @@ impl Db {
              end;",
         )?;
         self.conn.execute_batch(MESSAGE_INPUT_INDEXES_SQL)?;
+        self.conn.execute_batch(CODEX_FORK_PARENT_INDEX_SQL)?;
         // `sessions_fts` (an FTS5 copy of every title, summary, preview, and transcript) stopped
         // being read on 2026-07-22, when session search moved to scoring the complete corpus, and
         // stayed maintained, duplicating transcript storage and tokenization. This
@@ -2913,18 +2933,16 @@ impl Db {
 
         // Advance volatile session metadata; updated_at/last_message_at only move forward,
         // title/preview take the tail's newest view, cwd fills if it was NULL. created_at stays.
-        let new_count: i64 = tx.query_row(
-            "select count(*) from messages where session_id = ?1",
-            params![session.id],
-            |row| row.get(0),
-        )?;
+        let new_count: i64 = tx
+            .prepare_cached("select count(*) from messages where session_id = ?1")?
+            .query_row(params![session.id], |row| row.get(0))?;
         let [_, updated_at, last_message_at] =
             widest_session_dates(stored_session_dates(&tx, &session.id)?.into_iter().chain([[
                 None,
                 session.updated_at,
                 session.last_message_at,
             ]]));
-        tx.execute(
+        tx.prepare_cached(
             "update sessions set
                 updated_at = ?2,
                 last_message_at = ?3,
@@ -2933,16 +2951,16 @@ impl Db {
                 cwd = coalesce(cwd, ?6),
                 message_count = ?7
              where id = ?1",
-            params![
-                session.id,
-                updated_at,
-                last_message_at,
-                session.title,
-                session.preview_text,
-                session.cwd,
-                new_count,
-            ],
-        )?;
+        )?
+        .execute(params![
+            session.id,
+            updated_at,
+            last_message_at,
+            session.title,
+            session.preview_text,
+            session.cwd,
+            new_count,
+        ])?;
 
         // Append the new conversation text to the transcript blob, then rebuild this session's FTS
         // row from the now-current sessions + transcripts rows (no drift from the live values).
@@ -2956,23 +2974,23 @@ impl Db {
             )?;
         }
         // Persist the checkpoint + refresh files_seen mtime/size in the same transaction.
-        tx.execute(
+        tx.prepare_cached(
             "update files_seen set
                 file_identity = ?3, mtime_ns = ?4, size_bytes = ?5, last_indexed_at = ?6,
                 tail_byte_offset = ?7, prefix_fingerprint = ?8, parse_version = ?9
              where provider = ?1 and source_path = ?2",
-            params![
-                session.provider.as_str(),
-                session.source_path,
-                file_identity_for_path(Path::new(&session.source_path)),
-                mtime_ns,
-                size_bytes,
-                stored_timestamp(Utc::now()),
-                tail.new_tail_offset,
-                tail.new_fingerprint,
-                session.parse_version,
-            ],
-        )?;
+        )?
+        .execute(params![
+            session.provider.as_str(),
+            session.source_path,
+            file_identity_for_path(Path::new(&session.source_path)),
+            mtime_ns,
+            size_bytes,
+            stored_timestamp(Utc::now()),
+            tail.new_tail_offset,
+            tail.new_fingerprint,
+            session.parse_version,
+        ])?;
         tx.commit()?;
         Ok(())
     }
@@ -7147,21 +7165,19 @@ fn merge_transcripts<'a>(
 /// folded into a `count(*)` it shared that statement's O(session rows) scan of a covering index
 /// whose second column is not seq. Keep the maximum-sequence seek separate from row counting.
 fn next_message_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> {
-    Ok(tx.query_row(
-        "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
+    Ok(tx
+        .prepare_cached(
+            "select coalesce(max(seq), -1) + 1 from messages indexed by idx_messages_session_seq
          where session_id = ?1",
-        params![session_id],
-        |row| row.get(0),
-    )?)
+        )?
+        .query_row(params![session_id], |row| row.get(0))?)
 }
 
 /// The next free file-edit seq of a session: one past the highest stored.
 fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<i64> {
-    Ok(tx.query_row(
-        "select coalesce(max(seq), -1) + 1 from file_edits where session_id = ?1",
-        params![session_id],
-        |row| row.get(0),
-    )?)
+    Ok(tx
+        .prepare_cached("select coalesce(max(seq), -1) + 1 from file_edits where session_id = ?1")?
+        .query_row(params![session_id], |row| row.get(0))?)
 }
 
 /// Bring a session's message rows in line with a full parse. Returns true when stored rows the
@@ -7929,8 +7945,21 @@ fn store_parsed_file_edits(
     Ok(changed)
 }
 
-/// Reconcile indexed descendants before publishing changed Codex edits. Scan S session rows
-/// with M metadata bytes and join R source receipts in O(M + S log R), retaining O(S) paths.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CODEX_FORK_AFTER_READ: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+}
+
+const CODEX_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f.size_bytes
+     from sessions s join files_seen f on f.provider = s.provider and f.source_path = s.source_path
+     where s.provider = 'codex' and
+         (case when json_valid(s.raw_metadata_json)
+          then 'codex:' || json_extract(s.raw_metadata_json, '$.forked_from_id') end) = ?1";
+
+/// Reconcile indexed descendants before publishing changed Codex edits. For S sessions and R
+/// receipts, each parent lookup costs O(log S + K(log S + log R)) for K children, retaining
+/// O(K) paths plus O(D) visited identities for D reachable descendants. A no-fork publication
+/// visits no unrelated session metadata or source receipts.
 /// Each dependent source is parsed at most once: O(B + C + E + N log N) for B source/output
 /// bytes, C stored parent/fork edit bytes, E parent edits and N stored/parsed fork edits.
 /// Memory adds one parsed fork, O(E + N) keys and the largest stored edit body. This work
@@ -7939,39 +7968,34 @@ fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> 
     if session.provider != Provider::Codex {
         return Ok(());
     }
-    let mut children: HashMap<String, Vec<(String, SourceFile)>> = HashMap::new();
-    let mut statement = tx.prepare(
-        "select s.id, s.source_path, f.mtime_ns, f.size_bytes,
-            case when json_valid(s.raw_metadata_json)
-                then 'codex:' || json_extract(s.raw_metadata_json, '$.forked_from_id') end
-         from sessions s join files_seen f on f.provider = s.provider and f.source_path = s.source_path
-         where s.provider = 'codex'",
-    )?;
-    for row in statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            SourceFile {
-                provider: Provider::Codex,
-                path: std::path::PathBuf::from(row.get::<_, String>(1)?),
-                mtime_ns: row.get(2)?,
-                size_bytes: row.get(3)?,
-                sidecar: None,
-            },
-            row.get::<_, Option<String>>(4)?,
-        ))
-    })? {
-        let (id, source, parent) = row?;
-        if let Some(parent) = parent.filter(|parent| parent != &id) {
-            children.entry(parent).or_default().push((id, source));
-        }
-    }
-    if !children.contains_key(&session.id) {
+    let mut statement = tx.prepare_cached(CODEX_FORK_CHILDREN_SQL)?;
+    if !statement.exists([&session.id])? {
         return Ok(());
     }
-    let adapter = crate::providers::codex::CodexAdapter::new(Vec::new());
+    let mut adapter = None;
     let mut pending = vec![session.id.clone()];
+    let mut visited = std::collections::HashSet::from([session.id.clone()]);
     while let Some(parent) = pending.pop() {
-        for (id, source) in children.remove(&parent).unwrap_or_default() {
+        let children = statement
+            .query_map([&parent], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    SourceFile {
+                        provider: Provider::Codex,
+                        path: std::path::PathBuf::from(row.get::<_, String>(1)?),
+                        mtime_ns: row.get(2)?,
+                        size_bytes: row.get(3)?,
+                        sidecar: None,
+                    },
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, source) in children {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let adapter = adapter
+                .get_or_insert_with(|| crate::providers::codex::CodexAdapter::new(Vec::new()));
             let current = || {
                 fs::metadata(&source.path).ok().is_some_and(|metadata| {
                     metadata.len() as i64 == source.size_bytes
@@ -7990,6 +8014,12 @@ fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> 
                 let parsed = adapter
                     .parse_reader(std::io::BufReader::new(reader), &source.path)
                     .ok()?;
+                #[cfg(test)]
+                CODEX_FORK_AFTER_READ.with(|hook| {
+                    if let Some(after_read) = hook.take() {
+                        after_read(&source.path);
+                    }
+                });
                 (current()
                     && parsed.session.id == id
                     && codex_fork_parent(&parsed.session).as_deref() == Some(&parent))
@@ -8448,7 +8478,7 @@ fn insert_file_edits<'a>(
     session: &SessionRecord,
     rows: impl Iterator<Item = (i64, &'a FileEdit)>,
 ) -> Result<()> {
-    let mut stmt = tx.prepare(
+    let mut stmt = tx.prepare_cached(
         "insert into file_edits
             (session_id, provider, seq, ts, tool, file_path, file_name, new_content, edits_json)
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -9314,6 +9344,127 @@ fn row_to_session_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRec
 mod tests {
     use super::*;
     use crate::models::SessionKind;
+
+    include!("db/publication_benchmark.rs");
+
+    #[test]
+    fn codex_fork_lookup_is_indexed_and_upgrades_on_writable_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let mut parsed = archive_session(Vec::new(), Vec::new());
+        parsed.session.raw_metadata_json = Some("{malformed".into());
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        let plan = db
+            .conn
+            .prepare(&format!("explain query plan {CODEX_FORK_CHILDREN_SQL}"))
+            .unwrap()
+            .query_map(["codex:archive"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH s USING INDEX idx_sessions_codex_fork_parent")),
+            "{plan:?}"
+        );
+        assert!(!plan.iter().any(|line| line.contains("SCAN")), "{plan:?}");
+        let version = db.schema_version().unwrap();
+        db.conn
+            .execute_batch("drop index idx_sessions_codex_fork_parent")
+            .unwrap();
+        drop(db);
+        // Previous-writer layout: readers need no derived index and never install it.
+        let read_only = Db::open_existing_read_only_with_threads(
+            &path,
+            TEST_BUSY_TIMEOUT_MS,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        assert_eq!(read_only.schema_version().unwrap(), version);
+        assert_eq!(
+            read_only
+                .conn
+                .query_row("select count(*) from sessions", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert!(!read_only.conn.query_row("select exists(select 1 from sqlite_master where name='idx_sessions_codex_fork_parent')", [], |r| r.get::<_, bool>(0)).unwrap());
+        drop(read_only);
+        for _ in 0..2 {
+            let reopened = Db::open(&path).unwrap();
+            assert_eq!(reopened.schema_version().unwrap(), version);
+            assert!(reopened.conn.query_row("select exists(select 1 from sqlite_master where name='idx_sessions_codex_fork_parent')", [], |r| r.get::<_, bool>(0)).unwrap());
+        }
+    }
+
+    #[test]
+    fn publication_statements_observe_peer_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let parsed = archive_session(Vec::new(), Vec::new());
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        let tail = crate::tail::TailParse {
+            session: parsed.session.clone(),
+            new_messages: vec![archive_message(
+                0,
+                "synthetic",
+                crate::models::MessageKind::Conversation,
+            )],
+            new_file_edits: vec![FileEdit::new(0, "Write", "/synthetic/edit.rs")],
+            new_transcript: String::new(),
+            new_tail_offset: 1,
+            new_fingerprint: "synthetic".into(),
+        };
+        db.append_tail(&tail, 2, 2).unwrap();
+        let peer = Db::open(&path).unwrap();
+        peer.append_tail(&tail, 3, 3).unwrap();
+        let mut fork = archive_session(Vec::new(), Vec::new());
+        fork.session.id = "codex:fork".into();
+        fork.session.provider_session_id = "fork".into();
+        fork.session.source_path =
+            crate::util::normalize_path(&dir.path().join("missing-fork.jsonl"));
+        fork.session.raw_metadata_json = Some(r#"{"forked_from_id":"archive"}"#.into());
+        peer.upsert_session(&fork, 1, 1).unwrap();
+        // Reused statements must see both the peer's rows and its new fork dependency.
+        db.append_tail(&tail, 4, 4).unwrap();
+        for table in ["messages", "file_edits"] {
+            let seqs = db
+                .conn
+                .prepare(&format!(
+                    "select seq from {table} where session_id='codex:archive' order by seq"
+                ))
+                .unwrap()
+                .query_map([], |r| r.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(seqs, [0, 1, 2]);
+        }
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "select parse_version from files_seen where source_path=?1",
+                    [fork.session.source_path],
+                    |r| r.get::<_, String>(0)
+                )
+                .unwrap(),
+            ""
+        );
+        peer.conn
+            .execute(
+                "update index_metadata set value=?1 where key='minimum_writer_compatibility'",
+                [WRITER_COMPATIBILITY + 1],
+            )
+            .unwrap();
+        assert!(db
+            .append_tail(&tail, 5, 5)
+            .unwrap_err()
+            .to_string()
+            .contains("minimum_writer_compatibility"));
+        assert_eq!(db.file_edit_count().unwrap(), 3);
+    }
 
     const TEST_BUSY_TIMEOUT_MS: u64 = 250;
     const TEST_NO_WAIT_BUSY_TIMEOUT_MS: u64 = 0;
