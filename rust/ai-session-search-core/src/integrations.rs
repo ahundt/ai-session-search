@@ -4256,7 +4256,7 @@ fn codex_entry_without_marketplace(target: &Target) -> Option<String> {
         .map(str::to_string)
 }
 
-/// An aise entry left in a superseded place or entry shape, including its state and extensions.
+/// The entry to retain during migration, preferring the current location over obsolete duplicates.
 fn superseded_entry(target: &Target) -> Option<Value> {
     let layout = json_server_layout(target.format)?;
     let read = |path: &Path| {
@@ -4269,23 +4269,29 @@ fn superseded_entry(target: &Target) -> Option<Value> {
             .chain(layout.superseded.iter().copied())
             .find_map(|keys| owned_entry(&root, keys).cloned())
     });
-    in_old_files.or_else(|| {
-        let root = read(&target.path)?;
-        layout
-            .superseded
-            .iter()
-            .find_map(|keys| owned_entry(&root, keys).cloned())
-            .or_else(|| {
-                let entry = json_container(&root, layout.container)?.get(SERVER_NAME)?;
-                // Earlier aise omitted the transport tag. Repair only that known shape;
-                // explicit transports and custom argument lists remain the user's choice.
-                (entry.get("type").is_none()
-                    && json_entry_is_current(entry, ConfigFormat::JsonMcpServers)
-                    && !json_entry_is_current(entry, target.format))
-                .then(|| owned_entry(&root, layout.container).cloned())
-                .flatten()
-            })
-    })
+    let root = read(&target.path);
+    let current = root
+        .as_ref()
+        .and_then(|root| owned_entry(root, layout.container));
+    in_old_files
+        .or_else(|| {
+            layout
+                .superseded
+                .iter()
+                .find_map(|keys| owned_entry(root.as_ref()?, keys).cloned())
+        })
+        .map(|obsolete| current.cloned().unwrap_or(obsolete))
+        .or_else(|| {
+            let root = root.as_ref()?;
+            let entry = json_container(root, layout.container)?.get(SERVER_NAME)?;
+            // Earlier aise omitted the transport tag. Repair only that known shape;
+            // explicit transports and custom argument lists remain the user's choice.
+            (entry.get("type").is_none()
+                && json_entry_is_current(entry, ConfigFormat::JsonMcpServers)
+                && !json_entry_is_current(entry, target.format))
+            .then(|| owned_entry(root, layout.container).cloned())
+            .flatten()
+        })
 }
 
 fn entry_command(entry: &Value) -> Option<String> {

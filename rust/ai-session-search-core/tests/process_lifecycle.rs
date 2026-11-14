@@ -17,6 +17,81 @@ use std::os::unix::fs::PermissionsExt as _;
 mod support;
 use support::aise;
 
+#[test]
+fn upgrade_keeps_current_mcp_registration_over_obsolete_duplicates() {
+    for client in ["claude", "opencode"] {
+        let root = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let mut command = aise(root.path());
+            for key in include_str!("../harness-environment.txt")
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            {
+                command.env_remove(key);
+            }
+            command.args(args).output().unwrap()
+        };
+        let installed = run(&[
+            "integrations",
+            "install",
+            "--client",
+            "claude",
+            "--no-mcp",
+            "--no-instructions",
+            "--no-aliases",
+            "--no-index-preparation",
+        ]);
+        assert!(
+            installed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&installed.stderr)
+        );
+        let binary = env!("CARGO_BIN_EXE_aise");
+        let current = if client == "opencode" {
+            serde_json::json!({"type":"local", "command":[binary,"mcp","serve"], "env":{"SYNTHETIC":"current"}, "timeout":123})
+        } else {
+            serde_json::json!({"command":binary,"args":["mcp","serve"], "env":{"SYNTHETIC":"current"}, "timeout":123})
+        };
+        let obsolete = serde_json::json!({"command":[root.path().join("removed/aise"),"mcp","serve"], "env":{"SYNTHETIC":"obsolete"}, "obsolete_only":true});
+        let path = root.path().join(if client == "opencode" {
+            ".config/opencode/opencode.json"
+        } else {
+            ".claude.json"
+        });
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let document = if client == "opencode" {
+            serde_json::json!({"mcp":{"servers":{"ai-session-search":current}, "ai-session-search":obsolete}})
+        } else {
+            let legacy = root.path().join(".claude/.mcp.json");
+            fs::write(legacy, serde_json::json!({"mcpServers":{"ai-session-search":obsolete,"other":{"command":"keep"}}}).to_string()).unwrap();
+            serde_json::json!({"mcpServers":{"ai-session-search":current}})
+        };
+        fs::write(&path, format!("{document}\n")).unwrap();
+        let output = run(&["dates"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        if client == "opencode" {
+            assert_eq!(after["mcp"]["servers"]["ai-session-search"], current);
+            assert!(after["mcp"].get("ai-session-search").is_none());
+        } else {
+            assert_eq!(after["mcpServers"]["ai-session-search"], current);
+            let legacy: serde_json::Value = serde_json::from_str(
+                &fs::read_to_string(root.path().join(".claude/.mcp.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                legacy["mcpServers"],
+                serde_json::json!({"other":{"command":"keep"}})
+            );
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn skills_update_keeps_legacy_link_retirement_inside_the_selected_harness_home() {
