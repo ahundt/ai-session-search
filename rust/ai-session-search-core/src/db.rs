@@ -2879,6 +2879,30 @@ impl Db {
         })
     }
 
+    /// Validate the reread overlap before treating it as already indexed. Read only the
+    /// matching suffix: O(overlap rows + stored suffix bytes) time and O(overlap rows) keys.
+    /// Timestamps may have been backfilled from an earlier file mtime; other columns must match.
+    pub(crate) fn tail_overlap_matches(
+        &self,
+        session_id: &str,
+        overlap: &[crate::models::Message],
+    ) -> Result<bool> {
+        if overlap.is_empty() {
+            return Ok(true);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let stored = stored_message_keys(
+            &tx,
+            session_id,
+            StoredMessageSelection::Suffix(overlap.len()),
+        )?;
+        Ok(stored.len() == overlap.len()
+            && stored.iter().zip(overlap).all(|((_, old), incoming)| {
+                old.columns_without_seq_and_time
+                    == parsed_message_keys(incoming).columns_without_seq_and_time
+            }))
+    }
+
     /// Append ONLY the new rows from an incremental tail parse to an already-indexed session, in
     /// one transaction (SQLite makes the checkpoint update atomic with the data). New messages /
     /// file-edits are re-sequenced to continue after the highest seq already stored, so no seq is
@@ -7232,7 +7256,11 @@ fn store_parsed_messages(
         // The whole boundary row must match, so text that repeats by coincidence ("ok",
         // "continue") at that position cannot pass for it after an archive keep.
         let boundary = &parsed.messages[(existing_count - 1) as usize];
-        let stored_boundary = stored_message_keys(tx, &session.id, Some(boundary.seq))?;
+        let stored_boundary = stored_message_keys(
+            tx,
+            &session.id,
+            StoredMessageSelection::Sequence(boundary.seq),
+        )?;
         if let Some((id, keys)) = stored_boundary.first() {
             if *keys == parsed_message_keys(boundary) && message_parts_match(tx, *id, boundary)? {
                 insert_messages(
@@ -7246,7 +7274,7 @@ fn store_parsed_messages(
             }
         }
     }
-    let stored = stored_message_keys(tx, &session.id, None)?;
+    let stored = stored_message_keys(tx, &session.id, StoredMessageSelection::All)?;
     let parsed_keys: Vec<MessageKeys> = parsed.messages.iter().map(parsed_message_keys).collect();
     // A first parse has no archive rows to reconcile. Keep the parser's published sequence
     // numbers verbatim: they may be sparse or tied, and replacing them with insertion offsets
@@ -8050,7 +8078,7 @@ fn reconcile_codex_fork_edits(tx: &Transaction<'_>, session: &SessionRecord) -> 
 /// stored order. A target with no messages takes the retired messages with their seqs in one
 /// statement. O(target + retired rows and bytes) time, O(rows) key memory.
 fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str) -> Result<()> {
-    let held = stored_message_keys(tx, target, None)?;
+    let held = stored_message_keys(tx, target, StoredMessageSelection::All)?;
     if held.is_empty() {
         tx.execute(
             "update messages set session_id = ?1 where session_id = ?2",
@@ -8070,7 +8098,7 @@ fn move_retired_rows(tx: &rusqlite::Transaction<'_>, target: &str, retired: &str
         let mut moved = 0;
         let mut update =
             tx.prepare("update messages set session_id = ?1, seq = ?2 where id = ?3")?;
-        for (id, keys) in stored_message_keys(tx, retired, None)? {
+        for (id, keys) in stored_message_keys(tx, retired, StoredMessageSelection::All)? {
             let already_held = match keys.correlation {
                 Some(identity) => take_key(&mut held_by_identity, &identity),
                 None => take_key(&mut held_legacy, &keys.role_and_content),
@@ -8154,6 +8182,7 @@ type RowDigest = [u8; 32];
 ///   rows keep their archive coordinates even when the source's sequence shifts after pruning.
 /// - `columns_without_seq` covers other message columns; mixed-message parts are compared
 ///   separately because provider structure can change attribution without changing content.
+/// - `columns_without_seq_and_time` validates a tail overlap despite mtime-backed timestamps.
 #[derive(PartialEq, Eq)]
 struct MessageKeys {
     content: RowDigest,
@@ -8164,6 +8193,7 @@ struct MessageKeys {
     tool_result_relation: Option<RowDigest>,
     seq: i64,
     columns_without_seq: RowDigest,
+    columns_without_seq_and_time: RowDigest,
 }
 
 /// The stored message columns the archive keys read; `None` is SQL NULL.
@@ -8196,7 +8226,8 @@ impl MessageColumns<'_> {
         role_content_timestamp.update_bytes(&role_and_content);
         role_content_timestamp.update_optional_str(self.ts);
         let mut columns_without_seq = FramedSha256::new(b"aise-archive-message-columns-v1");
-        for value in [
+        let mut columns_without_seq_and_time = FramedSha256::new(b"aise-tail-message-columns-v1");
+        for (index, value) in [
             self.role,
             self.kind,
             self.authorship,
@@ -8209,11 +8240,20 @@ impl MessageColumns<'_> {
             self.input_delivery_state,
             self.input_origin,
             self.record_relation,
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             columns_without_seq.update_optional_str(value);
+            // The fourth column is time, which can come from the previous source mtime.
+            if index != 3 {
+                columns_without_seq_and_time.update_optional_str(value);
+            }
         }
         columns_without_seq.update_u8(u8::from(self.is_compaction));
         columns_without_seq.update_bytes(&content);
+        columns_without_seq_and_time.update_u8(u8::from(self.is_compaction));
+        columns_without_seq_and_time.update_bytes(&content);
         let correlation = match self.correlation {
             [Some(authority), Some(scope), Some(id)] => {
                 let mut digest = FramedSha256::new(b"aise-archive-message-correlation-v1");
@@ -8235,6 +8275,7 @@ impl MessageColumns<'_> {
                 .flatten(),
             seq: self.seq,
             columns_without_seq: columns_without_seq.finish_bytes(),
+            columns_without_seq_and_time: columns_without_seq_and_time.finish_bytes(),
         }
     }
 }
@@ -8294,29 +8335,36 @@ fn tool_result_relation_key(name: Option<&str>, call_id: Option<&str>) -> Option
     Some(digest.finish_bytes())
 }
 
-/// A session's stored message rows as (row id, keys) in (seq, id) order, or only the rows at
-/// `only_seq`. The whole session is read only off the append path: O(stored rows + bytes) time,
-/// O(stored rows) memory for the keys; one seq is an index seek on idx_messages_session_seq.
+enum StoredMessageSelection {
+    All,
+    Sequence(i64),
+    Suffix(usize),
+}
+
+/// Message keys in source order. Sequence and suffix reads use the session/sequence index;
+/// suffix validation retains only O(selected rows) keys, not the whole session archive.
 fn stored_message_keys(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
-    only_seq: Option<i64>,
+    selection: StoredMessageSelection,
 ) -> Result<Vec<(i64, MessageKeys)>> {
     const COLUMNS: &str = "select id, seq, role, kind, authorship, ts, tool_name, tool_call_id,
         is_compaction, correlation_authority, correlation_scope, correlation_id,
         input_delivery_state, input_origin, record_relation, content from messages";
-    // Two fixed statements, so the single-seq read stays an index seek: an `?2 is null or`
-    // predicate can keep SQLite off the (session_id, seq) key.
-    let mut statement = tx.prepare(&match only_seq {
-        Some(_) => format!(
+    let mut statement = tx.prepare(&match selection {
+        StoredMessageSelection::Sequence(_) => format!(
             "{COLUMNS} indexed by idx_messages_session_seq where session_id = ?1 and seq = ?2
              order by id"
         ),
-        None => format!("{COLUMNS} where session_id = ?1 order by seq, id"),
+        StoredMessageSelection::All => format!("{COLUMNS} where session_id = ?1 order by seq, id"),
+        StoredMessageSelection::Suffix(_) => format!("{COLUMNS} indexed by idx_messages_session_seq where session_id = ?1 order by seq desc, id desc limit ?2"),
     })?;
-    let mut rows = match only_seq {
-        Some(seq) => statement.query(params![session_id, seq])?,
-        None => statement.query(params![session_id])?,
+    let mut rows = match selection {
+        StoredMessageSelection::Sequence(seq) => statement.query(params![session_id, seq])?,
+        StoredMessageSelection::All => statement.query(params![session_id])?,
+        StoredMessageSelection::Suffix(count) => {
+            statement.query(params![session_id, count as i64])?
+        }
     };
     let mut keys = Vec::new();
     while let Some(row) = rows.next()? {
@@ -8344,6 +8392,9 @@ fn stored_message_keys(
             content: &content,
         };
         keys.push((row.get(0)?, columns.keys()));
+    }
+    if matches!(selection, StoredMessageSelection::Suffix(_)) {
+        keys.reverse();
     }
     Ok(keys)
 }
@@ -16683,6 +16734,7 @@ mod tests {
             .unwrap());
         assert!(!reader.implicit_index_maintenance);
         let tail = crate::tail::TailParse {
+            overlap_messages: Vec::new(),
             new_messages: Vec::new(),
             new_file_edits: Vec::new(),
             session: parsed_with_messages("claude:s1", &["saved"]).session,

@@ -18,7 +18,8 @@
 //! is within the overlap is still tagged correctly. The new rows are the SUFFIX of the
 //! overlap+tail parse after the rows the overlap alone produces — which, because parsing is a
 //! left-to-right per-line fold over identical leading bytes, is exactly the messages from the
-//! newly appended lines.
+//! newly appended lines. The indexer also checks the reread overlap against stored rows: an
+//! unchanged head alone cannot prove that later bytes before the checkpoint stayed unchanged.
 
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom};
@@ -143,6 +144,8 @@ fn complete_prefix_offset_inner_until(
 /// New rows discovered by an incremental tail parse (to be appended by `Db::append_tail`).
 #[non_exhaustive]
 pub struct TailParse {
+    // Reread prefix rows must match the stored suffix before the merge may skip them.
+    pub(crate) overlap_messages: Vec<Message>,
     pub new_messages: Vec<Message>,
     pub new_file_edits: Vec<FileEdit>,
     /// Session metadata re-derived over the [overlap, EOF) window. Used to advance the volatile
@@ -259,6 +262,7 @@ where
         .to_string();
 
     Ok(TailParseRun::Complete(Some(Box::new(TailParse {
+        overlap_messages: parsed_overlap.messages,
         new_messages,
         new_file_edits,
         session: parsed_all.session,

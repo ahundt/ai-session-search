@@ -1731,7 +1731,8 @@ fn tail_requires_full_parse(session: &crate::models::SessionRecord) -> bool {
 /// Parsing A appended bytes plus the fixed overlap costs O(A + overlap) time/memory.
 /// Stamp checks are O(1). Persistence still counts O(M) stored session messages and copies
 /// O(B + A) transcript bytes in SQLite, including transient memory, for B stored bytes.
-/// New returned messages retain O(A) bytes, plus the existing table/FTS maintenance costs.
+/// Returned messages and validation overlap retain O(A + overlap) bytes. Validation reads
+/// O(overlap rows + stored suffix bytes), plus the existing table/FTS maintenance costs.
 fn try_tail<F>(
     source: &SourceFile,
     source_path: &str,
@@ -1796,6 +1797,11 @@ where
                 }
             }
             if tail_requires_full_parse(&tail.session) {
+                return Ok(TailOutcome::FullParse);
+            }
+            // A grown file can rewrite records beyond its unchanged head. The merge may skip
+            // overlap rows only when they still match the archive; otherwise reconcile in full.
+            if !db.tail_overlap_matches(&tail.session.id, &tail.overlap_messages)? {
                 return Ok(TailOutcome::FullParse);
             }
             // Fills the tail's volatile end for `append_tail`; the tail's `created_at` is never
@@ -3188,6 +3194,81 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn claude_rewritten_source_adds_tool_and_notice_rows_without_losing_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("session.jsonl");
+        let turn = |i| serde_json::json!({"type":"assistant","uuid":format!("reply-{i}-{}", "x".repeat(80)),"sessionId":"rewrite","message":{"role":"assistant","content":format!("Synthetic response {i}")}});
+        let initial: Vec<_> = (0..42).map(turn).collect();
+        let write = |records: &[serde_json::Value]| {
+            std::fs::write(
+                &path,
+                records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+            )
+            .unwrap()
+        };
+        write(&initial);
+        let db_path = dir.path().join("index.db");
+        let config = config_with_single_claude_fixture(&db_path, &root);
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let retained = || {
+            let mut stmt = conn
+                .prepare(
+                    "select id,seq,content from messages where kind='conversation' order by seq,id",
+                )
+                .unwrap();
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        };
+        let before = retained();
+        let mut rewritten: Vec<_> = (0..40).map(turn).collect();
+        rewritten.extend([
+            serde_json::json!({"type":"assistant","uuid":"call-event","sessionId":"rewrite","message":{"role":"assistant","content":[{"type":"tool_use","id":"synthetic-call","name":"Bash","input":{"command":"echo synthetic"}}]}}),
+            serde_json::json!({"type":"attachment","uuid":"denial","sessionId":"rewrite","attachment":{"type":"hook_blocking_error","content":"Synthetic operation denied by hook"}}),
+            serde_json::json!({"type":"user","uuid":"result","sessionId":"rewrite","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"synthetic-call","content":"Synthetic tool result"}]}}),
+            serde_json::json!({"type":"assistant","uuid":"final","sessionId":"rewrite","message":{"role":"assistant","content":"Synthetic response after denial"}}),
+        ]);
+        write(&rewritten);
+        let check = |conn: &rusqlite::Connection, label: &str| {
+            let mut stmt = conn.prepare("select kind,content from messages where kind in ('tool_call','harness_notice','tool_result') or content='Synthetic response after denial' order by kind,content").unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert_eq!(rows.len(), 4, "{label} new source rows: {rows:?}");
+            rows
+        };
+        let fresh_path = dir.path().join("fresh.db");
+        let fresh = Db::open(&fresh_path).unwrap();
+        reindex(
+            &config_with_single_claude_fixture(&fresh_path, &root),
+            &fresh,
+            false,
+            None,
+        )
+        .unwrap();
+        let expected = check(&rusqlite::Connection::open(&fresh_path).unwrap(), "fresh");
+        for full in [false, true, false] {
+            reindex(&config, &db, full, None).unwrap();
+            assert_eq!(check(&conn, "refreshed"), expected, "full={full}");
+            assert_eq!(&retained()[..before.len()], before.as_slice());
+            assert_eq!(db.message_count().unwrap(), 46);
+        }
     }
 
     #[test]
