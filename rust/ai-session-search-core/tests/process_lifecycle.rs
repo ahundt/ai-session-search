@@ -1301,7 +1301,7 @@ fn message_search_describe_reads_configuration_without_creating_an_index() {
             .as_array()
             .unwrap()
             .len(),
-        28
+        30
     );
     assert!(specification["configured_default"]
         .get("input_scope")
