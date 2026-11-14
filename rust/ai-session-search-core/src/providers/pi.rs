@@ -348,7 +348,11 @@ impl PiAdapter {
                                     event_id,
                                 );
                             }
-                            if role == Some("user") && substantive_text(text) {
+                            if role == Some("user") {
+                                raw_message =
+                                    pi_skill_provenance(raw_message, text, spawned.is_some());
+                            }
+                            if role == Some("user") && substantive_text(pi_skill_arguments(text)) {
                                 first_user_index.get_or_insert(messages.len());
                                 last_user_index = Some(messages.len());
                             }
@@ -408,8 +412,9 @@ impl PiAdapter {
             }
         }
 
-        let user_text =
-            |index: Option<usize>| index.map(|index| messages[index].content().to_owned());
+        let user_text = |index: Option<usize>| {
+            index.map(|index| pi_skill_arguments(messages[index].content()).to_owned())
+        };
         let (first_user, last_user) = (user_text(first_user_index), user_text(last_user_index));
         let title = first_user
             .clone()
@@ -551,6 +556,62 @@ impl PiAdapter {
     fn spawn_origin_of(&self, path: &Path) -> Option<SpawnOrigin> {
         self.spawn_origin(self.root_for(path)?, path)
     }
+}
+
+/// Match the envelope emitted by both harnesses' _expandSkillCommand, not an inline example.
+/// Returns a byte boundary; provenance below converts it to Unicode scalar coordinates.
+fn pi_skill_argument_start(text: &str) -> Option<usize> {
+    let (header, rest) = text.split_once('\n')?;
+    if !header.starts_with("<skill name=\"")
+        || !header.contains("\" location=\"")
+        || !header.ends_with("\">")
+        || !rest.starts_with("References are relative to ")
+    {
+        return None;
+    }
+    let end = text.rfind("\n</skill>")? + "\n</skill>".len();
+    if end == text.len() {
+        Some(end)
+    } else if text[end..].starts_with("\n\n") {
+        Some(end + 2)
+    } else {
+        None
+    }
+}
+
+fn pi_skill_arguments(text: &str) -> &str {
+    pi_skill_argument_start(text).map_or(text, |start| &text[start..])
+}
+
+fn pi_skill_provenance(raw: RawMessage, text: &str, subagent: bool) -> RawMessage {
+    let Some(start) = pi_skill_argument_start(text) else {
+        return raw;
+    };
+    if start == text.len() {
+        return raw.with_authorship(MessageAuthorship::Generated);
+    }
+    let start_char = text[..start].chars().count();
+    raw.with_input_origin(MessageInputOrigin::DirectConversation)
+        .with_content_parts(vec![
+            MessageContentPart {
+                ordinal: 0,
+                start_char: 0,
+                end_char: start_char,
+                authorship: ContentPartAuthorship::Generated,
+                origin: ContentPartOrigin::HarnessContext,
+            },
+            MessageContentPart {
+                ordinal: 1,
+                start_char,
+                end_char: text.chars().count(),
+                authorship: if subagent {
+                    ContentPartAuthorship::Agent
+                } else {
+                    ContentPartAuthorship::Human
+                },
+                origin: ContentPartOrigin::DirectInput,
+            },
+        ])
 }
 
 /// Native command/instruction fields are input; their adjacent output/summary is generated.
@@ -833,6 +894,72 @@ mod tests {
     use crate::models::Provider;
     use std::fs;
     use tempfile::tempdir;
+
+    #[test]
+    fn expanded_skills_partition_context_from_personal_arguments() {
+        use crate::models::{ContentPartAuthorship, MessageAuthorship};
+        use serde_json::json;
+        let skill = "<skill name=\"sample\" location=\"/synthetic/SKILL.md\">\nReferences are relative to /synthetic.\n\nGenerated 🦀 instructions\n</skill>";
+        for adapter in [PiAdapter::new(vec![]), PiAdapter::prime_agent(vec![])] {
+            for args in ["", "\n\nplease check α"] {
+                let text = format!("{skill}{args}");
+                let records = format!(
+                    "{{\"type\":\"session\",\"id\":\"skills\"}}\n{}",
+                    json!({"type":"message","id":"skill-event","message":{"role":"user","content":text}})
+                );
+                let parsed = adapter
+                    .parse_reader(
+                        std::io::Cursor::new(records),
+                        std::path::Path::new("/synthetic/skill.jsonl"),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    parsed.session.title.as_deref(),
+                    (!args.is_empty()).then_some("please check α")
+                );
+                let row = &parsed.messages[0];
+                row.provenance.validate(&row.content).unwrap();
+                assert_eq!(row.content, text);
+                if args.is_empty() {
+                    assert_eq!(row.provenance.authorship, MessageAuthorship::Generated);
+                } else {
+                    assert_eq!(row.provenance.authorship, MessageAuthorship::Mixed);
+                    let parts = &row.provenance.content_parts;
+                    assert_eq!(parts.len(), 2);
+                    assert_eq!(parts[0].authorship, ContentPartAuthorship::Generated);
+                    assert_eq!(parts[1].authorship, ContentPartAuthorship::Human);
+                    assert_eq!(parts[1].start_char, skill.chars().count() + 2);
+                }
+                let dir = tempdir().unwrap();
+                let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+                let mut old = parsed.clone();
+                old.session.parse_version = "legacy-skill-parser".into();
+                old.messages[0].provenance.authorship = MessageAuthorship::Human;
+                old.messages[0].provenance.content_parts.clear();
+                db.upsert_session(&old, 1, 1).unwrap();
+                db.upsert_session(&parsed, 1, 1).unwrap();
+                use crate::message_search::{
+                    MessageQuery, MessageSearchRequest, MessageTarget, SearchSurface,
+                };
+                let config = crate::config::Config::default();
+                let service =
+                    crate::service::MessageService::new(&config, &db, SearchSurface::Rust);
+                for (query, count) in [
+                    ("Generated 🦀", 0),
+                    ("please check α", usize::from(!args.is_empty())),
+                ] {
+                    let request = MessageSearchRequest::builder(
+                        MessageQuery::literal(query).unwrap(),
+                        MessageTarget::content(),
+                    )
+                    .role(crate::models::Role::User)
+                    .build()
+                    .unwrap();
+                    assert_eq!(service.search(request).unwrap().hits().len(), count);
+                }
+            }
+        }
+    }
 
     #[test]
     fn native_commands_and_compaction_instructions_are_input_not_generated_output() {
