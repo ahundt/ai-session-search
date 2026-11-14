@@ -1348,6 +1348,7 @@ mod tests {
 
     fn hit(seq: i64, role: Role, content: &str) -> MessageHit {
         MessageHit {
+            row_id: 0,
             provenance: None,
             session_id: "claude:test".to_string(),
             provider: Provider::Claude,

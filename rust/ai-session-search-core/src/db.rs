@@ -3444,7 +3444,7 @@ impl Db {
             self.ordered_page_index_hint(filters, order, content_prefilter.as_deref())?;
         let ranges = input_provenance_projection(filters);
         let mut sql = format!(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{ranges} \
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{ranges}, m.id as message_row_id \
              from messages m{page_index_hint} where 1 = 1",
         );
         let mut args = Vec::new();
@@ -3709,7 +3709,7 @@ impl Db {
 
         let ranges = input_provenance_projection(filters);
         let mut sql = format!(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{ranges} \
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{ranges}, m.id as message_row_id \
              from messages m where 1 = 1",
         );
         let mut args: Vec<Value> = Vec::new();
@@ -4059,7 +4059,7 @@ impl Db {
         }
         let provenance = input_provenance_projection(filters);
         let mut sql = format!(
-            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{provenance} \
+            "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name, m.kind, m.tool_call_id, m.content{provenance}, m.id as message_row_id \
              from messages m where 1 = 1",
         );
         let mut args = Vec::new();
@@ -4168,7 +4168,7 @@ impl Db {
         let provenance = input_provenance_projection(filters);
         let mut sql = format!(
             "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                    m.kind, m.tool_call_id, m.content{provenance}
+                    m.kind, m.tool_call_id, m.content{provenance}, m.id as message_row_id
                from messages m
               where m.tool_name is not null",
         );
@@ -4296,7 +4296,7 @@ impl Db {
             let provenance = input_provenance_projection(filters);
             let mut sql = format!(
                 "select m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                        m.kind, m.tool_call_id, m.content{provenance}
+                        m.kind, m.tool_call_id, m.content{provenance}, m.id as message_row_id
                    from json_each(?) selected
                    join messages m on m.tool_name = selected.value
                   where m.tool_name is not null",
@@ -4823,7 +4823,7 @@ impl Db {
         anyhow::ensure!(before >= 0, "context before must be non-negative");
         anyhow::ensure!(after >= 0, "context after must be non-negative");
         let mut sql = String::from(
-            "select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, content from messages
+            "select session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, content, id as message_row_id from messages
              where session_id = ? and seq between ? and ?",
         );
         // Saturate instead of wrapping: a huge `context` request (e.g. i64::MAX) must widen
@@ -4879,7 +4879,7 @@ impl Db {
                    from json_each(?)
              )
              select a.ord, m.session_id, m.provider, m.seq, m.role, m.ts, m.tool_name,
-                    m.kind, m.tool_call_id, m.content
+                    m.kind, m.tool_call_id, m.content, m.id as message_row_id
                from anchors a
                join messages m on m.session_id = a.session_id
                               and m.seq between a.lower_seq and a.upper_seq
@@ -5065,7 +5065,7 @@ impl Db {
                         )
                       )
                     end as content,
-                    m.id as message_id
+                    m.id as message_id, m.id as message_row_id
              from messages m
              where m.record_relation = 'original'
                and {copy_exclusion}
@@ -9283,6 +9283,7 @@ fn decode_db_enum<T>(
 fn row_to_message_hit_at(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite::Result<MessageHit> {
     let ts: Option<String> = row.get(offset + 4)?;
     Ok(MessageHit {
+        row_id: row.get("message_row_id")?,
         provenance: row
             .as_ref()
             .column_index("source_provenance")
@@ -10348,7 +10349,7 @@ mod tests {
         ] {
             let error = connection
                 .query_row(
-                    "select 'session', ?1, 0, ?2, null, null, 'conversation', null, 'content'",
+                    "select 'session', ?1, 0, ?2, null, null, 'conversation', null, 'content', 1 as message_row_id",
                     params![provider, role],
                     row_to_message_hit,
                 )
@@ -21511,14 +21512,28 @@ mod tests {
         insert_tied_human_messages(&db, &expected);
         let contents =
             |hits: Vec<MessageHit>| hits.into_iter().map(|hit| hit.content).collect::<Vec<_>>();
-        assert_eq!(
-            contents(db.message_context("claude:t", 4, 0, 0).unwrap()),
-            expected
-        );
+        let context = db.message_context("claude:t", 4, 0, 0).unwrap();
+        let row_ids = context.iter().map(|hit| hit.row_id).collect::<Vec<_>>();
+        assert!(row_ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(contents(context), expected);
         let windows = db
             .message_context_windows(&[("claude:t".to_string(), 4)], 1, 1)
             .unwrap();
-        assert_eq!(contents(windows.into_iter().next().unwrap()), expected);
+        let window = windows.into_iter().next().unwrap();
+        assert_eq!(
+            window.iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
+            row_ids
+        );
+        assert_eq!(contents(window), expected);
+        let filters = MessageFilters {
+            session_id: Some("claude:t".into()),
+            ..Default::default()
+        };
+        let search = db.search_messages("context", &filters).unwrap();
+        assert_eq!(
+            search.iter().map(|hit| hit.row_id).collect::<Vec<_>>(),
+            row_ids
+        );
     }
 
     #[test]
