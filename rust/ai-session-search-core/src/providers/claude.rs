@@ -534,8 +534,20 @@ impl QueuedCommand {
         let mut retired_lines = false;
         let mut delivered = std::collections::HashSet::new();
         let mut kept: Vec<Self> = Vec::new();
+        let mut scanned = 0;
+        let mut enqueue_start = 0;
         for queued in queued {
+            // An attachment cannot supply delivery evidence across an intervening reply.
+            for (offset, message) in messages[scanned..queued.position].iter().enumerate() {
+                if message.role() == "assistant" {
+                    enqueue_start = scanned + offset + 1;
+                }
+            }
+            scanned = queued.position;
             let Some(position) = indexed.get_mut(&queued.digest).and_then(|positions| {
+                while positions.front().is_some_and(|&p| p < enqueue_start) {
+                    positions.pop_front();
+                }
                 // A later enqueue is a delivery copy only at the next conversation
                 // position; an intervening reply starts an independent submission.
                 (positions

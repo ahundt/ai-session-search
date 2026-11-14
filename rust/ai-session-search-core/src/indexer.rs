@@ -3191,24 +3191,31 @@ mod tests {
     }
 
     #[test]
-    fn claude_queued_attachments_do_not_consume_later_submissions() {
+    fn claude_queued_attachments_do_not_consume_other_submissions() {
         use std::io::Write as _;
-        for arrangement in ["contentless", "attachment-first", "enqueue-first"] {
+        for arrangement in [
+            "contentless",
+            "attachment-first",
+            "enqueue-first",
+            "earlier-enqueue",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().join("claude");
             std::fs::create_dir_all(&root).unwrap();
             let path = root.join("session.jsonl");
             let attachment = serde_json::json!({"type":"attachment","uuid":"first-delivery","sessionId":"repeat-queue","timestamp":"2026-11-01T00:00:02Z","attachment":{"type":"queued_command","prompt":"repeat synthetic submission","commandMode":"prompt","origin":{"kind":"human"}}});
             let enqueue = serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"repeat-queue","timestamp":"2026-11-01T00:00:01Z","content":"repeat synthetic submission"});
-            let records = if arrangement == "contentless" {
+            let records = if arrangement == "earlier-enqueue" {
+                vec![enqueue.clone()]
+            } else if arrangement == "contentless" {
                 vec![
                     serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"repeat-queue"}),
-                    attachment,
+                    attachment.clone(),
                 ]
             } else if arrangement == "attachment-first" {
-                vec![attachment, enqueue]
+                vec![attachment.clone(), enqueue]
             } else {
-                vec![enqueue, attachment]
+                vec![enqueue, attachment.clone()]
             };
             std::fs::write(
                 &path,
@@ -3221,12 +3228,24 @@ mod tests {
             reindex(&config, &db, false, None).unwrap();
             let reply = serde_json::json!({"type":"assistant","uuid":"reply","sessionId":"repeat-queue","message":{"role":"assistant","content":"synthetic response"}});
             let later = serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"repeat-queue","timestamp":"2026-11-01T00:00:03Z","content":"repeat synthetic submission"});
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .unwrap()
-                .write_all(format!("{reply}\n{later}\n").as_bytes())
-                .unwrap();
+            let appended = if arrangement == "earlier-enqueue" {
+                vec![
+                    reply,
+                    serde_json::json!({"type":"queue-operation","operation":"enqueue","sessionId":"repeat-queue"}),
+                    attachment,
+                ]
+            } else {
+                vec![reply, later]
+            };
+            for record in appended {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(format!("{record}\n").as_bytes())
+                    .unwrap();
+                reindex(&config, &db, false, None).unwrap();
+            }
             let rows = |path: &Path| {
                 let conn = rusqlite::Connection::open(path).unwrap();
                 let mut stmt = conn.prepare("select json_array(role,kind,content,authorship,input_origin,input_delivery_state,correlation_authority,correlation_scope,correlation_id) from messages order by seq,id").unwrap();
