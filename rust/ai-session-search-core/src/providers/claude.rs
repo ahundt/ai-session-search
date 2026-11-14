@@ -444,6 +444,8 @@ struct QueuedCommand {
     /// `messages.len()` and `transcript_lines.len()` when the attachment was read, so the row
     /// keeps its place in file order.
     position: usize,
+    // Ordinary attachments do not interrupt the next conversation delivery copy.
+    delivery_position: usize,
     transcript_position: usize,
     digest: String,
     /// `commandMode == "prompt"`: input a person or agent submitted. Any other mode is not a
@@ -492,6 +494,7 @@ impl QueuedCommand {
         }
         Some(Self {
             position,
+            delivery_position: position,
             transcript_position,
             digest,
             prompt: is_prompt,
@@ -536,12 +539,14 @@ impl QueuedCommand {
                 .get_mut(&queued.digest)
                 .and_then(std::collections::VecDeque::pop_front)
             else {
-                let delivery_copy = !enqueued.contains_key(&queued.position)
-                    && messages.get(queued.position).is_some_and(|message| {
-                        message.role() == "user"
-                            && sha256(message.content().trim().as_bytes()) == queued.digest
-                    });
-                if !delivery_copy || !delivered.insert(queued.position) {
+                let delivery_copy = !enqueued.contains_key(&queued.delivery_position)
+                    && messages
+                        .get(queued.delivery_position)
+                        .is_some_and(|message| {
+                            message.role() == "user"
+                                && sha256(message.content().trim().as_bytes()) == queued.digest
+                        });
+                if !delivery_copy || !delivered.insert(queued.delivery_position) {
                     kept.push(queued);
                 }
                 continue;
@@ -801,6 +806,7 @@ impl ClaudeAdapter {
         // Retain fixed-size digests rather than another copy of the transcript's bodies.
         let mut seen_records = std::collections::HashSet::new();
         let mut attachments = AttachmentRows::default();
+        let mut attachment_positions = std::collections::HashSet::new();
 
         for line in crate::util::lines_replacing_invalid_utf8(reader) {
             let line = line?;
@@ -912,7 +918,13 @@ impl ClaudeAdapter {
                             queued_commands.push(queued);
                         }
                     } else if value["attachment"]["type"] != "queued_command" {
+                        let start = attachments.rows.len();
                         attachments.read(&value, &mut unrecognized);
+                        // Keep overlap parses a row prefix while retaining attachment deduplication.
+                        attachment_positions.extend(
+                            messages.len()..messages.len() + attachments.rows.len() - start,
+                        );
+                        messages.extend_from_slice(&attachments.rows[start..]);
                     } else if !value["attachment"]["prompt"].is_string() {
                         unrecognized.layout(
                             "queued_command",
@@ -1249,6 +1261,11 @@ impl ClaudeAdapter {
         }
 
         retracted_messages.append(&mut earlier_assistant_rows);
+        for queued in &mut queued_commands {
+            while attachment_positions.contains(&queued.delivery_position) {
+                queued.delivery_position += 1;
+            }
+        }
         QueuedCommand::place(
             queued_commands,
             &enqueued,
@@ -1323,8 +1340,7 @@ impl ClaudeAdapter {
         if has_queue_operations {
             raw_metadata["queue_operations"] = json!(queue_operation_counts);
         }
-        // Attachments render after conversation rows, so their overlap is not a row prefix.
-        if requires_full_parse_for_tail || !attachments.rows.is_empty() {
+        if requires_full_parse_for_tail {
             raw_metadata["requires_full_parse_for_tail"] = json!(true);
         }
         if !unrecognized.counts.is_empty() {
@@ -1397,7 +1413,7 @@ impl ClaudeAdapter {
         } else {
             UserRoleEvidence::HumanInputEvent
         };
-        messages.extend(attachments.rows);
+        drop(attachments);
         let mut messages = crate::util::normalize_raw_messages_with_evidence(
             messages,
             Some(&session.id),

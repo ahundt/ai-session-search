@@ -2203,54 +2203,126 @@ mod tests {
     #[test]
     fn claude_turn_after_attachment_matches_fresh_index() {
         use std::io::Write as _;
+
+        for variant in ["turns", "attachments", "interleaved"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("claude");
+            std::fs::create_dir_all(&root).unwrap();
+            let path = root.join("session.jsonl");
+            let attachment = |n: usize| {
+                serde_json::json!({"type":"attachment","sessionId":"attachment-turn",
+                "attachment":{"type":"instructions","files":[{"path":"/synthetic/rules.txt","content":format!("attachment rule {n}")}]}})
+            };
+            let turn = |n: usize| {
+                serde_json::json!({"type":"assistant","uuid":format!("turn-{n}"),
+                "sessionId":"attachment-turn","message":{"role":"assistant","content":format!("appended response {n}")}})
+            };
+            std::fs::write(
+                &path,
+                format!(
+                    "{}{}\n",
+                    claude_overlap_padding("attachment-turn"),
+                    attachment(0)
+                ),
+            )
+            .unwrap();
+            let db_path = dir.path().join("index.db");
+            let config = config_with_single_claude_fixture(&db_path, &root);
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let rows = |path: &Path| {
+                let conn = rusqlite::Connection::open(path).unwrap();
+                let mut stmt = conn.prepare(
+                    "select json_array(role,kind,content,correlation_authority,correlation_scope,correlation_id) from messages order by seq,id"
+                ).unwrap();
+                stmt.query_map([], |r| r.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            for refresh in 1..=2 {
+                let n = refresh * 2;
+                let records = match variant {
+                    "turns" => vec![turn(n), turn(n + 1)],
+                    "attachments" => vec![attachment(n), attachment(0), attachment(n + 1)],
+                    _ => vec![
+                        turn(n),
+                        attachment(n),
+                        turn(n + 1),
+                        attachment(0),
+                        attachment(n + 1),
+                    ],
+                };
+                let appended = records.iter().map(|r| format!("{r}\n")).collect::<String>();
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(appended.as_bytes())
+                    .unwrap();
+                reindex(&config, &db, false, None).unwrap();
+                let fresh_path = dir.path().join(format!("fresh-{refresh}.db"));
+                let fresh = Db::open(&fresh_path).unwrap();
+                reindex(
+                    &config_with_single_claude_fixture(&fresh_path, &root),
+                    &fresh,
+                    false,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    rows(&db_path),
+                    rows(&fresh_path),
+                    "{variant}, refresh {refresh}"
+                );
+                let stored = db.resolve_session_record("claude:attachment-turn").unwrap();
+                let metadata: serde_json::Value =
+                    serde_json::from_str(stored.raw_metadata_json.as_deref().unwrap()).unwrap();
+                assert!(
+                    metadata.get("requires_full_parse_for_tail").is_none(),
+                    "{variant}, refresh {refresh}: {metadata}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_attachment_between_queue_and_delivery_keeps_one_input() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("claude");
         std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("session.jsonl");
-        let initial = format!(
-            "{}\n{}\n",
-            serde_json::json!({"type":"user","sessionId":"attachment-turn","message":{"role":"user","content":"initial prompt"}}),
-            serde_json::json!({"type":"attachment","sessionId":"attachment-turn","attachment":{"type":"instructions","files":[{"path":"/synthetic/rules.txt","content":"attachment rule ".repeat(200)}]}})
-        );
-        std::fs::write(&path, initial).unwrap();
+        let records = [
+            serde_json::json!({"type":"attachment","uuid":"queued","sessionId":"queue-attachment",
+                "attachment":{"type":"queued_command","prompt":"delivered prompt","commandMode":"prompt"}}),
+            serde_json::json!({"type":"attachment","sessionId":"queue-attachment",
+                "attachment":{"type":"instructions","content":"synthetic rule"}}),
+            serde_json::json!({"type":"user","uuid":"delivered","sessionId":"queue-attachment",
+                "message":{"role":"user","content":"delivered prompt"}}),
+        ];
+        std::fs::write(
+            root.join("session.jsonl"),
+            records.iter().map(|r| format!("{r}\n")).collect::<String>(),
+        )
+        .unwrap();
         let db_path = dir.path().join("index.db");
-        let config = config_with_single_claude_fixture(&db_path, &root);
         let db = Db::open(&db_path).unwrap();
-        reindex(&config, &db, false, None).unwrap();
-        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(
-            b"{\"type\":\"assistant\",\"sessionId\":\"attachment-turn\",\"message\":{\"role\":\"assistant\",\"content\":\"appended response\"}}\n"
-        ).unwrap();
-        reindex(&config, &db, false, None).unwrap();
-        assert_eq!(
-            db.search_messages("appended response", &Default::default())
-                .unwrap()
-                .len(),
-            1
-        );
-        let fresh_path = dir.path().join("fresh.db");
-        let fresh = Db::open(&fresh_path).unwrap();
         reindex(
-            &config_with_single_claude_fixture(&fresh_path, &root),
-            &fresh,
+            &config_with_single_claude_fixture(&db_path, &root),
+            &db,
             false,
             None,
         )
         .unwrap();
-        let rows = |path: &Path| {
-            let conn = rusqlite::Connection::open(path).unwrap();
-            let mut stmt = conn
-                .prepare(
-                    "select json_array(role,kind,content,correlation_id) from messages order by 1",
-                )
-                .unwrap();
-            stmt.query_map([], |r| r.get::<_, String>(0))
+        assert_eq!(
+            db.search_messages("delivered prompt", &Default::default())
                 .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
+                .len(),
+            1
+        );
+        assert!(tail_requires_full_parse(
+            &db.resolve_session_record("claude:queue-attachment")
                 .unwrap()
-        };
-        assert_eq!(rows(&db_path), rows(&fresh_path));
-        reindex(&config, &db, false, None).unwrap();
-        assert_eq!(rows(&db_path), rows(&fresh_path));
+        ));
     }
 
     #[test]
