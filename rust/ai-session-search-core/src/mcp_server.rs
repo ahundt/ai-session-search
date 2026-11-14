@@ -28,7 +28,7 @@ use crate::refs::{extract_refs_from_text, ref_summary};
 use crate::runtime::ExecutionRuntime;
 use crate::service::SessionSearch;
 use crate::service::{CatalogService, MessageService};
-use crate::sql_query::{self, DbSchemaArgs, ResolvedDbQueryArgs};
+use crate::sql_query;
 use crate::util::{
     current_repo, normalize_path_prefix, render_posix_shell_command, truncate_for_display,
 };
@@ -5045,24 +5045,21 @@ fn tool_search_sessions(args: &Value, config: &Config, db: &Db) -> Result<ToolRe
     let offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
     let requested_limit = filters.limit;
     if requested_limit > 0 {
-        filters.limit = offset
-            .checked_add(requested_limit)
-            .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| {
-                "search_sessions offset plus limit and look-ahead overflows".to_string()
-            })?;
+        filters.limit = requested_limit.checked_add(1).ok_or_else(|| {
+            "search_sessions offset plus limit and look-ahead overflows".to_string()
+        })?;
     }
     let repo = current_repo(config);
     let mut hits = CatalogService::new(db)
-        .search_sessions(query, &filters, repo.as_deref(), &config.search.scoring)
+        .search_sessions_page(
+            query,
+            &filters,
+            repo.as_deref(),
+            &config.search.scoring,
+            offset,
+        )
         .map_err(|e| format!("{e:#}"))?;
-    let page_end = offset
-        .checked_add(requested_limit)
-        .ok_or_else(|| "search_sessions offset plus limit overflows".to_string())?;
-    let has_more = requested_limit > 0 && hits.len() > page_end;
-    if offset > 0 {
-        hits.drain(..offset.min(hits.len()));
-    }
+    let has_more = requested_limit > 0 && hits.len() > requested_limit;
     if requested_limit > 0 {
         hits.truncate(requested_limit);
     }
@@ -5671,60 +5668,33 @@ fn tool_query_session_index_cancellable(
             "query_session_index accepts one mode at a time: provide sql to run a read-only query over the AI session-history index, schema_table to inspect columns, or neither to list schema objects.".to_string(),
         );
     }
-    if sql.is_some() {
-        crate::search_scope::ensure_raw_sql_allowed(
-            &config.search.scope,
-            "query_session_index SQL",
-        )
-        .map_err(|error| format!("{error:#}"))?;
-    }
+    let service = crate::service::SqlService::new(config);
     if sql.is_none() {
-        let schema_args = DbSchemaArgs {
+        let query = crate::sql_query::SqlSchemaQuery {
             table: schema_table.map(str::to_string),
             include_internal: mcp_bool_arg(args, "include_internal", false),
-            format: crate::render::OutputFormat::Json,
         };
-        let result = match cancellation {
-            Some(cancellation) => sql_query::schema_path_cancellable(
-                &config.db_path(),
-                config.index.busy_timeout_ms,
-                &schema_args,
-                cancellation,
-            ),
-            None => sql_query::schema_path(
-                &config.db_path(),
-                config.index.busy_timeout_ms,
-                &schema_args,
-            ),
-        }
-        .map_err(format_mcp_query_error)?;
+        let result = service
+            .schema_cancellable(&query, cancellation)
+            .map_err(format_mcp_query_error)?;
         let payload =
             sql_query::query_result_payload(&result, 0, mcp_max_cell_chars(args, config)?);
         return ToolResponse::structured(payload.value);
     }
-
-    let query_args = ResolvedDbQueryArgs {
-        sql: sql.unwrap().to_string(),
-        limit: mcp_nonnegative_usize_arg(args, "limit", config.db.query_limit)?,
-        offset: mcp_nonnegative_usize_arg(args, "offset", 0)?,
-        timeout_ms: mcp_u64_arg(args, "timeout_ms", config.mcp.query_timeout_ms),
-        format: crate::render::OutputFormat::Json,
-    };
-    let result = match cancellation {
-        Some(cancellation) => sql_query::query_path_cancellable(
-            &config.db_path(),
-            config.index.busy_timeout_ms,
-            &query_args,
-            cancellation,
-        ),
-        None => sql_query::query_path(&config.db_path(), config.index.busy_timeout_ms, &query_args),
-    }
-    .map_err(format_mcp_query_error)?;
-    let payload = sql_query::query_result_payload(
-        &result,
-        query_args.offset,
-        mcp_max_cell_chars(args, config)?,
-    );
+    let mut query = crate::sql_query::SqlQuery::new(sql.unwrap());
+    query.limit = Some(mcp_nonnegative_usize_arg(
+        args,
+        "limit",
+        config.db.query_limit,
+    )?);
+    query.offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
+    query.timeout_ms = Some(mcp_u64_arg(args, "timeout_ms", config.mcp.query_timeout_ms));
+    // Keep cell presentation here so the payload can report precisely which cells were cut.
+    let result = service
+        .query_cancellable(&query, cancellation, "query_session_index SQL")
+        .map_err(format_mcp_query_error)?;
+    let payload =
+        sql_query::query_result_payload(&result, query.offset, mcp_max_cell_chars(args, config)?);
     ToolResponse::structured(payload.value)
 }
 
@@ -7098,6 +7068,40 @@ mod tests {
                 .map(crate::ServiceError::code),
             Some("invalid-argument")
         );
+    }
+
+    #[test]
+    fn surface_representative_responses() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        for (name, args) in [
+            (
+                "get_session",
+                json!({"session_id":"claude:test1", "seq":1,"context":1}),
+            ),
+            (
+                "get_session",
+                json!({"session_id":"claude:test1", "seq_from":0, "seq_to":1}),
+            ),
+            (
+                "get_session",
+                json!({"session_id":"claude:test1","transcript_lines":2}),
+            ),
+            (
+                "search_sessions",
+                json!({"query":"hello","limit":1,"offset":0}),
+            ),
+            (
+                "query_session_index",
+                json!({"sql":"select id from sessions order by id", "limit":1}),
+            ),
+            ("query_session_index", json!({"schema_table":"messages"})),
+        ] {
+            println!(
+                "SNAPSHOT {}",
+                json!({"tool":name,"arguments":args,"response":call_tool(name,args.clone(),&config,&db)})
+            );
+        }
     }
 
     fn fixture() -> (tempfile::TempDir, Db) {
