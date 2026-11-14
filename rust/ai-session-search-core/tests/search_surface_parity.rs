@@ -59,6 +59,73 @@ mod support;
 
 const FIXTURE: &str = include_str!("fixtures/search_surface_parity.json");
 
+#[test]
+fn filtered_range_reads_share_event_dates_role_and_newest_order() {
+    use ai_session_search::db::MessageOrder;
+    use ai_session_search::models::MessageFilters;
+    let mut f = fixture();
+    let id = "claude:warning";
+    f.spec["session_id"] = json!(id);
+    let db = Db::open(&f.db_path).unwrap();
+    let mut first = Message::new(0, Role::Assistant, "first");
+    first.ts = ai_session_search::util::parse_datetime("2026-01-01T00:00:00Z");
+    let mut second = Message::new(1, Role::Assistant, "second");
+    second.ts = ai_session_search::util::parse_datetime("2026-02-01T00:00:00Z");
+    db.upsert_session(
+        &ParsedSession::new(
+            SessionRecord::new(id, Provider::Claude, "warning", "/warning", "test", "test"),
+            vec![first, second],
+        ),
+        0,
+        0,
+    )
+    .unwrap();
+    let filters = MessageFilters::default()
+        .with_session_id(id)
+        .with_role(Role::Assistant)
+        .with_since(ai_session_search::util::parse_datetime("2026-02-01T00:00:00Z").unwrap())
+        .with_limit(1);
+    let config = Config::default();
+    let service = MessageService::new(&config, &db, SearchSurface::Rust);
+    let expected = vec![(1, "assistant".to_string())];
+    assert_eq!(
+        hit_ids(
+            service
+                .read_session(&filters, MessageOrder::NewestFirst)
+                .unwrap()
+        ),
+        expected
+    );
+    assert_eq!(
+        cli_read(
+            &f,
+            &[
+                "--role".into(),
+                "assistant".into(),
+                "--since".into(),
+                "2026-02-01T00:00:00Z".into(),
+                "--limit".into(),
+                "1".into(),
+                "--order".into(),
+                "newest".into()
+            ]
+        ),
+        expected
+    );
+    let response = mcp_calls(
+        &f,
+        &[(
+            "get_session",
+            json!({"session_id":id,
+        "role":"assistant", "since":"2026-02-01T00:00:00Z", "limit":1, "order":"newest"}),
+        )],
+    )
+    .remove(0)
+    .unwrap();
+    assert_eq!(response["session_id"], id);
+    assert_eq!(read_rows(&response), expected);
+}
+
 type Ids = Vec<(i64, String)>;
 
 struct Fixture {
