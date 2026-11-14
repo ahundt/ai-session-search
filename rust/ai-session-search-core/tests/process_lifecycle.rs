@@ -18,6 +18,159 @@ mod support;
 use support::aise;
 
 #[test]
+fn upgrade_preserves_mcp_launch_policy_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let mut command = aise(root.path());
+        for key in include_str!("../harness-environment.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            command.env_remove(key);
+        }
+        command.args(args).output().unwrap()
+    };
+    let installed = run(&[
+        "integrations",
+        "install",
+        "--client",
+        "claude",
+        "--no-mcp",
+        "--no-instructions",
+        "--no-aliases",
+        "--no-index-preparation",
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let args = serde_json::json!([
+        "--index-refresh",
+        "existing-only",
+        "--threads=1",
+        "mcp",
+        "serve"
+    ]);
+    let binary = env!("CARGO_BIN_EXE_aise");
+    let entry = serde_json::json!({"command":binary, "args":args, "env":{"SYNTHETIC":"keep"}});
+    let mut command = vec![serde_json::json!(binary)];
+    command.extend(args.as_array().unwrap().clone());
+    for (path, document) in [
+        (
+            ".claude/.mcp.json",
+            serde_json::json!({"mcpServers":{"ai-session-search":entry}}),
+        ),
+        (
+            ".cursor/mcp.json",
+            serde_json::json!({"mcpServers":{"ai-session-search":entry}}),
+        ),
+        (
+            ".config/opencode/opencode.json",
+            serde_json::json!({"mcp":{"ai-session-search":{"command":command,"enabled":true}}}),
+        ),
+        (
+            ".openclaw/openclaw.json",
+            serde_json::json!({"mcpServers":{"ai-session-search":entry}}),
+        ),
+    ] {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, document.to_string()).unwrap();
+    }
+    let codex = root.path().join(".codex/config.toml");
+    fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    let toml = format!(
+        "[mcp_servers.ai-session-search]\ncommand = {}\nargs = {args}\n",
+        serde_json::json!(binary)
+    );
+    fs::write(&codex, toml).unwrap();
+    if cfg!(target_os = "macos") {
+        let zed = root
+            .path()
+            .join("Library/Application Support/Zed/settings.json");
+        fs::create_dir_all(zed.parent().unwrap()).unwrap();
+        fs::write(
+            zed,
+            serde_json::json!({"context_servers":{"ai-session-search":entry}}).to_string(),
+        )
+        .unwrap();
+    }
+    let output = run(&["dates"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut paths = vec![
+        (".claude.json", vec!["mcpServers"]),
+        (".cursor/mcp.json", vec!["mcpServers"]),
+        (".config/opencode/opencode.json", vec!["mcp", "servers"]),
+        (".openclaw/openclaw.json", vec!["mcp", "servers"]),
+        (
+            "codex-marketplace/plugins/ai-session-search/.mcp.json",
+            vec!["mcpServers"],
+        ),
+    ];
+    if cfg!(target_os = "macos") {
+        paths.push((".config/zed/settings.json", vec!["context_servers"]));
+    }
+    for (path, keys) in paths {
+        let path = root.path().join(path);
+        let text =
+            fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        for key in keys {
+            value = value[key].clone();
+        }
+        let entry = &value["ai-session-search"];
+        if entry["command"].is_array() {
+            assert_eq!(
+                entry["command"],
+                serde_json::json!(command),
+                "{}",
+                path.display()
+            );
+        } else {
+            assert_eq!(entry["args"], args, "{}", path.display());
+        }
+        if path.ends_with(".cursor/mcp.json") {
+            assert_eq!(entry["type"], "stdio");
+        }
+    }
+    let after: toml::Value = toml::from_str(&fs::read_to_string(codex).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&after["mcp_servers"]["ai-session-search"]["args"]).unwrap(),
+        args
+    );
+    let reinstalled = run(&[
+        "integrations",
+        "install",
+        "--client",
+        "claude",
+        "--no-skill",
+        "--no-instructions",
+        "--no-aliases",
+        "--no-index-preparation",
+        "--binary",
+        binary,
+    ]);
+    assert!(
+        reinstalled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reinstalled.stderr)
+    );
+    let explicit: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(root.path().join(".claude.json")).unwrap())
+            .unwrap();
+    assert!(!explicit["mcpServers"]["ai-session-search"]["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|arg| arg == "--threads=1" || arg == "--index-refresh"));
+}
+
+#[test]
 fn upgrade_keeps_current_mcp_registration_over_obsolete_duplicates() {
     for client in ["claude", "opencode"] {
         let root = tempfile::tempdir().unwrap();

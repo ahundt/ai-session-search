@@ -5125,11 +5125,34 @@ fn merge_registration_arguments(
             selections.push((pair[0].clone(), pair[1].clone()));
         }
     }
-    let mut args: Vec<Value> = selections
-        .into_iter()
-        .flat_map(|(flag, value)| [Value::String(flag), Value::String(value)])
-        .collect();
-    args.extend([json!("mcp"), json!("serve")]);
+    // Explicit reinstall selects state; automatic migration retains the user's launch policy.
+    let mut args: Vec<Value> =
+        if state.is_none() && (!old_args.is_empty() || !entry_args.is_empty()) {
+            let (retained, has_args) = if old_args.is_empty() {
+                (entry_args, entry.get("args").is_some())
+            } else {
+                (old_args, old.is_some_and(|old| old.get("args").is_some()))
+            };
+            let retained = if has_args {
+                retained
+            } else {
+                retained.get(1..).unwrap_or_default()
+            };
+            if !mcp_serve_arguments(retained) {
+                bail!(
+                    "{} server {SERVER_NAME} has customized launch arguments; left unchanged",
+                    path.display()
+                );
+            }
+            retained.to_vec()
+        } else {
+            let mut args: Vec<_> = selections
+                .into_iter()
+                .flat_map(|(flag, value)| [Value::String(flag), Value::String(value)])
+                .collect();
+            args.extend([json!("mcp"), json!("serve")]);
+            args
+        };
     if entry["command"].is_array() {
         let binary = entry["command"][0].clone();
         args.insert(0, binary);
@@ -5844,30 +5867,10 @@ fn json_array_is_strings(value: Option<&Value>, expected: &[&str]) -> bool {
 }
 
 fn mcp_serve_arguments(args: &[Value]) -> bool {
-    let mut remaining = Vec::new();
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        let Some(arg) = arg.as_str() else {
-            return false;
-        };
-        if STATE_OPTIONS.iter().any(|(flag, _)| arg == *flag) {
-            if !args
-                .next()
-                .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
-            {
-                return false;
-            }
-        } else if STATE_OPTIONS.iter().any(|(flag, _)| {
-            arg.strip_prefix(&format!("{flag}="))
-                .is_some_and(|value| !value.is_empty())
-        }) {
-            continue;
-        } else {
-            remaining.push(arg);
-        }
-    }
-    remaining == ["mcp", "serve"]
+    args.iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+        .is_some_and(|args| crate::cli::is_mcp_serve_arguments(&args))
 }
 
 fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {

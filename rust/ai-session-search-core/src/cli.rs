@@ -102,6 +102,19 @@ struct Cli {
     command_path: Vec<String>,
 }
 
+/// Recognize a registration's launch arguments without resolving configuration or running it.
+pub(crate) fn is_mcp_serve_arguments(args: &[&str]) -> bool {
+    args.iter().all(|arg| !arg.is_empty())
+        && Cli::try_parse_from(std::iter::once("aise").chain(args.iter().copied())).is_ok_and(
+            |cli| {
+                matches!(
+                    cli.command,
+                    Commands::Mcp(crate::integrations::McpCmd::Serve)
+                )
+            },
+        )
+}
+
 #[derive(Debug, Subcommand)]
 enum Commands {
     #[command(name = "__refresh-index", hide = true)]
