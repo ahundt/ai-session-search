@@ -111,6 +111,96 @@ fn upgrade_migrates_published_mcp_registrations_without_installing_skills() {
 }
 
 #[test]
+fn automatic_mcp_refresh_preserves_unrecognized_duplicates() {
+    for case in ["opencode-old", "opencode-current", "claude", "codex"] {
+        let root = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let mut command = aise(root.path());
+            for key in include_str!("../harness-environment.txt")
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            {
+                command.env_remove(key);
+            }
+            command
+                .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let binary = env!("CARGO_BIN_EXE_aise");
+        let current =
+            serde_json::json!({"type":"local","command":[binary,"mcp","serve"],"timeout":123});
+        let foreign = serde_json::json!({"command":["/synthetic/other","serve"],"user_settings":{"keep":true}});
+        let client = if case.starts_with("opencode") {
+            "opencode"
+        } else {
+            case
+        };
+        let path = root.path().join(match client {
+            "opencode" => ".config/opencode/opencode.json",
+            "claude" => ".claude.json",
+            _ => ".codex/config.toml",
+        });
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = match case {
+            "opencode-old" => serde_json::json!({"mcp":{"servers":{"ai-session-search":current},"ai-session-search":foreign}}).to_string(),
+            "opencode-current" => serde_json::json!({"mcp":{"servers":{"ai-session-search":current,"aise":foreign}}}).to_string(),
+            "claude" => serde_json::json!({"mcpServers":{"ai-session-search":{"command":binary,"args":["mcp","serve"]}}}).to_string(),
+            _ => format!("[mcp_servers.ai-session-search]\ncommand = {}\nargs = ['mcp', 'serve']\n[mcp_servers.aise]\ncommand = '/synthetic/other'\nargs = ['serve']\nuser_setting = true\n", serde_json::json!(binary)),
+        };
+        fs::write(&path, &original).unwrap();
+        let old_path = root.path().join(".claude/.mcp.json");
+        let old_text = serde_json::json!({"mcpServers":{"ai-session-search":foreign}}).to_string();
+        if case == "claude" {
+            fs::create_dir_all(old_path.parent().unwrap()).unwrap();
+            fs::write(&old_path, &old_text).unwrap();
+        }
+        for args in [
+            vec!["dates"],
+            vec![
+                "integrations",
+                "status",
+                "--client",
+                client,
+                "--no-aliases",
+                "--format",
+                "json",
+            ],
+        ] {
+            let output = run(&args);
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                original,
+                "preserve the customized duplicate: {case}"
+            );
+            if case == "claude" {
+                assert_eq!(fs::read_to_string(&old_path).unwrap(), old_text);
+            }
+            if args[0] == "integrations" {
+                let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert!(
+                    status["integrations"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|entry| entry["component"] == "mcp"
+                            && entry["path"] == path.to_str().unwrap()
+                            && entry["state"] == "stale"
+                            && entry["current"] == false),
+                    "{status}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn codex_marketplace_edits_survive_reinstall_refresh_and_uninstall() {
     for action in ["install", "refresh", "uninstall"] {
         for edited in [

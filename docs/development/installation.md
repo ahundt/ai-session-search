@@ -311,7 +311,9 @@ AGENTS.md, or GEMINI.md in place, as long as that block still holds text some re
 edited file or block is left alone and reported on stderr.
 
 Recognized MCP launch registrations refresh even for OpenCode-only or `--no-skill` installs,
-preserving their executable and launch arguments without installing a skill. Skill and instruction
+preserving their executable and launch arguments without installing a skill. Automatic migration
+leaves a client's configuration unchanged if a duplicate aise server key has an unrecognized
+launch contract; `aise integrations status` reports it as stale. Skill and instruction
 refresh still require a recorded skill installation. Instruction files added with `--claude-md`,
 `--agents-md`, or `--gemini-md` are not visited;
 rerun `aise integrations install` for those. Commands that install or remove integrations

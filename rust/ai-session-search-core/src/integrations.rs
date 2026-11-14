@@ -4225,7 +4225,10 @@ fn refresh_superseded_mcp_entries(
             }
             None => continue,
         };
-        let planned = plan_upsert_target(&target, Path::new(&binary));
+        let planned = plan_upsert_target(&target, Path::new(&binary)).and_then(|planned| {
+            validate_automatic_mcp_ownership(&target, &planned)?;
+            Ok(planned)
+        });
         if was_cli_only {
             mutations.extend(planned?);
             moved.push(target.path.clone());
@@ -4241,26 +4244,76 @@ fn refresh_superseded_mcp_entries(
     Ok(moved)
 }
 
+/// Automatic migration needs launch-contract evidence for every named entry in the affected
+/// files, including duplicates. Validate the plan's snapshots so concurrent edits cannot grant
+/// removal authority; explicit install and uninstall retain their name-based selection.
+fn validate_automatic_mcp_ownership(
+    target: &Target,
+    mutations: &[PlannedFileMutation],
+) -> Result<()> {
+    for mutation in mutations {
+        let path = mutation.path();
+        if path != target.path && !target.superseded_paths.iter().any(|old| old == path) {
+            continue;
+        }
+        let text = match mutation {
+            PlannedFileMutation::Write { original, .. } => original.as_deref(),
+            PlannedFileMutation::Remove { original, .. } => Some(original.as_str()),
+        };
+        let Some(text) = text else { continue };
+        let (root, containers): (Map<String, Value>, Vec<&[&str]>) = match target.format {
+            ConfigFormat::CodexToml => {
+                let root = serde_json::to_value(toml::from_str::<toml::Value>(text)?)?;
+                (
+                    root.as_object().cloned().unwrap_or_default(),
+                    vec![&["mcp_servers"]],
+                )
+            }
+            format => {
+                let layout = json_layout_for(format)?;
+                (
+                    parse_json_object_or_empty(path, Some(text), layout.syntax)?,
+                    std::iter::once(layout.container)
+                        .chain(layout.superseded.iter().copied())
+                        .collect(),
+                )
+            }
+        };
+        for keys in containers {
+            let Some(servers) = json_container(&root, keys) else {
+                continue;
+            };
+            for name in std::iter::once(SERVER_NAME).chain(LEGACY_SERVER_NAMES) {
+                if let Some(entry) = servers.get(name) {
+                    if entry_command(entry).is_none()
+                        || !entry_arguments(entry).is_some_and(mcp_serve_arguments)
+                    {
+                        bail!("{} server {name} has an unrecognized launch contract; duplicate entries left unchanged", path.display());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The executable of aise's current Codex `[mcp_servers]` entry when aise's plugin marketplace is
 /// missing or outdated beside it, as after an upgrade from a release that registered only the
 /// server. `None` when the target has no marketplace root or no current aise entry.
 fn codex_entry_without_marketplace(target: &Target) -> Option<String> {
     let root = target.codex_marketplace.as_deref()?;
-    if status_codex_mcp_server(&target.path).ok()? != "configured"
-        || codex_marketplace_is_current(&target.path, root)
-    {
+    if codex_marketplace_is_current(&target.path, root) {
         return None;
     }
     let text = read_optional_utf8_regular_file(&target.path)
         .ok()
         .flatten()?;
-    let document = text.parse::<toml_edit::DocumentMut>().ok()?;
-    document
-        .get("mcp_servers")?
-        .get(SERVER_NAME)?
-        .get("command")?
-        .as_str()
-        .map(str::to_string)
+    let document: toml::Value = toml::from_str(&text).ok()?;
+    let entry = serde_json::to_value(document.get("mcp_servers")?.get(SERVER_NAME)?).ok()?;
+    entry_arguments(&entry)
+        .is_some_and(mcp_serve_arguments)
+        .then(|| entry_command(&entry))
+        .flatten()
 }
 
 /// The entry to retain during migration, preferring the current location over obsolete duplicates.
@@ -6073,7 +6126,13 @@ fn status_json_server(path: &Path, format: ConfigFormat) -> Result<&'static str>
             .is_some_and(|old| old.contains_key(SERVER_NAME) || has_legacy_name(old))
     });
     Ok(match servers.and_then(|servers| servers.get(SERVER_NAME)) {
-        Some(entry) if json_entry_is_current(entry, format) && !left_in_superseded => "configured",
+        Some(entry)
+            if json_entry_is_current(entry, format)
+                && !left_in_superseded
+                && !servers.is_some_and(has_legacy_name) =>
+        {
+            "configured"
+        }
         Some(_) => "stale",
         None if left_in_superseded || servers.is_some_and(has_legacy_name) => "stale",
         None => "not configured",
@@ -6092,7 +6151,11 @@ fn status_codex_mcp_server(path: &Path) -> Result<&'static str> {
         .and_then(toml_edit::Item::as_table);
     Ok(match entry {
         Some(entry)
-            if entry
+            if !servers.is_some_and(|servers| {
+                LEGACY_SERVER_NAMES
+                    .iter()
+                    .any(|name| servers.contains_key(name))
+            }) && entry
                 .get("command")
                 .and_then(toml_edit::Item::as_value)
                 .and_then(toml_edit::Value::as_str)
@@ -7769,6 +7832,13 @@ mod tests {
                 }
                 "upgrade" => {
                     refresh_integrations_for_version(&receipt, "9.9.9", Some(&layout)).unwrap();
+                    assert_eq!(fs::read_to_string(&legacy).unwrap(), original);
+                    assert_eq!(status_target(target).unwrap(), "stale");
+                    assert!(
+                        !target.path.exists(),
+                        "unrecognized duplicates prevent migration"
+                    );
+                    continue;
                 }
                 "uninstall" => {
                     assert!(remove_target(target).unwrap());
