@@ -1768,6 +1768,9 @@ impl MessageFilters {
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 pub struct MessageHit {
+    /// Stable indexed identity used internally when source sequence numbers tie.
+    #[serde(skip)]
+    pub(crate) row_id: i64,
     /// Source evidence loaded for user-selected matching, including unknown senders.
     #[serde(
         skip_serializing_if = "Option::is_none",
@@ -1800,6 +1803,7 @@ impl MessageHit {
         content: impl Into<String>,
     ) -> Self {
         Self {
+            row_id: 0,
             session_id: session_id.into(),
             provider,
             seq,

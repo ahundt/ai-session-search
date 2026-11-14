@@ -4567,6 +4567,7 @@ mod tests {
 
     fn hit(content: impl Into<String>) -> crate::models::MessageHit {
         crate::models::MessageHit {
+            row_id: 0,
             provenance: None,
             session_id: "claude:evidence".into(),
             provider: Provider::Claude,

@@ -144,21 +144,23 @@ impl PendingContextRow {
 /// Ordered union of overlapping context windows from chronological search anchors.
 ///
 /// A row through the current anchor can be emitted immediately: a later anchor has a greater
-/// sequence within the same session, so only the current window's trailing rows can later become
-/// matches. Session changes flush the prior tail because SQL orders anchors by `(session_id, seq)`.
+/// `(sequence, row id)` within the same session, so only the current window's trailing rows can
+/// later become matches. Session changes flush the prior tail; SQL orders anchors by
+/// `(session_id, seq, id)`.
 ///
 /// # Complexity
 ///
-/// For one context window containing `W` rows and `A` retained trailing rows, insertion and
-/// deduplication take `O(W log(A + 1))` time and retain `O(A)` rows. `A` is bounded by the requested
-/// messages-after window; the separately owned service batch remains bounded by its configured
-/// hit count and per-hit context windows.
+/// For `W` input window rows and `A` previously pending rows, insertion and deduplication take
+/// `O(W log(W + A + 1))` time and `O(W + A)` peak row state. After emission only the active tail
+/// remains: rows tied after the anchor and rows through the messages-after sequence bound.
+/// Ties can contain arbitrarily many rows, so a sequence span is not a fixed row-count bound.
+/// The separately owned service batch is bounded by its hit count and per-hit context windows.
 #[derive(Debug, Default)]
 struct ContextWindowUnion {
     current_session: Option<String>,
-    last_anchor_seq: Option<i64>,
-    last_emitted_seq: Option<i64>,
-    pending: BTreeMap<i64, PendingContextRow>,
+    last_anchor: Option<(i64, i64)>,
+    last_emitted: Option<(i64, i64)>,
+    pending: BTreeMap<(i64, i64), PendingContextRow>,
 }
 
 impl ContextWindowUnion {
@@ -168,6 +170,7 @@ impl ContextWindowUnion {
         window: &[MessageHit],
     ) -> Result<Vec<PendingContextRow>> {
         let session_id = anchor.message().session_id.as_str();
+        let anchor_key = (anchor.seq, anchor.message().row_id);
         let mut ready = Vec::new();
         if self.current_session.as_deref() != Some(session_id) {
             if let Some(current_session) = self.current_session.as_deref() {
@@ -178,14 +181,13 @@ impl ContextWindowUnion {
             }
             ready.append(&mut self.drain_pending());
             self.current_session = Some(session_id.to_owned());
-            self.last_anchor_seq = None;
-            self.last_emitted_seq = None;
+            self.last_anchor = None;
+            self.last_emitted = None;
         }
-        if let Some(last_anchor_seq) = self.last_anchor_seq {
+        if let Some(last_anchor) = self.last_anchor {
             anyhow::ensure!(
-                anchor.seq > last_anchor_seq,
-                "batched context anchors are not strictly ordered by sequence in session {session_id:?}: {} followed {last_anchor_seq}",
-                anchor.seq
+                anchor_key > last_anchor,
+                "batched context anchors are not strictly ordered by sequence and row id in session {session_id:?}: {anchor_key:?} followed {last_anchor:?}"
             );
         }
 
@@ -195,25 +197,26 @@ impl ContextWindowUnion {
                 "context row session {:?} does not match anchor session {session_id:?}",
                 hit.session_id
             );
+            let key = (hit.seq, hit.row_id);
             if self
-                .last_emitted_seq
-                .is_none_or(|last_emitted| hit.seq > last_emitted)
+                .last_emitted
+                .is_none_or(|last_emitted| key > last_emitted)
             {
                 self.pending
-                    .entry(hit.seq)
+                    .entry(key)
                     .or_insert_with(|| PendingContextRow::surrounding(hit.clone()));
             }
         }
 
         anyhow::ensure!(
-            self.last_emitted_seq
-                .is_none_or(|last_emitted| anchor.seq > last_emitted),
+            self.last_emitted
+                .is_none_or(|last_emitted| anchor_key > last_emitted),
             "batched context anchor {} in session {session_id:?} was already emitted",
             anchor.seq
         );
         let matched = self
             .pending
-            .entry(anchor.seq)
+            .entry(anchor_key)
             .or_insert_with(|| PendingContextRow::surrounding(anchor.message().clone()));
         matched.is_match = true;
         matched.match_evidence = anchor.match_evidence().cloned();
@@ -221,16 +224,16 @@ impl ContextWindowUnion {
         while self
             .pending
             .first_key_value()
-            .is_some_and(|(seq, _)| *seq <= anchor.seq)
+            .is_some_and(|(key, _)| *key <= anchor_key)
         {
             let (_, row) = self
                 .pending
                 .pop_first()
                 .expect("first_key_value proved a pending context row exists");
-            self.last_emitted_seq = Some(row.hit.seq);
+            self.last_emitted = Some((row.hit.seq, row.hit.row_id));
             ready.push(row);
         }
-        self.last_anchor_seq = Some(anchor.seq);
+        self.last_anchor = Some(anchor_key);
         Ok(ready)
     }
 
@@ -287,10 +290,10 @@ impl ContextRow {
 
     fn from_hit(
         hit: MessageHit,
-        matched_rows: &HashSet<(String, i64)>,
+        matched_rows: &HashSet<(String, i64, i64)>,
         lines_per_message: i64,
     ) -> Self {
-        let key = (hit.session_id.clone(), hit.seq);
+        let key = (hit.session_id.clone(), hit.seq, hit.row_id);
         Self::from_match(hit, matched_rows.contains(&key), lines_per_message)
     }
 
@@ -467,7 +470,7 @@ fn insert_caret(rendered: &mut String, at_char: usize) {
 impl ContextRowWithRefs {
     fn from_hit(
         hit: MessageHit,
-        matched_rows: &HashSet<(String, i64)>,
+        matched_rows: &HashSet<(String, i64, i64)>,
         lines_per_message: i64,
     ) -> Self {
         // Refs come from the full content so a per-message line cap never hides references.
@@ -1038,14 +1041,17 @@ pub(crate) fn run_command(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result
                     );
                 }
                 let context = args.context;
-                let matched_rows: HashSet<(String, i64)> =
-                    HashSet::from([(session.id.clone(), seq)]);
                 let rows = MessageService::new(config, db, SearchSurface::Cli).context_resolved(
                     &session.id,
                     seq,
                     args.context_before.unwrap_or(context),
                     args.context_after.unwrap_or(context),
                 )?;
+                let matched_rows = rows
+                    .iter()
+                    .filter(|hit| hit.seq == seq)
+                    .map(|hit| (hit.session_id.clone(), hit.seq, hit.row_id))
+                    .collect();
                 if args.refs {
                     let rows = rows
                         .into_iter()
@@ -1348,14 +1354,19 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
         return emit_message_search_hits(hits, include_refs, format, lines_per_message);
     }
 
-    let matched: HashSet<(String, i64)> =
-        hits.iter().map(|h| (h.session_id.clone(), h.seq)).collect();
+    let matched: HashSet<(String, i64, i64)> = hits
+        .iter()
+        .map(|h| (h.session_id.clone(), h.seq, h.message().row_id))
+        .collect();
     let match_evidence = hits
         .iter()
         .filter_map(|hit| {
-            hit.match_evidence()
-                .cloned()
-                .map(|evidence| ((hit.session_id.clone(), hit.seq), evidence))
+            hit.match_evidence().cloned().map(|evidence| {
+                (
+                    (hit.session_id.clone(), hit.seq, hit.message().row_id),
+                    evidence,
+                )
+            })
         })
         .collect::<BTreeMap<_, _>>();
     let context_hits = context_hits_in_encounter_order(response.context_windows());
@@ -1364,7 +1375,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
             .into_iter()
             .map(|ctx| {
                 let evidence = match_evidence
-                    .get(&(ctx.session_id.clone(), ctx.seq))
+                    .get(&(ctx.session_id.clone(), ctx.seq, ctx.row_id))
                     .cloned();
                 let mut row = ContextRowWithRefs::from_hit(ctx, &matched, lines_per_message);
                 row.row = row.row.with_match_evidence(evidence);
@@ -1377,7 +1388,7 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
             .into_iter()
             .map(|ctx| {
                 let evidence = match_evidence
-                    .get(&(ctx.session_id.clone(), ctx.seq))
+                    .get(&(ctx.session_id.clone(), ctx.seq, ctx.row_id))
                     .cloned();
                 ContextRow::from_hit(ctx, &matched, lines_per_message).with_match_evidence(evidence)
             })
@@ -1391,7 +1402,7 @@ fn context_hits_in_encounter_order(windows: &[Vec<MessageHit>]) -> Vec<MessageHi
     windows
         .iter()
         .flatten()
-        .filter(|hit| seen.insert((hit.session_id.clone(), hit.seq)))
+        .filter(|hit| seen.insert((hit.session_id.clone(), hit.seq, hit.row_id)))
         .cloned()
         .collect()
 }
@@ -1980,6 +1991,7 @@ mod tests {
 
     fn sample_hit(seq: i64, content: &str) -> MessageHit {
         MessageHit {
+            row_id: 0,
             provenance: None,
             session_id: "claude:s1".to_string(),
             provider: Provider::Claude,
@@ -2036,7 +2048,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(0, false), (1, false), (2, true)]
         );
-        assert_eq!(union.pending.keys().copied().collect::<Vec<_>>(), [3, 4]);
+        assert_eq!(
+            union.pending.keys().copied().collect::<Vec<_>>(),
+            [(3, 0), (4, 0)]
+        );
 
         let second_ready = union.push_anchor(&second, &second_window).unwrap();
         assert_eq!(
@@ -2046,7 +2061,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(3, false), (4, true)]
         );
-        assert_eq!(union.pending.keys().copied().collect::<Vec<_>>(), [5, 6]);
+        assert_eq!(
+            union.pending.keys().copied().collect::<Vec<_>>(),
+            [(5, 0), (6, 0)]
+        );
         assert_eq!(
             union
                 .finish()
@@ -2054,6 +2072,36 @@ mod tests {
                 .map(|row| (row.hit.seq, row.is_match))
                 .collect::<Vec<_>>(),
             [(5, false), (6, false)]
+        );
+    }
+
+    #[test]
+    fn context_window_union_keeps_identical_tied_rows_and_marks_only_exact_anchors() {
+        let rows = (1..=5)
+            .map(|row_id| {
+                let mut hit = sample_hit(100, "identical text");
+                hit.row_id = row_id;
+                hit
+            })
+            .collect::<Vec<_>>();
+        let mut union = ContextWindowUnion::default();
+        let first = MessageSearchHit::from_parts(rows[1].clone(), None, None);
+        let second = MessageSearchHit::from_parts(rows[3].clone(), None, None);
+        let mut emitted = union.push_anchor(&first, &rows).unwrap();
+        assert_eq!(union.pending.len(), 3);
+        emitted.extend(union.push_anchor(&second, &rows).unwrap());
+        assert_eq!(union.pending.len(), 1);
+        emitted.extend(union.finish());
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|row| (row.hit.row_id, row.is_match))
+                .collect::<Vec<_>>(),
+            [(1, false), (2, true), (3, false), (4, true), (5, false)]
+        );
+        assert_eq!(
+            context_hits_in_encounter_order(&[rows.clone(), rows]).len(),
+            5
         );
     }
 
@@ -2150,7 +2198,7 @@ mod tests {
     fn render_context_and_refs_rows_expose_match_and_refs_columns() {
         let hit = sample_hit(7, "see https://example.com now");
         let mut matched = HashSet::new();
-        matched.insert((hit.session_id.clone(), hit.seq));
+        matched.insert((hit.session_id.clone(), hit.seq, hit.row_id));
 
         // ContextRow marks the matched row with `*` and a non-match with blank.
         let ctx = ContextRow::from_hit(hit.clone(), &matched, 0);
@@ -2254,7 +2302,7 @@ mod tests {
     #[test]
     fn context_table_rows_render_the_same_bounded_match_evidence() {
         let hit = sample_hit(7, "full raw message content");
-        let matched = HashSet::from([(hit.session_id.clone(), hit.seq)]);
+        let matched = HashSet::from([(hit.session_id.clone(), hit.seq, hit.row_id)]);
         let evidence = crate::message_search::MessageMatchEvidence {
             view_text: "x".repeat(220),
             field_start_char: 0,
@@ -2302,7 +2350,7 @@ mod tests {
         );
 
         let hit = sample_hit(7, "raw content");
-        let matched = HashSet::from([(hit.session_id.clone(), hit.seq)]);
+        let matched = HashSet::from([(hit.session_id.clone(), hit.seq, hit.row_id)]);
         let search_hit = MessageSearchHit::from_parts(hit.clone(), Some(evidence.clone()), None);
         let context = ContextRow::from_hit(hit.clone(), &matched, 0)
             .with_match_evidence(Some(evidence.clone()));
@@ -2607,6 +2655,7 @@ mod tests {
     #[test]
     fn structured_context_rows_reuse_complete_message_hit_metadata() {
         let hit = MessageHit {
+            row_id: 0,
             provenance: None,
             session_id: "codex:context-contract".to_string(),
             provider: Provider::Codex,
@@ -2619,7 +2668,7 @@ mod tests {
             fuzzy_score: None,
             content: "first\nsecond".to_string(),
         };
-        let matched = HashSet::from([("codex:context-contract".to_string(), 7)]);
+        let matched = HashSet::from([("codex:context-contract".to_string(), 7, 0)]);
 
         let value = serde_json::to_value(ContextRow::from_hit(hit, &matched, 1)).unwrap();
 

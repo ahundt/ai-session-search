@@ -65,6 +65,112 @@ fn rows(dir: &tempfile::TempDir, args: &[&str]) -> Value {
 }
 
 #[test]
+fn message_context_preserves_tied_row_identity_and_evidence_in_every_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Db::open(&dir.path().join("index.db")).unwrap();
+    let record = SessionRecord::new(
+        "claude:ties",
+        Provider::Claude,
+        "ties",
+        "/synthetic/ties.jsonl",
+        "test",
+        "fixture",
+    );
+    let contents = [
+        (99, "before first"),
+        (99, "before second"),
+        (100, "duplicate alpha"),
+        (100, "padding duplicate beta"),
+        (100, "unmatched peer"),
+        (101, "after first"),
+        (101, "after second"),
+    ];
+    db.upsert_session(
+        &ParsedSession::new(
+            record,
+            contents
+                .iter()
+                .map(|(seq, text)| Message::new(*seq, Role::Assistant, *text))
+                .collect(),
+        ),
+        0,
+        0,
+    )
+    .unwrap();
+    for extent in [vec!["--limit", "10"], vec!["--all-results"]] {
+        for query in ["duplicate", "alpha"] {
+            let expected = if query == "duplicate" {
+                vec!["duplicate alpha", "padding duplicate beta"]
+            } else {
+                vec!["duplicate alpha"]
+            };
+            for format in ["csv", "plain", "table", "json", "jsonl"] {
+                let mut args = vec![
+                    "messages",
+                    "search",
+                    query,
+                    "--session-id",
+                    "claude:ties",
+                    "--context",
+                    "1",
+                    "--format",
+                    format,
+                ];
+                args.extend(&extent);
+                let out = output(&dir, &args);
+                let text = String::from_utf8(out.stdout).unwrap();
+                if format == "json" || format == "jsonl" {
+                    let results: Vec<Value> = if format == "json" {
+                        serde_json::from_str::<Value>(&text).unwrap()["results"]
+                            .as_array()
+                            .unwrap()
+                            .clone()
+                    } else {
+                        text.lines()
+                            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                            .filter(|v| v["type"] == "hit")
+                            .map(|v| v["result"].clone())
+                            .collect()
+                    };
+                    assert_eq!(results.len(), expected.len(), "{args:?}: {text}");
+                    for (row, expected) in results.iter().zip(&expected) {
+                        assert_eq!(
+                            row["presentation"]["field_view"]["text"], *expected,
+                            "{row}"
+                        );
+                        assert_eq!(
+                            row["presentation"]["match_view"]["text"], *expected,
+                            "{row}"
+                        );
+                        assert_eq!(
+                            row["match"]["literal_occurrence"]["field_start_char"],
+                            expected.find(query).unwrap()
+                        );
+                        for side in ["messages_before", "messages_after"] {
+                            assert_eq!(row["context"][side].as_array().unwrap().len(), 2, "{row}");
+                        }
+                    }
+                } else {
+                    let data = text
+                        .lines()
+                        .filter(|line| contents.iter().any(|(_, content)| line.contains(content)))
+                        .collect::<Vec<_>>();
+                    assert_eq!(data.len(), contents.len(), "{args:?}: {text}");
+                    for (line, (_, content)) in data.iter().zip(contents) {
+                        let is_match = expected.contains(&content);
+                        assert_eq!(
+                            line.matches(content).count(),
+                            if is_match { 2 } else { 1 },
+                            "{args:?}: {line}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn session_cli_pages_reproduce_the_whole_order() {
     let dir = fixture();
     for command in [vec!["list"], vec!["search", "needle"]] {
