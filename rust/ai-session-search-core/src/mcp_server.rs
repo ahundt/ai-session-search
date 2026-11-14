@@ -989,7 +989,15 @@ impl ToolRecovery {
                     _ => true,
                 }
         });
-        if !accepts("limit") {
+        if !accepts("limit")
+            || (tool_name == "get_session"
+                && ![
+                    "seq_from", "seq_to", "role", "limit", "offset", "order", "since", "until",
+                    "when",
+                ]
+                .iter()
+                .any(|key| args.get(*key).is_some()))
+        {
             return Self {
                 paging: ToolPaging::Unpaged,
                 reducers,
@@ -2212,6 +2220,8 @@ fn session_record_meta_output_schema() -> Value {
         "type": "object",
         "properties": {
             "provider_session_id": { "type": "string" },
+            "parent_session_id": { "type": ["string", "null"] },
+            "agent_label": { "type": ["string", "null"] },
             "cwd": { "type": "string" },
             "repo": { "type": "string" },
             "title": { "type": "string" },
@@ -4634,11 +4644,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     "skill": skill_selector_input_schema(),
                     "definition": {
                         "type": "object",
-                        "description": "Direct typed message-classification rules for this call. These categories replace only the primary selected skill's adjacent aise-capability.toml rules.",
+                        "description": "Typed rules replacing only the primary skill's aise-capability.toml for this call.",
                         "properties": {
                             "categories": {
                                 "type": "array",
-                                "description": "Typed classification categories for this call, replacing the package's own.",
+                                "description": "Replacement classification categories.",
                                 "minItems": 1,
                                 "items": {
                                     "type": "object",
@@ -4699,17 +4709,19 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             }
                         ]
                     },
-                    "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Extra packages evaluated after the primary one; all must declare the same capability type." },
+                    "additional_skills": { "type": "array", "uniqueItems": true, "items": skill_selector_input_schema(), "description": "Extra packages after the primary; same capability type required." },
                     "session_kinds": { "type": "array", "items": { "type": "string", "enum": session_kind_values() }, "description": "Which session classes to scan; omit for user-started sessions only." },
                     "provider": provider_filter_schema(&provider_values, provider_filter_description),
-                    "session_id": { "type": "string", "description": "Exact session ID or unique prefix; scopes the run to one session found by search_sessions." },
-                    "workspace_path_prefix": { "type": "string", "description": "Only sessions whose working directory or repository root starts with this path; scopes the run to one project." },
+                    "session_id": { "type": "string", "description": "Session ID or unique prefix; omit for all." },
+                    "exclude_session_ids": { "type": "array", "items": {"type":"string"}, "description":"Exclude exact session IDs before paging. Omit for none." },
+                    "exclude_path_prefixes": { "type":"array", "items":{"type":"string"}, "description":"Exclude workspace/repository/transcript paths before paging. Omit for none." },
+                    "workspace_path_prefix": { "type": "string", "description": "Working-directory/repository path prefix; omit for all." },
                     "since": { "type": "string", "description": "Lower bound on the message's own timestamp; omit for no bound." },
                     "until": { "type": "string", "description": "Upper bound on the message's own timestamp, inclusive; omit for no bound." },
                     "when": { "type": "string", "description": "One period bounding message timestamps at both ends; conflicts with since and until." },
                     "limit": { "type": "integer", "minimum": 1, "description": format!("Positive page size; omit for the configured MCP default of {}. Use all_results for every match.", config.mcp.run_message_classification_limit) },
                     "all_results": { "type": "boolean", "description": "Every match; conflicts with limit. Matches contain whole user messages, so page wide ranges. Omit for false." },
-                    "offset": { "type": "integer", "minimum": 0, "description": "Skip this many matches before returning, newest first, to page through results. Omit for 0." },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Newest-first matches to skip. Omit for 0." },
                     "include_unattributed_input": { "type": "boolean", "description": "Also read queued messages with no recorded sender. Omit for false: they are left out and counted." }
                 },
                 "required": ["skill"],
@@ -4770,9 +4782,9 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             },
                             "summary": {
                                 "type": "boolean",
-                                "description": "Compact evidence: opening purpose, selected user intent, tool previews, refs, aggregate file changes, provenance and bounded follow-ups. summary_items caps message and aggregate evidence; truncated_evidence lists categories with more entries. Conflicts with transcript_lines and seq. Omit for false (transcript lines)."
+                                "description": "Compact purpose, intent, tools, refs, files and provenance. summary_items bounds evidence; truncated_evidence lists incomplete categories. Conflicts with transcript, focused and range reads. Omit for false."
                             },
-                            "summary_items": { "type": "integer", "description": format!("With summary=true, select aggregate evidence records: positive=first, negative=last, 0=all (default {}). Message-derived records are displayed chronologically; changed_files remains an aggregate ordered by path and edit count. This changes presentation only; use bounded search_messages pages for deterministic non-overlapping detail retrieval.", config.mcp.summary_items) },
+                            "summary_items": { "type": "integer", "description": format!("Summary evidence: positive=first, negative=last, 0=all; omit for {}. Messages display chronologically; files aggregate by path and count. Presentation only; page search_messages for detail.", config.mcp.summary_items) },
                             "include": { "type": "array", "items": { "type": "string", "enum": ["time_profile"] }, "description": "Optional bounded summary sections (default none). Currently supports time_profile. Requires summary=true." },
                             "transcript_lines": {
                                 "type": "integer",
@@ -4788,7 +4800,14 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                                 "type": "integer", "minimum": 0,
                                 "description": "Upper inclusive message-sequence bound for an absolute range read. See seq_from for non-overlapping chunked reads. Must be >= seq_from when both are given."
                             },
-                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Message classes for seq_from/seq_to ranges. Omit for every class except harness_notice. Include harness_notice in an explicit class list to read notices too; focused seq context already includes every class." },
+                            "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Range message classes; omit for all except harness_notice. Focused seq includes every class." },
+                            "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Range role; user selects recorded input. Omit for all." },
+                            "limit": { "type": "integer", "minimum": 0, "description": "Range message count; omit for 0 (all)." },
+                            "offset": { "type": "integer", "minimum": 0, "description": "Range messages to skip; omit for 0." },
+                            "order": { "type": "string", "enum": ["oldest", "newest"], "description": "Range selection edge; omit for oldest. Newest selects last N; both return oldest-first." },
+                            "since": { "type": "string", "description": "Inclusive event start, RFC 3339 or period (7d, 2026-01); UTC unless offset/zone. Omit for unbounded." },
+                            "until": { "type": "string", "description": "Inclusive event end; same forms as since. Omit for unbounded." },
+                            "when": { "type": "string", "description": "Event period; conflicts with since/until. Omit for unbounded." },
                             "context_before": { "type": "integer", "minimum": 0, "description": "Messages before seq; omit for context. 0 selects none." },
                             "context_after": { "type": "integer", "minimum": 0, "description": "Messages after seq; omit for context. 0 selects none." },
                             "context": {
@@ -4883,7 +4902,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                     // `tool.description` is a separate field with its own 2,048-character cap that
                     // no measured client charges to the schema. A fact many parameters share also
                     // reads better stated once here than transcribed onto each of them.
-                    "description": format!("{} {}", format!("Execute deterministic message-classification rules under one selected aise skill package across {provider_summary}. By default aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Packaged and direct definitions share a 1 MiB parsing ceiling; exceeding it returns byte counts and guidance rather than truncated rules. since/until/when bound the message's own timestamp, not session activity: an RFC 3339 instant or a relative form such as 7d, yesterday, or 2026-01. session_kinds omits subagent runs, unlike search_messages and list_sessions: in a spawned run, 'user' rows hold the calling agent's delegation prompt, not a person's text. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."), omitted_values_sentence(&run_skill_capability_input_schema).trim_end()),
+                    "description": format!("{} {}", format!("Execute deterministic message-classification rules under one selected aise skill package across {provider_summary}. By default aise reads the package's aise-capability.toml; definition can supply typed categories directly for one call, while the selected skill still owns identity, version, instructions, and path authorization. The MCP client or AI harness, not aise, loads and follows SKILL.md, for the primary package and for additional_skills alike. Select corrections or another catalog package by name, or pass a package path authorized by [skills].search_paths. Both definition sources have a 1 MiB ceiling; overflow reports bytes and recovery, never partial rules. since/until/when bound the message's own timestamp, not session activity: an RFC 3339 instant or a relative form such as 7d, yesterday, or 2026-01. session_kinds omits subagent runs, unlike search_messages and list_sessions: in a spawned run, 'user' rows hold the calling agent's delegation prompt, not a person's text. detail, field_view and match_view change presentation only, never classification, ordering, result count, pagination, or digests; extent metadata and message_ref keep every bounded result exactly recoverable. Returns the resolved package, capability and policy receipts, source-appropriate digests, matches, and pagination. For corrections, this is equivalent to `aise skills corrections --format json`."), omitted_values_sentence(&run_skill_capability_input_schema).trim_end()),
                     "outputSchema": run_skill_capability_output_schema(),
                     "inputSchema": run_skill_capability_input_schema
                 },
@@ -4916,6 +4935,16 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
             ]
         }
     });
+    for tool in response["result"]["tools"].as_array_mut().expect("tools") {
+        if matches!(
+            tool["name"].as_str(),
+            Some("list_sessions" | "search_sessions")
+        ) {
+            tool["inputSchema"]["properties"]["warnings_only"] = json!({
+                "type":"boolean", "description":"Only sessions with parse warnings, before paging. Omit for false."
+            });
+        }
+    }
     add_index_refresh_controls(&mut response);
     add_not_ready_output_alternatives(&mut response);
     response
@@ -5162,7 +5191,11 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     // numbers are session-local, which this per-session tool already scopes.
     let seq_from = args.get("seq_from").and_then(Value::as_i64);
     let seq_to = args.get("seq_to").and_then(Value::as_i64);
-    let has_range = seq_from.is_some() || seq_to.is_some();
+    let has_range = [
+        "seq_from", "seq_to", "role", "limit", "offset", "order", "since", "until", "when",
+    ]
+    .iter()
+    .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
 
     if message_seq.is_none() {
         for name in ["context_before", "context_after"] {
@@ -5193,15 +5226,6 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
                 .to_string(),
         );
     }
-    if let (Some(from), Some(to)) = (seq_from, seq_to) {
-        if from > to {
-            return Err(format!(
-                "seq_from must be <= seq_to, got {from} > {to}; \
-                 swap the bounds or raise seq_to to at least {from}"
-            ));
-        }
-    }
-
     if summary {
         let include = parse_string_array(args, "include")?;
         if let Some(unsupported) = include
@@ -5242,8 +5266,14 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         let presentation = MessagePresentation::from_args(args, config)?;
         let before = mcp_nonnegative_i64_arg(args, "context_before", context)?;
         let after = mcp_nonnegative_i64_arg(args, "context_after", context)?;
-        return message_window_value(&session, seq, (before, after), &presentation, db)
-            .and_then(ToolResponse::structured);
+        return message_window_value(
+            &session,
+            seq,
+            (before, after),
+            &presentation,
+            &MessageService::new(config, db, SearchSurface::Mcp),
+        )
+        .and_then(ToolResponse::structured);
     }
 
     if has_range {
@@ -5252,13 +5282,34 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             .resolve_session_record(session_id)
             .map_err(|e| format!("{e:#}"))?;
         let presentation = MessagePresentation::from_args(args, config)?;
-        return message_range_value(
-            &session,
+        let (since, until) = parse_date_bounds(args, chrono::Utc::now())?;
+        let filters = MessageFilters {
+            session_id: Some(session.id.clone()),
             seq_from,
             seq_to,
-            parse_enum_array(args, "kinds")?,
+            kinds: parse_enum_array(args, "kinds")?,
+            role: parse_opt_enum::<Role>(args, "role")?,
+            limit: mcp_nonnegative_usize_arg(args, "limit", 0)?,
+            offset: mcp_nonnegative_usize_arg(args, "offset", 0)?,
+            since,
+            until,
+            ..Default::default()
+        };
+        let order = match args
+            .get("order")
+            .and_then(Value::as_str)
+            .unwrap_or("oldest")
+        {
+            "oldest" => crate::db::MessageOrder::OldestFirst,
+            "newest" => crate::db::MessageOrder::NewestFirst,
+            _ => return Err("order must be oldest or newest".into()),
+        };
+        return message_range_value(
+            &session,
+            &filters,
+            order,
             &presentation,
-            db,
+            &MessageService::new(config, db, SearchSurface::Mcp),
         )
         .and_then(ToolResponse::structured);
     }
@@ -5534,6 +5585,11 @@ fn tool_run_skill_capability(
         until,
         limit: query_limit,
         offset,
+        exclude_session_ids: parse_string_array(args, "exclude_session_ids")?,
+        exclude_path_prefixes: parse_string_array(args, "exclude_path_prefixes")?
+            .iter()
+            .map(|path| normalize_path_prefix(path))
+            .collect(),
         // Left as `None` when the caller named no class, so the core applies its own user-only
         // default. Deciding it here would put "what a correction IS" in the MCP adapter, where
         // the CLI and Python could not inherit it.
@@ -6327,7 +6383,7 @@ fn search_filters_from_args(
         since,
         until,
         limit: mcp_nonnegative_usize_arg(args, "limit", default_limit)?,
-        warnings_only: false,
+        warnings_only: mcp_bool_arg(args, "warnings_only", false),
     };
     filters.validate().map_err(|error| error.to_string())?;
     Ok(filters)
@@ -6796,11 +6852,11 @@ fn message_window_value(
     seq: i64,
     context: (i64, i64),
     presentation: &MessagePresentation,
-    db: &Db,
+    service: &MessageService<'_>,
 ) -> Result<Value, String> {
     let (before, after) = context;
-    let rows = db
-        .message_context(&session.id, seq, before, after)
+    let rows = service
+        .context(&session.id, seq, before, after)
         .map_err(|e| format!("{e:#}"))?;
     let include_refs = presentation.include_refs;
     let messages: Vec<Value> = rows
@@ -6845,21 +6901,14 @@ fn message_window_value(
 /// bound (0 when omitted) and `is_match` flags that first message of the range when seq_from is set.
 fn message_range_value(
     session: &SessionRecord,
-    seq_from: Option<i64>,
-    seq_to: Option<i64>,
-    kinds: Option<Vec<crate::models::MessageKind>>,
+    filters: &MessageFilters,
+    order: crate::db::MessageOrder,
     presentation: &MessagePresentation,
-    db: &Db,
+    service: &MessageService<'_>,
 ) -> Result<Value, String> {
-    let filters = MessageFilters {
-        session_id: Some(session.id.clone()),
-        seq_from,
-        seq_to,
-        kinds,
-        ..MessageFilters::default()
-    };
-    let rows = db
-        .read_session_messages(&filters, crate::db::MessageOrder::OldestFirst)
+    let seq_from = filters.seq_from;
+    let rows = service
+        .read_session(filters, order)
         .map_err(|e| format!("{e:#}"))?;
     let include_refs = presentation.include_refs;
     let messages: Vec<Value> = rows
@@ -6899,6 +6948,8 @@ fn message_range_value(
 
 fn session_record_meta_json(session: &SessionRecord, include_source_path: bool) -> Value {
     let mut out = serde_json::Map::new();
+    out.insert("parent_session_id".into(), json!(session.parent_session_id));
+    out.insert("agent_label".into(), json!(session.agent_label));
     insert_string(
         &mut out,
         "provider_session_id",
@@ -6998,38 +7049,6 @@ mod tests {
     }
 
     #[test]
-    fn focused_and_range_reads_reject_summary_only_options() {
-        let (dir, db) = fixture();
-        let config = config_for_fixture(&dir);
-        for selector in [
-            json!({"seq":0}),
-            json!({"seq_from":0}),
-            json!({"transcript_lines":2}),
-        ] {
-            for (key, value) in [
-                ("summary_items", json!(1)),
-                ("include", json!(["time_profile"])),
-            ] {
-                let mut args = selector.clone();
-                args["session_id"] = json!("claude:test1");
-                args[key] = value;
-                let error = tool_get_session(&args, &config, &db).unwrap_err();
-                assert!(
-                    error.contains(&format!("{key} only applies with summary=true")),
-                    "{error}"
-                );
-            }
-        }
-        assert!(tool_get_session(
-            &json!({"session_id":"claude:test1", "summary":true,
-            "summary_items":1, "include":["time_profile"]}),
-            &config,
-            &db
-        )
-        .is_ok());
-    }
-
-    #[test]
     fn service_read_and_classification_rejections_keep_typed_arguments() {
         let (dir, db) = fixture();
         let config = config_for_fixture(&dir);
@@ -7067,6 +7086,163 @@ mod tests {
                 .downcast_ref::<crate::ServiceError>()
                 .map(crate::ServiceError::code),
             Some("invalid-argument")
+        );
+    }
+
+    #[test]
+    fn warning_and_classification_exclusions_reach_shared_filters() {
+        let (dir, db) = corrections_fixture();
+        let config = config_for_fixture(&dir);
+        let filters =
+            search_filters_from_args(&json!({"warnings_only":true}), 1, chrono::Utc::now())
+                .unwrap();
+        assert!(filters.warnings_only);
+        let mut warning = minimal_record(
+            Provider::Claude,
+            Path::new("/synthetic/warning.jsonl"),
+            String::new(),
+        );
+        warning.session.id = "claude:warning".into();
+        warning.session.title = Some("warning-only".into());
+        warning.session.parse_warning = Some("synthetic warning".into());
+        db.upsert_session(&warning, 0, 0).unwrap();
+        for tool in ["list_sessions", "search_sessions"] {
+            let out = call_tool(
+                tool,
+                json!({"query":"warning-only", "warnings_only":true, "limit":1}),
+                &config,
+                &db,
+            );
+            assert_eq!(
+                out["result"]["structuredContent"]["sessions"][0]["id"], "claude:warning",
+                "{out}"
+            );
+            let next = call_tool(
+                tool,
+                json!({"query":"warning-only", "warnings_only":true, "limit":1, "offset":1}),
+                &config,
+                &db,
+            );
+            assert_eq!(
+                next["result"]["structuredContent"]["sessions"],
+                json!([]),
+                "{next}"
+            );
+        }
+        let out = call_tool(
+            "run_skill_capability",
+            json!({
+                "skill":{"name":"corrections"}, "exclude_session_ids":["claude:human"], "limit":1
+            }),
+            &config,
+            &db,
+        );
+        assert_ne!(out["result"]["isError"], true, "{out}");
+        assert_eq!(
+            out["result"]["structuredContent"]["run"]["output"]["result"]["report"]["matches"],
+            json!([]),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn focused_and_range_reads_reject_summary_only_options() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        for selector in [
+            json!({"seq":0}),
+            json!({"seq_from":0}),
+            json!({"transcript_lines":2}),
+        ] {
+            for (key, value) in [
+                ("summary_items", json!(1)),
+                ("include", json!(["time_profile"])),
+            ] {
+                let mut args = selector.clone();
+                args["session_id"] = json!("claude:test1");
+                args[key] = value;
+                let error = tool_get_session(&args, &config, &db).unwrap_err();
+                assert!(
+                    error.contains(&format!("{key} only applies with summary=true")),
+                    "{error}"
+                );
+            }
+        }
+        assert!(tool_get_session(
+            &json!({"session_id":"claude:test1", "summary":true,
+            "summary_items":1, "include":["time_profile"]}),
+            &config,
+            &db
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn surface_read_predicates_match_the_shared_service() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        for (args, expected) in [
+            (json!({"role":"user", "limit":1, "order":"newest"}), vec![2]),
+            (json!({"role":"user", "offset":1}), vec![2]),
+            (json!({"role":"assistant"}), vec![1]),
+            (json!({"since":"2030-01-01T00:00:00Z"}), vec![]),
+        ] {
+            let mut args = args;
+            args["session_id"] = json!("claude:test1");
+            args["seq_from"] = json!(0);
+            let tools = handle_tools_list(None, &config);
+            validate_tool_call(
+                &json!({"name":"get_session", "arguments":args}),
+                &tools["result"]["tools"],
+            )
+            .unwrap();
+            let out = tool_get_session(&args, &config, &db)
+                .unwrap()
+                .structured_content
+                .unwrap();
+            let seqs = out["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["seq"].as_i64().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(seqs, expected, "{args}");
+        }
+    }
+
+    #[test]
+    fn surface_child_metadata_survives_each_read_mode() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        insert_subagent_session(&db, "claude:child", "claude:test1", "Explore");
+        for selector in [
+            json!({"seq":0}),
+            json!({"seq_from":0}),
+            json!({"transcript_lines":0}),
+        ] {
+            let mut args = selector;
+            args["session_id"] = json!("claude:child");
+            let out = tool_get_session(&args, &config, &db)
+                .unwrap()
+                .structured_content
+                .unwrap();
+            let meta = if out.get("session_metadata").is_some() {
+                &out["session_metadata"]
+            } else {
+                &out["session"]
+            };
+            assert_eq!(meta["parent_session_id"], "claude:test1", "{out}");
+            assert_eq!(meta["agent_label"], "Explore", "{out}");
+        }
+        let root =
+            session_record_meta_json(&db.resolve_session_record("claude:test1").unwrap(), true);
+        assert_eq!(
+            root.as_object().unwrap().get("parent_session_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            root.as_object().unwrap().get("agent_label"),
+            Some(&Value::Null)
         );
     }
 
@@ -9253,6 +9429,7 @@ mod tests {
             "include",
             "match_window",
             "ordering",
+            "order",
             "query_mode",
             "receipt_level",
             "response_format",

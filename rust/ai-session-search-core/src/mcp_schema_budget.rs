@@ -599,13 +599,13 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     // 4_721 -> 4_883: `include_unattributed_input` opts in to queued messages with no recorded
     // sender, which the run otherwise leaves out and counts. Tighter wording later retained the
     // same contract at 4,723 bytes, below the 4,750-byte tripwire.
-    ("run_skill_capability", 4_723, 9),
+    ("run_skill_capability", 4_733, 9),
     // Explicit range kinds include harness notices without changing the default class set.
     // Canonical detail compact/full retains the deprecated response_format spelling.
-    ("get_session", 4_110, 10),
+    ("get_session", 4_549, 10),
     // Session dates state the UTC default and the explicit [Area/City] calendar opt-in.
-    ("search_sessions", 4_340, 8),
-    ("list_sessions", 3_792, 8),
+    ("search_sessions", 4_457, 8),
+    ("list_sessions", 3_909, 8),
     ("query_session_index", 1_724, 8),
     ("get_resume_command", 374, 8),
     ("get_index_status", 238, 9),
