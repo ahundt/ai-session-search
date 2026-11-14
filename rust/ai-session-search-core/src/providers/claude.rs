@@ -17,7 +17,7 @@ use crate::hashing::sha256;
 use crate::models::{
     ContentPartAuthorship, ContentPartOrigin, EditOp, FileEdit, InputDeliveryState,
     MessageAuthorship, MessageContentPart, MessageCorrelationAuthority, MessageCorrelationIdentity,
-    MessageInputOrigin, ParsedSession, Provider, SessionRecord, SourceFile,
+    MessageInputOrigin, MessageRecordRelation, ParsedSession, Provider, SessionRecord, SourceFile,
 };
 use crate::providers::{
     spawn::{self, SpawnOrigin},
@@ -1166,6 +1166,15 @@ impl ClaudeAdapter {
             // origin metadata on the outer record. Absence is intentionally left unresolved so
             // the legacy session-level evidence below remains unchanged.
             let native_semantics = claude_native_message_semantics(&value);
+            // The SDK explicitly labels re-emitted input, including copies whose originals
+            // have left the source. Keep that evidence rather than deduplicating by text:
+            // separate unmarked submissions of identical text remain separate originals.
+            let is_replay = record_type == Some("user") && value["isReplay"] == true;
+            let relation = if is_replay {
+                MessageRecordRelation::Mirror
+            } else {
+                MessageRecordRelation::Original
+            };
 
             // A declined record runs through the same rendering into separate sinks, so what an
             // earlier parser stored from it can be recognised and removed; see `RetractedRows`.
@@ -1290,7 +1299,8 @@ impl ClaudeAdapter {
                             observe_session_start(&mut created_at, timestamp);
                             observe_session_end(&mut updated_at, timestamp);
                         }
-                        let (mut raw_message, transcript_text) = mixed.into_raw_message(timestamp);
+                        let (raw_message, transcript_text) = mixed.into_raw_message(timestamp);
+                        let mut raw_message = raw_message.with_record_relation(relation);
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
                                 MessageCorrelationAuthority::Anthropic,
@@ -1300,7 +1310,7 @@ impl ClaudeAdapter {
                         out.push(raw_message);
                         if !transcript_text.is_empty() {
                             let line = format_transcript_line("user", timestamp, &transcript_text);
-                            if retract {
+                            if retract || is_replay {
                                 retracted_transcript_lines.push(line);
                             } else {
                                 transcript_lines.push(line);
@@ -1318,7 +1328,8 @@ impl ClaudeAdapter {
                     // (kept separate from the conversation, like other providers' tool output).
                     if is_compaction {
                         let mut raw_message =
-                            RawMessage::message("compaction", text, timestamp, None);
+                            RawMessage::message("compaction", text, timestamp, None)
+                                .with_record_relation(relation);
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
                                 MessageCorrelationAuthority::Anthropic,
@@ -1334,7 +1345,8 @@ impl ClaudeAdapter {
                             text,
                             tool_call_id.as_deref(),
                             timestamp,
-                        );
+                        )
+                        .with_record_relation(relation);
                         if let Some(event_id) = event_id {
                             raw_message = raw_message.with_native_event_identity(
                                 MessageCorrelationAuthority::Anthropic,
@@ -1349,7 +1361,11 @@ impl ClaudeAdapter {
                         observe_session_end(&mut updated_at, timestamp);
                     }
                     let is_user_role = role.as_deref() == Some("user");
-                    if !retract && is_user_role && std::mem::take(&mut pending_direct_delivery) {
+                    if !retract
+                        && !is_replay
+                        && is_user_role
+                        && std::mem::take(&mut pending_direct_delivery)
+                    {
                         // Its enqueue may precede the overlap; only a new delivery needs it.
                         requires_full_parse_for_tail |=
                             is_new && context.is_none_or(|c| c.prefix_truncated);
@@ -1375,7 +1391,8 @@ impl ClaudeAdapter {
                         text.clone(),
                         timestamp,
                         None,
-                    );
+                    )
+                    .with_record_relation(relation);
                     if is_user_role {
                         if let Some(semantics) = native_semantics {
                             raw_message =
@@ -1392,7 +1409,7 @@ impl ClaudeAdapter {
                         );
                     }
                     let line = format_transcript_line(raw_message.role(), timestamp, &text);
-                    if retract {
+                    if retract || is_replay {
                         retracted_transcript_lines.push(line);
                     } else {
                         transcript_lines.push(line);
@@ -4649,6 +4666,129 @@ mod tests {
             "surrounding text is preserved: {content:?}"
         );
         assert_eq!(parsed.session.message_count, Some(1));
+    }
+
+    #[test]
+    fn desktop_sdk_replays_are_mirrors_not_new_submissions() {
+        use crate::models::{MessageFilters, MessageRecordRelation};
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("audit.jsonl");
+        let original = json!({"type":"user","uuid":"input-1","session_id":"synthetic",
+            "message":{"role":"user","content":"please use the blue widget"}});
+        let mut replay = original.clone();
+        replay["isReplay"] = json!(true);
+        replay["_audit_timestamp"] = json!("2026-01-01T00:00:01Z");
+        let mut second = original.clone();
+        second["uuid"] = json!("input-2");
+        let mut orphan = replay.clone();
+        orphan["uuid"] = json!("input-orphan");
+        orphan["message"]["content"] = json!("a replay whose original was pruned");
+        let mut mixed = replay.clone();
+        mixed["uuid"] = json!("input-mixed");
+        mixed["message"]["content"] = json!([
+            {"type":"text","text":"copied prompt"},
+            {"type":"tool_result","tool_use_id":"call-1","content":"copied output"}]);
+        let records = [
+            original.clone(),
+            original,
+            replay.clone(),
+            replay,
+            second,
+            orphan,
+            mixed,
+        ];
+        let parsed = ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(
+                    records
+                        .iter()
+                        .map(Value::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                &path,
+            )
+            .unwrap();
+        assert_eq!(
+            parsed.messages.len(),
+            5,
+            "identical whole records already deduplicate"
+        );
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .filter(|m| m.provenance.record_relation == MessageRecordRelation::Mirror)
+                .count(),
+            3
+        );
+        assert_eq!(
+            parsed
+                .transcript_text
+                .matches("please use the blue widget")
+                .count(),
+            2
+        );
+        assert!(!parsed.transcript_text.contains("original was pruned"));
+        assert!(!parsed.transcript_text.contains("copied prompt"));
+
+        // Reclassification repairs native rows without deleting an absent source row.
+        let mut old = parsed.clone();
+        old.session.parse_version = "claude-desktop-local-agent-v18".into();
+        for message in &mut old.messages {
+            message.provenance.record_relation = MessageRecordRelation::Original;
+        }
+        let mut archived = old.messages[0].clone();
+        archived.content = "an archived separate submission".into();
+        archived.provenance.correlation_identity = None;
+        archived.seq = 5;
+        old.messages.push(archived);
+        old.transcript_text = old
+            .messages
+            .iter()
+            .map(|m| {
+                crate::util::format_transcript_line(
+                    m.role.as_str(),
+                    m.ts,
+                    if m.content.contains("copied prompt") {
+                        "copied prompt"
+                    } else {
+                        &m.content
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.upsert_session(&old, 1, 1).unwrap();
+        for generation in [2, 3] {
+            db.upsert_session(&parsed, generation, generation).unwrap();
+            assert_eq!(db.message_count().unwrap(), 6);
+            let human = db
+                .search_messages(
+                    "",
+                    &MessageFilters {
+                        role: Some(crate::models::Role::User),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                human.len(),
+                3,
+                "two submissions plus the archive, not replays"
+            );
+            let conn = rusqlite::Connection::open(temp.path().join("index.db")).unwrap();
+            let transcript: String = conn
+                .query_row("select transcript_text from transcripts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(transcript.matches("please use the blue widget").count(), 2);
+            assert!(!transcript.contains("original was pruned"));
+            assert!(!transcript.contains("copied prompt"));
+            assert!(transcript.contains("an archived separate submission"));
+        }
     }
 
     #[test]
