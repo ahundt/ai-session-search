@@ -2978,15 +2978,12 @@ impl Db {
         // gaps (rows deleted without renumbering), so the row count is not the next free seq:
         // numbering from it reused existing seqs and left one (session_id, seq) naming two
         // messages.
-        let next_seq = next_message_seq(&tx, &session.id)?;
-        insert_messages(
-            &tx,
-            session,
-            tail.new_messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| (next_seq + i as i64, m)),
-        )?;
+        let mut next_seq = next_message_seq(&tx, &session.id)?;
+        for message in &tail.new_messages {
+            // Content-addressed rows may already exist outside the overlap. Only inserted
+            // rows consume a sequence, so later events retain full-parse coordinates.
+            next_seq += insert_messages(&tx, session, std::iter::once((next_seq, message)))? as i64;
+        }
         let next_edit_seq = next_file_edit_seq(&tx, &session.id)?;
         insert_file_edits(
             &tx,
@@ -6964,15 +6961,16 @@ fn insert_messages<'a>(
     tx: &rusqlite::Transaction<'_>,
     session: &SessionRecord,
     rows: impl Iterator<Item = (i64, &'a crate::models::Message)>,
-) -> Result<()> {
-    let mut stmt = tx.prepare(
+) -> Result<usize> {
+    let mut inserted = 0;
+    let mut stmt = tx.prepare_cached(
         "insert into messages
             (session_id, provider, seq, role, ts, tool_name, kind, tool_call_id, is_compaction,
              content, authorship, correlation_authority, correlation_scope, correlation_id,
              input_delivery_state, input_origin, record_relation)
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
     )?;
-    let mut part_stmt = tx.prepare(INSERT_MESSAGE_PARTS_SQL)?;
+    let mut part_stmt = tx.prepare_cached(INSERT_MESSAGE_PARTS_SQL)?;
     for (seq, message) in rows {
         if let Err(detail) = message.provenance.validate(&message.content) {
             bail!(
@@ -6981,8 +6979,17 @@ fn insert_messages<'a>(
             );
         }
         let correlation = message.provenance.correlation_identity.as_ref();
-        if crate::providers::claude::is_attachment_message(message) {
-            let identity = correlation.expect("attachment identity was checked");
+        // Only snapshot identities describe session-wide content rather than event
+        // occurrences. Ordinary native IDs must not collapse repeated source events.
+        let codex_snapshot = session.provider == Provider::Codex
+            && message.kind == crate::models::MessageKind::HarnessNotice
+            && correlation.is_some_and(|identity| {
+                identity.authority == crate::models::MessageCorrelationAuthority::OpenAi
+                    && identity.scope == session.id
+                    && identity.id.starts_with("snapshot:base_instructions:")
+            });
+        if crate::providers::claude::is_attachment_message(message) || codex_snapshot {
+            let identity = correlation.expect("snapshot identity was checked");
             let exists: bool = tx.query_row(
                 "select exists(select 1 from messages where session_id=?1
                  and correlation_authority=?2 and correlation_scope=?3 and correlation_id=?4
@@ -7028,8 +7035,9 @@ fn insert_messages<'a>(
             message_id,
             &message.provenance.content_parts,
         )?;
+        inserted += 1;
     }
-    Ok(())
+    Ok(inserted)
 }
 
 /// Update an identified source row in place while preserving its archive sequence and row id.

@@ -3099,7 +3099,7 @@ mod tests {
         let meta = json!({"type":"session_meta","payload":{"id":"00000000-0000-0000-0000-000000000001","base_instructions":{"text":"stable rule"}}}).to_string() + "\n";
         let initial = format!(
             "{meta}{}\n",
-            json!({"type":"ignored","padding":"x".repeat(300_000)})
+            json!({"type":"ignored","padding":"x".repeat(crate::tail::OVERLAP_BYTES as usize + 1)})
         );
         fs::write(&path, &initial).unwrap();
         let db = crate::db::Db::open(&dir.path().join("tail.db")).unwrap();
@@ -3135,6 +3135,153 @@ mod tests {
             .query_row("select count(*) from messages", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+        // Repeated snapshots must not leave sequence holes before later ordinary events.
+        let event = json!({"type":"response_item","payload":{"type":"message","id":"synthetic-event","role":"user","content":[{"type":"input_text","text":"ordinary input"}]}}).to_string() + "\n";
+        let changed =
+            json!({"type":"session_meta","payload":{"base_instructions":{"text":"changed rule"}}})
+                .to_string()
+                + "\n";
+        let mut offset = (initial.len() + meta.len()) as i64;
+        for suffix in [
+            format!("{meta}{event}{changed}{meta}"),
+            format!("{changed}{event}"),
+        ] {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(suffix.as_bytes())
+                .unwrap();
+            let run = crate::tail::tail_parse_until(&path, offset, None, &|| false, |r, p, c| {
+                adapter.parse_reader_with_context(r, p, Some(c))
+            })
+            .unwrap();
+            let crate::tail::TailParseRun::Complete(Some(tail)) = run else {
+                panic!("resumed snapshots must stay incremental")
+            };
+            offset += suffix.len() as i64;
+            db.append_tail(&tail, 3, offset).unwrap();
+        }
+        let full = adapter
+            .parse_reader(
+                std::io::BufReader::new(fs::File::open(&path).unwrap()),
+                &path,
+            )
+            .unwrap();
+        let fresh = crate::db::Db::open(&dir.path().join("fresh.db")).unwrap();
+        fresh.upsert_session(&full, 3, offset).unwrap();
+        let rows = |name: &str| {
+            let conn = rusqlite::Connection::open(dir.path().join(name)).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "select json_array(session_id, provider, seq, role, ts, tool_name, kind,
+                        tool_call_id, is_compaction, content, authorship, correlation_authority,
+                        correlation_scope, correlation_id, input_delivery_state, input_origin,
+                        record_relation) from messages order by seq",
+                )
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(rows("tail.db"), rows("fresh.db"));
+        assert_eq!(
+            rows("tail.db").len(),
+            4,
+            "two distinct snapshots and two ordinary events, even with the same native id"
+        );
+        db.upsert_session(&full, 4, offset).unwrap();
+        assert_eq!(
+            rows("tail.db"),
+            rows("fresh.db"),
+            "full reconciliation must not retain extra archive rows"
+        );
+    }
+
+    #[test]
+    fn lifecycle_records_in_overlap_are_not_inserted_twice() {
+        use std::io::Write;
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-00000000-0000-0000-0000-000000000003.jsonl");
+        let adapter = CodexAdapter::new(vec![]);
+        let initial =
+            json!({"type":"session_meta","payload":{"id":"00000000-0000-0000-0000-000000000003"}})
+                .to_string()
+                + "\n";
+        fs::write(&path, &initial).unwrap();
+        let db = crate::db::Db::open(&dir.path().join("overlap.db")).unwrap();
+        let before = adapter
+            .parse_reader(std::io::Cursor::new(&initial), &path)
+            .unwrap();
+        db.upsert_session(&before, 1, initial.len() as i64).unwrap();
+        let lifecycle = [
+            json!({"type":"compacted","payload":{"message":"summary"}}),
+            json!({"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}),
+        ]
+        .into_iter()
+        .map(|record| record.to_string() + "\n")
+        .collect::<String>();
+        let event = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"continue"}]}}).to_string() + "\n";
+        let mut offset = initial.len() as i64;
+        // The second refresh sees both lifecycle records only in overlap; the third
+        // adds identical new occurrences, which must not be deduplicated as snapshots.
+        for (suffix, expected_new, expected_notices) in [
+            (lifecycle.clone(), 2, 2),
+            (event.clone(), 1, 2),
+            (lifecycle.clone(), 2, 4),
+            (event, 1, 4),
+        ] {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(suffix.as_bytes())
+                .unwrap();
+            assert!(offset < crate::tail::OVERLAP_BYTES);
+            let run = crate::tail::tail_parse_until(&path, offset, None, &|| false, |r, p, c| {
+                adapter.parse_reader_with_context(r, p, Some(c))
+            })
+            .unwrap();
+            let crate::tail::TailParseRun::Complete(Some(tail)) = run else {
+                panic!("lifecycle records must stay incremental")
+            };
+            assert_eq!(tail.new_messages.len(), expected_new);
+            offset += suffix.len() as i64;
+            db.append_tail(&tail, 2, offset).unwrap();
+            let full = adapter
+                .parse_reader(
+                    std::io::BufReader::new(fs::File::open(&path).unwrap()),
+                    &path,
+                )
+                .unwrap();
+            let conn = rusqlite::Connection::open(dir.path().join("overlap.db")).unwrap();
+            let mut stmt = conn
+                .prepare("select seq, content from messages order by seq")
+                .unwrap();
+            let stored = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(
+                stored,
+                full.messages
+                    .iter()
+                    .map(|m| (m.seq, m.content.clone()))
+                    .collect::<Vec<_>>()
+            );
+            let notices: i64 = conn
+                .query_row(
+                    "select count(*) from messages where kind in ('compaction', 'harness_notice')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(notices, expected_notices);
+        }
     }
 
     #[test]
