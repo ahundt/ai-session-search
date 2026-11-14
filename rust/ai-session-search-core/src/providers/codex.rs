@@ -195,6 +195,7 @@ impl CodexAdapter {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
         let mut valid_record_count: usize = 0;
+        let mut unrecognized = super::health::UnrecognizedRecordTypes::default();
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
@@ -251,6 +252,7 @@ impl CodexAdapter {
                 }
             };
             valid_record_count += 1;
+            unrecognized.observe(Provider::Codex, &value);
             let timestamp = value
                 .get("timestamp")
                 .and_then(Value::as_str)
@@ -723,6 +725,7 @@ impl CodexAdapter {
         // full-parse result; sidecar values remain authoritative when present.
         let parent_session_id = parent_session_id.or(header_spawn_origin.0);
         let agent_label = agent_label.or(header_spawn_origin.1);
+        unrecognized.publish(&mut raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
         let agent_started = parent_session_id.is_some() || agent_label.is_some();
 

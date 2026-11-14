@@ -111,7 +111,7 @@ const IGNORED_SYSTEM_SUBTYPES: &[&str] = &[
 
 /// `raw_metadata_json` key holding counts of unrecognized record types and attachment layouts,
 /// which `Db::parser_health` aggregates across sessions.
-pub(crate) const UNRECOGNIZED_RECORD_TYPES_KEY: &str = "unrecognized_record_types";
+pub(crate) use super::health::UNRECOGNIZED_RECORD_TYPES_KEY;
 
 // File, Context and Queued are STORED; Skipped types are classified non-content or duplicates.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -375,71 +375,7 @@ impl AttachmentRows {
     }
 }
 
-/// Unclassified record types and attachment layouts, named without payload text.
-/// Bounded: at most `MAX_TYPES` names of at most `MAX_NAME_CHARS` characters each are kept, and
-/// records of any further type are counted under one overflow name.
-#[derive(Default)]
-struct UnrecognizedRecordTypes {
-    counts: std::collections::BTreeMap<String, usize>,
-}
-
-impl UnrecognizedRecordTypes {
-    const MAX_TYPES: usize = 16;
-    const MAX_NAME_CHARS: usize = 64;
-    const OVERFLOW: &'static str = "(other types)";
-
-    fn count(&mut self, record_type: Option<&str>) {
-        let name: String = record_type
-            .unwrap_or("(no type)")
-            .chars()
-            .take(Self::MAX_NAME_CHARS)
-            .collect();
-        let name = if self.counts.contains_key(&name) || self.counts.len() < Self::MAX_TYPES {
-            name
-        } else {
-            Self::OVERFLOW.to_string()
-        };
-        *self.counts.entry(name).or_default() += 1;
-    }
-
-    fn layout(&mut self, kind: &str, difference: &str, value: &Value) {
-        let keys = value
-            .as_object()
-            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
-            .unwrap_or_else(|| {
-                match value {
-                    Value::Null => "null",
-                    Value::Array(_) => "array",
-                    Value::Bool(_) => "boolean",
-                    Value::Number(_) => "number",
-                    Value::String(_) => "string",
-                    Value::Object(_) => unreachable!(),
-                }
-                .to_owned()
-            });
-        self.count(Some(&format!(
-            "attachment/{kind} ({difference}; keys: {keys})"
-        )));
-    }
-
-    fn warning(&self) -> Option<String> {
-        if self.counts.is_empty() {
-            return None;
-        }
-        Some(
-            self.counts
-                .iter()
-                .map(|(name, count)| match count {
-                    1 => format!("1 record of unrecognized type {name:?} was not indexed"),
-                    count => {
-                        format!("{count} records of unrecognized type {name:?} were not indexed")
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("; "),
-        )
-    }
-}
+use super::health::UnrecognizedRecordTypes;
 
 struct QueueEnqueue {
     line: Option<usize>,
@@ -1554,9 +1490,7 @@ impl ClaudeAdapter {
         if pending_direct_delivery {
             raw_metadata["pending_direct_delivery"] = json!(true);
         }
-        if !unrecognized.counts.is_empty() {
-            raw_metadata[UNRECOGNIZED_RECORD_TYPES_KEY] = json!(unrecognized.counts);
-        }
+        unrecognized.publish(&mut raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
         let parse_warning = [
