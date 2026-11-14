@@ -486,18 +486,16 @@ impl CodexAdapter {
                             messages.push(raw_message);
                         }
                         // Stage apply_patch changes until its correlated output proves success.
-                        if name == Some("apply_patch") {
-                            if let Some(patch) = apply_patch_text(payload) {
-                                pending_file_mutations.stage_many(
-                                    payload.get("call_id").and_then(Value::as_str),
-                                    timestamp,
-                                    "apply_patch",
-                                    parse_apply_patch(&patch)
-                                        .into_iter()
-                                        .map(|(path, content)| (path, content, Vec::new()))
-                                        .collect(),
-                                );
-                            }
+                        if let Some(patch) = apply_patch_text(payload) {
+                            pending_file_mutations.stage_many(
+                                payload.get("call_id").and_then(Value::as_str),
+                                timestamp,
+                                "apply_patch",
+                                parse_apply_patch(&patch)
+                                    .into_iter()
+                                    .map(|(path, content)| (path, content, Vec::new()))
+                                    .collect(),
+                            );
                         }
                     } else if matches!(
                         item_type,
@@ -1324,20 +1322,66 @@ fn codex_append_request_user_input_answers(
     }
 }
 
-/// The apply_patch payload text: codex records it as `custom_tool_call.input` (a patch
-/// string); a `function_call` variant may wrap it in `arguments` JSON (`{"input": "..."}`)
-/// or pass the raw patch. Returns None when no patch text is present.
+/// Decode a native patch call or a single literal shell invocation. Arbitrary code in
+/// the exec tool is not a patch receipt: it may construct, branch, catch errors, or never
+/// execute the patch. Never infer a mutation merely from a marker inside such code.
 fn apply_patch_text(payload: &Value) -> Option<String> {
-    if let Some(input) = payload.get("input").and_then(Value::as_str) {
-        return Some(input.to_string());
+    let name = payload.get("name").and_then(Value::as_str)?;
+    let args = codex_tool_call_args(payload);
+    if name == "apply_patch" {
+        return args
+            .as_str()
+            .or_else(|| args.get("input").and_then(Value::as_str))
+            .map(str::to_owned);
     }
-    let args = payload.get("arguments").and_then(Value::as_str)?;
-    if let Ok(value) = serde_json::from_str::<Value>(args) {
-        if let Some(input) = value.get("input").and_then(Value::as_str) {
-            return Some(input.to_string());
+    if !matches!(
+        name,
+        "exec_command" | "shell_command" | "shell" | "local_shell"
+    ) {
+        return None;
+    }
+    let command = args.get("cmd").or_else(|| args.get("command"))?;
+    let command = if let Some(command) = command.as_str() {
+        command
+    } else {
+        let argv = command.as_array()?;
+        if argv.len() == 2 && argv[0].as_str() == Some("apply_patch") {
+            return argv[1]
+                .as_str()
+                .filter(|text| {
+                    text.starts_with("*** Begin Patch\n")
+                        && text.trim_end().ends_with("*** End Patch")
+                })
+                .map(str::to_owned);
         }
+        if argv.len() != 3
+            || !matches!(argv[0].as_str(), Some("bash" | "sh" | "zsh"))
+            || !matches!(argv[1].as_str(), Some("-lc" | "-c"))
+        {
+            return None;
+        }
+        argv[2].as_str()?
+    };
+    let (header, body) = command.trim().split_once('\n')?;
+    let delimiter = header.strip_prefix("apply_patch <<")?.trim();
+    // Only a quoted heredoc has literal bytes; an unquoted one expands shell variables.
+    let quote = delimiter.chars().next()?;
+    if !matches!(quote, '\'' | '"') || !delimiter.ends_with(quote) || delimiter.len() < 3 {
+        return None;
     }
-    args.contains("*** Begin Patch").then(|| args.to_string())
+    let delimiter = &delimiter[1..delimiter.len() - 1];
+    if !delimiter
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    let (patch, end) = body.trim_end().rsplit_once('\n')?;
+    (end == delimiter
+        && !patch.lines().any(|line| line == delimiter)
+        && patch.starts_with("*** Begin Patch\n")
+        && patch.ends_with("*** End Patch"))
+    .then(|| patch.to_owned())
 }
 
 fn codex_tool_call_args(payload: &Value) -> Value {
@@ -1500,8 +1544,12 @@ fn codex_apply_patch_succeeded(output: Option<&Value>) -> bool {
     if let Ok(structured) = serde_json::from_str::<Value>(text) {
         return codex_apply_patch_succeeded(Some(&structured));
     }
-    text.starts_with("Exit code: 0\n")
-        && text.contains("\nOutput:\nSuccess. Updated the following files:")
+    (text.starts_with("Exit code: 0\n")
+        && text.contains("\nOutput:\nSuccess. Updated the following files:"))
+        || (text
+            .lines()
+            .any(|line| line == "Process exited with code 0")
+            && text.contains("\nFinal output:\nSuccess. Updated the following files:"))
 }
 
 /// The parent history a forked rollout replays before its own records.
@@ -3149,6 +3197,61 @@ mod tests {
                 .unwrap(),
             3
         );
+    }
+
+    #[test]
+    fn shell_apply_patch_requires_a_single_command_and_correlated_success() {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("rollout-00000000-0000-0000-0000-000000000003.jsonl");
+        let patch = "*** Begin Patch\n*** Add File: /synthetic/new.txt\n+synthetic text\n*** Update File: /synthetic/old.txt\n@@\n-before\n+after\n*** End Patch";
+        let command = format!("apply_patch <<'PATCH'\n{patch}\nPATCH");
+        let success = "Chunk ID: synthetic\nWall time: 0.1 seconds\nProcess exited with code 0\nFinal output:\nSuccess. Updated the following files:\nA /synthetic/new.txt\nM /synthetic/old.txt";
+        let call = |id: &str, name: &str, args: serde_json::Value| json!({"type":"response_item","payload":{"type":"function_call","call_id":id,"name":name,"arguments":args.to_string()}});
+        let output = |id: &str, text: &str| json!({"type":"response_item","payload":{"type":"function_call_output","call_id":id,"output":text}});
+        for (name, args) in [
+            ("exec_command", json!({"cmd":command})),
+            ("shell", json!({"command":["bash","-lc",command]})),
+            ("shell_command", json!({"command":command})),
+        ] {
+            let rows = [
+                call("good", name, args.clone()),
+                output("unrelated", success),
+                output("good", success),
+                call("failed", name, args.clone()),
+                output(
+                    "failed",
+                    "Process exited with code 1\nFinal output:\npatch failed",
+                ),
+                call("pending", name, args),
+                call(
+                    "quoted",
+                    name,
+                    json!({"cmd":format!("cat <<'PATCH'\n{patch}\nPATCH")}),
+                ),
+                output("quoted", success),
+            ]
+            .into_iter()
+            .map(|r| r.to_string() + "\n")
+            .collect::<String>();
+            let parsed = CodexAdapter::new(vec![])
+                .parse_reader(std::io::Cursor::new(rows), &path)
+                .unwrap();
+            assert_eq!(parsed.file_edits.len(), 2, "{name}");
+            assert_eq!(
+                parsed.file_edits[0].new_content.as_deref(),
+                Some("synthetic text")
+            );
+            assert_eq!(parsed.file_edits[1].file_path, "/synthetic/old.txt");
+        }
+        assert!(super::apply_patch_text(&json!({"name":"exec","input":format!("const p = await tools.apply_patch({});", json!(patch))})).is_none());
+        assert!(super::apply_patch_text(&json!({"name":"exec_command","arguments":json!({"cmd":format!("{command}\necho done")}).to_string()})).is_none());
+        let early_end = command.replace("+synthetic text", "+synthetic text\nPATCH\necho injected");
+        assert!(super::apply_patch_text(
+            &json!({"name":"exec_command","arguments":json!({"cmd":early_end}).to_string()})
+        )
+        .is_none());
     }
 
     #[test]
