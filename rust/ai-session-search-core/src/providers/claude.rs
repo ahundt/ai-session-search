@@ -42,8 +42,8 @@ pub(crate) fn claude_queue_scope(canonical_path: &str) -> String {
 }
 
 /// Record types that are conversation, and the only ones whose records may become messages,
-/// tool calls, tool results or file edits. `system` records reach only the harness-notice rule
-/// (`is_harness_notice`); `queue-operation`, `attachment` and `last-prompt` have their own arms
+/// tool calls, tool results or file edits. `system` records reach only the SDK subtype notice
+/// rules or `is_harness_notice`; `queue-operation`, `attachment` and `last-prompt` have their own arms
 /// in `parse_reader`'s dispatch.
 ///
 /// Eligibility is decided by the record's `type`, never by whether it carries a `message` object:
@@ -89,6 +89,24 @@ const IGNORED_RECORD_TYPES: [&str; 27] = [
     "tool_use_summary",
     "tools-used",
     "worktree-state",
+];
+
+/// SDK system subtypes that describe state rather than searchable notices. In particular,
+/// progress descriptions repeat task prompts; permission requests carry tool input, not prose.
+const IGNORED_SYSTEM_SUBTYPES: &[&str] = &[
+    "init",
+    "status",
+    "thinking_tokens",
+    "task_progress",
+    "task_updated",
+    "compact_boundary",
+    "microcompact_boundary",
+    "turn_duration",
+    "stop_hook_summary",
+    "permission_request",
+    "permission_response",
+    "permission_auto_approved",
+    "commands_changed",
 ];
 
 /// `raw_metadata_json` key holding counts of unrecognized record types and attachment layouts,
@@ -955,6 +973,34 @@ impl ClaudeAdapter {
                 .filter(|id| !id.trim().is_empty());
 
             let record_type = value.get("type").and_then(Value::as_str);
+            let system_notice = if record_type == Some("system") {
+                if let Some(subtype) = value.get("subtype").and_then(Value::as_str) {
+                    let field = match subtype {
+                        "task_started" => "prompt",
+                        "task_notification" => "summary",
+                        "api_retry" => "error",
+                        "permission_denied" => "message",
+                        "model_refusal_fallback" => "content",
+                        subtype if IGNORED_SYSTEM_SUBTYPES.contains(&subtype) => continue,
+                        subtype => {
+                            unrecognized.count(Some(&format!("system/{subtype}")));
+                            continue;
+                        }
+                    };
+                    match value.get(field).and_then(Value::as_str) {
+                        Some(text) => Some(text),
+                        None => {
+                            unrecognized
+                                .count(Some(&format!("system/{subtype} ({field} not string)")));
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             // The one place that decides what a record may produce, by its type. A record of any
             // type outside `MESSAGE_RECORD_TYPES` yields no message, tool call, tool result or
             // file edit, whatever fields it carries; see that constant for why.
@@ -1190,7 +1236,9 @@ impl ClaudeAdapter {
             let mut tool_call_id: Option<String> = None;
             let mut mixed_user_content = None;
 
-            if let Some(message) = value.get("message") {
+            if let Some(notice) = system_notice {
+                text = notice.to_string();
+            } else if let Some(message) = value.get("message") {
                 // `message.role` refines a user or assistant record. It never makes a record of
                 // another type a turn; only the earlier rendering of a declined record used it.
                 if retract || matches!(record_type, Some("user" | "assistant")) {
@@ -1267,7 +1315,7 @@ impl ClaudeAdapter {
             // task notifications) are the only record of what a hook told an agent and what it
             // did next, so they are stored and tagged rather than dropped. Every query excludes
             // them by default, so user prose and the analytics built on it are unaffected.
-            if is_harness_notice(&value, &text) {
+            if system_notice.is_some() || is_harness_notice(&value, &text) {
                 let notice = text.trim();
                 if !notice.is_empty() {
                     let mut raw_message = RawMessage::harness_notice(notice.to_string(), timestamp);
@@ -4788,6 +4836,111 @@ mod tests {
             assert!(!transcript.contains("original was pruned"));
             assert!(!transcript.contains("copied prompt"));
             assert!(transcript.contains("an archived separate submission"));
+        }
+    }
+
+    #[test]
+    fn sdk_system_subtypes_store_notices_and_report_unknowns() {
+        use crate::models::{MessageFilters, MessageKind, Role};
+        let temp = tempdir().unwrap();
+        for filename in ["audit.jsonl", "session.jsonl"] {
+            let mut records = Vec::new();
+            for (subtype, field) in [
+                ("task_started", "prompt"),
+                ("task_notification", "summary"),
+                ("api_retry", "error"),
+                ("permission_denied", "message"),
+                ("model_refusal_fallback", "content"),
+            ] {
+                let mut record = json!({"type":"system","subtype":subtype,
+                    "uuid":subtype,"session_id":"synthetic-notices"});
+                record[field] = json!(format!("synthetic notice {subtype}"));
+                records.push(record.clone());
+                records.push(record);
+            }
+            for subtype in [
+                "init",
+                "status",
+                "thinking_tokens",
+                "task_progress",
+                "task_updated",
+                "compact_boundary",
+                "permission_request",
+                "permission_response",
+                "permission_auto_approved",
+                "commands_changed",
+            ] {
+                records.push(json!({"type":"system","subtype":subtype,
+                    "content":"bookkeeping must not become prose"}));
+            }
+            records.push(json!({"type":"system","subtype":"future_status",
+                "content":"unknown must not become prose"}));
+            let parsed = ClaudeAdapter::new(vec![])
+                .parse_reader(
+                    std::io::Cursor::new(
+                        records
+                            .iter()
+                            .map(Value::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
+                    &temp.path().join(filename),
+                )
+                .unwrap();
+            assert_eq!(parsed.messages.len(), 5);
+            assert!(parsed
+                .messages
+                .iter()
+                .all(|m| m.kind == MessageKind::HarnessNotice));
+            assert!(parsed.transcript_text.is_empty());
+            let metadata: Value =
+                serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                metadata[super::UNRECOGNIZED_RECORD_TYPES_KEY],
+                json!({"system/future_status":1})
+            );
+            assert!(parsed
+                .session
+                .parse_warning
+                .as_deref()
+                .unwrap()
+                .contains("system/future_status"));
+            let db = crate::db::Db::open(&temp.path().join(format!("{filename}.db"))).unwrap();
+            let mut old = parsed.clone();
+            old.session.parse_version = "synthetic-earlier-parser".into();
+            old.messages.clear();
+            db.upsert_session(&old, 1, 1).unwrap();
+            for generation in [2, 3] {
+                db.upsert_session(&parsed, generation, generation).unwrap();
+                assert_eq!(db.message_count().unwrap(), 5);
+                assert!(db
+                    .search_messages("synthetic notice", &Default::default())
+                    .unwrap()
+                    .is_empty());
+                assert_eq!(
+                    db.search_messages(
+                        "synthetic notice",
+                        &MessageFilters {
+                            kinds: Some(vec![MessageKind::HarnessNotice]),
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap()
+                    .len(),
+                    5
+                );
+                assert!(db
+                    .search_messages(
+                        "synthetic notice",
+                        &MessageFilters {
+                            role: Some(Role::User),
+                            kinds: Some(vec![MessageKind::HarnessNotice]),
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap()
+                    .is_empty());
+            }
         }
     }
 
