@@ -1507,8 +1507,12 @@ pub(crate) fn serialize_hit_provenance<
 #[non_exhaustive]
 pub struct MessageFilters {
     /// User selects recorded input across source roles in search and range reads.
+    /// Released generation-five layouts without input columns retain stored-role filtering.
     /// Other roles select stored roles; analytics retain their operation-specific policies.
     pub role: Option<Role>,
+    /// Set only by the database compatibility path, never by a serialized caller request.
+    #[serde(skip)]
+    pub(crate) stored_user_role: bool,
     /// Which semantic message classes to return. `None` selects the default set
     /// ([`MessageKind::default_search_set`]): every class except `HarnessNotice`, which is
     /// harness output rather than user or model prose.
@@ -1617,7 +1621,11 @@ chainable_setters!(MessageFilters {
 
 impl MessageFilters {
     pub(crate) fn input_scope(&self) -> MessageInputScope {
-        MessageInputScope::for_role(self.role)
+        if self.stored_user_role {
+            MessageInputScope::Any
+        } else {
+            MessageInputScope::for_role(self.role)
+        }
     }
 
     /// Validate invariants shared by CLI, MCP, Rust, and language bindings.

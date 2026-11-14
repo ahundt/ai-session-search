@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Nisarg Patel
 // SPDX-License-Identifier: Apache-2.0
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::num::{NonZeroU64, NonZeroUsize};
@@ -3500,7 +3501,8 @@ impl Db {
     ) -> Result<(Vec<MessageHit>, Option<SearchExplain>)> {
         self.validate_access_scope()?;
         filters.validate(query)?;
-        self.validate_input_scope_layout(filters)?;
+        let filters = self.message_filters_for_layout(filters)?;
+        let filters = filters.as_ref();
         let field = filters.field.unwrap_or(SearchField::Content);
         if filters.match_mode != MessageSearchMode::Fuzzy {
             let prepared =
@@ -3634,7 +3636,8 @@ impl Db {
     ) -> Result<MessageBatchVisitOutcome> {
         self.validate_access_scope()?;
         filters.validate(query)?;
-        self.validate_input_scope_layout(filters)?;
+        let filters = self.message_filters_for_layout(filters)?;
+        let filters = filters.as_ref();
         anyhow::ensure!(
             filters.match_mode != MessageSearchMode::Fuzzy,
             "batched exhaustive traversal supports literal, regex, and queryless searches; pass a finite limit to the bounded fuzzy search"
@@ -4206,15 +4209,38 @@ impl Db {
             .map_err(Into::into)
     }
 
-    fn validate_input_scope_layout(&self, filters: &MessageFilters) -> Result<()> {
+    /// Preserve published role filtering on generation five without synthesizing provenance.
+    pub(crate) fn message_input_scope(
+        &self,
+        role: Option<Role>,
+    ) -> Result<crate::models::MessageInputScope> {
+        let scope = crate::models::MessageInputScope::for_role(role);
+        if scope == crate::models::MessageInputScope::UserInput
+            && self.schema_version()? == 5
+            && !self.stores_input_origin()?
+        {
+            return Ok(crate::models::MessageInputScope::Any);
+        }
+        Ok(scope)
+    }
+
+    fn message_filters_for_layout<'a>(
+        &self,
+        filters: &'a MessageFilters,
+    ) -> Result<Cow<'a, MessageFilters>> {
         if filters.input_scope() == crate::models::MessageInputScope::UserInput {
+            if self.message_input_scope(filters.role)? == crate::models::MessageInputScope::Any {
+                let mut filters = filters.clone();
+                filters.stored_user_role = true;
+                return Ok(Cow::Owned(filters));
+            }
             if let Some(problem) =
                 crate::indexer::message_input_provenance_layout_problem(&self.conn)?
             {
                 bail!("user-input search requires current provenance storage: {problem}; run a writable aise command (without --index-refresh existing-only) to upgrade the index, or omit the role filter to search readable stored content");
             }
         }
-        Ok(())
+        Ok(Cow::Borrowed(filters))
     }
 
     /// Whether this index stores `messages.input_origin`.
@@ -6685,7 +6711,7 @@ fn append_message_filters_with_class(
     recorded_user: bool,
 ) {
     use rusqlite::types::Value;
-    if recorded_user && filters.role == Some(Role::User) {
+    if recorded_user && filters.input_scope() == crate::models::MessageInputScope::UserInput {
         sql.push_str(" and m.record_relation != 'mirror' and ((");
         sql.push_str(WHOLE_USER_INPUT_SQL);
         sql.push_str(") or (m.authorship='mixed' and exists (select 1 from message_content_parts p where p.message_id=m.id and ");

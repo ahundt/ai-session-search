@@ -107,6 +107,8 @@ For historical user input across storage roles, pass `role="user"` to
 `MessageSearchRequest`. This selects recorded prompts, queued submissions and linked answer
 regions; omit the role to search complete content. Known parent-agent prompts sent to spawned
 sessions are excluded from this selector. Other filters intersect normally.
+On an existing-only generation-five index without input-provenance columns, `role="user"`
+preserves stored user-role filtering. A writable upgrade enables provenance-based selection.
 Content queries match contiguous input regions in the indexed message and report Unicode-scalar
 coordinates in that message. Tool-name and tool-argument queries use their own field coordinates.
 Views and context may include generated text. Results include concise source

@@ -3559,7 +3559,8 @@ impl<'db> MessageService<'db> {
             &plan.retrieval.query,
             &plan.retrieval.target,
             plan.response.presentation.match_view,
-            crate::models::MessageInputScope::for_role(plan.retrieval.predicates.role),
+            self.db
+                .message_input_scope(plan.retrieval.predicates.role)?,
             hits,
             || ensure_message_search_active(cancellation),
         )?;
@@ -3978,12 +3979,13 @@ mod message_search_service_tests {
             "released-schema",
             "/workspace",
             "/missing/session.jsonl",
-            &["unrestricted legacy needle"],
+            &["unrestricted legacy needle", "generated legacy needle"],
         );
         drop(db);
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         conn.execute_batch(
-            "drop index idx_messages_session_authorship_relation_seq;
+            "update messages set authorship='agent', record_relation='mirror' where seq=1;
+             drop index idx_messages_session_authorship_relation_seq;
              drop index idx_messages_authorship_relation_ts;
              alter table messages drop column input_delivery_state;
              alter table messages drop column input_origin;
@@ -4004,7 +4006,7 @@ mod message_search_service_tests {
             .database()
             .search_messages("legacy needle", &MessageFilters::default())
             .unwrap();
-        assert_eq!(unrestricted.len(), 1);
+        assert_eq!(unrestricted.len(), 2);
         let all_sessions = |limit| SearchFilters {
             limit,
             ..SearchFilters::default()
@@ -4054,7 +4056,7 @@ mod message_search_service_tests {
                 .len(),
             1
         );
-        let error = app
+        let hits = app
             .database()
             .search_messages(
                 "legacy needle",
@@ -4063,10 +4065,21 @@ mod message_search_service_tests {
                     ..Default::default()
                 },
             )
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("user-input provenance"), "{error}");
-        assert!(error.contains("omit the role filter"), "{error}");
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        let request = literal_request()
+            .role(Role::User)
+            .extent(RequestedExtent::all_results())
+            .build()
+            .unwrap();
+        let mut sequences = Vec::new();
+        app.messages()
+            .visit_search_batches(request, NonZeroUsize::new(1).unwrap(), |batch| {
+                sequences.extend(batch.results.iter().map(|hit| hit.message().seq));
+                Ok(MessageSearchBatchControl::Continue)
+            })
+            .unwrap();
+        assert_eq!(sequences, [0, 1]);
     }
 
     #[test]

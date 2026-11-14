@@ -22,6 +22,48 @@ from scripts.verify_harness_discovery import environment as isolated_environment
 native = pytest.importorskip("ai_session_search.native", reason="native extension is not installed")
 
 
+@pytest.mark.parametrize("surface", ["python", "cli", "mcp"])
+def test_released_index_user_role_search_preserves_stored_rows(tmp_path: Path, surface: str) -> None:
+    database = tmp_path / "index.db"
+    fixture = Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/tests/fixtures/v1_0_0_populated.sql"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(fixture.read_text())
+    before = hashlib.sha256(database.read_bytes()).hexdigest()
+    expected = [("claude:upgrade-claude", 0), ("codex:upgrade-codex", 0)]
+    env = isolated_environment(tmp_path / "runtime")
+    env["AI_SESSION_SEARCH_DATABASE"] = str(database)
+    if surface == "python":
+        with native.SessionSearch(database, index_refresh="existing-only") as search:
+            response = search.search_messages("question", native.MessageSearchRequest(role="user"))
+            results = response.results
+    elif surface == "cli":
+        result = subprocess.run(
+            [sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+             "--index-refresh", "existing-only", "messages", "search", "question", "--role", "user", "--format", "json"],
+            env=env, capture_output=True, text=True, check=False, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        results = json.loads(result.stdout)["results"]
+    else:
+        requests = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "synthetic-test", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "search_messages", "arguments": {"query": "question", "role": "user", "index_refresh": "existing-only"}}},
+        ]
+        result = subprocess.run(
+            [sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+             "--index-refresh", "existing-only", "mcp", "serve"],
+            input="".join(json.dumps(request) + "\n" for request in requests),
+            env=env, capture_output=True, text=True, check=True, timeout=30,
+        )
+        response = next(json.loads(line) for line in result.stdout.splitlines() if json.loads(line).get("id") == 2)
+        assert "error" not in response, response
+        assert not response["result"].get("isError"), response
+        results = response["result"]["structuredContent"]["results"]
+    assert [(hit["message_ref"]["session_id"], hit["message_ref"]["message_seq"]) for hit in results] == expected
+    assert hashlib.sha256(database.read_bytes()).hexdigest() == before
+
+
 def test_legacy_input_sentinels_return_none_without_selecting_current_unknown_input(tmp_path: Path) -> None:
     db_path = tmp_path / "index.db"
     search = native.SessionSearch(db_path)

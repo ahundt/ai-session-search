@@ -39,6 +39,68 @@ fn snapshot(path: &Path) -> Vec<Vec<Vec<Value>>> {
 }
 
 #[test]
+fn published_generation_five_user_role_search_is_read_only() {
+    use ai_session_search::config::IndexRefresh;
+    use ai_session_search::db::MessageOrder;
+    use ai_session_search::models::{MessageFilters, Role};
+    use ai_session_search::{MessageQuery, MessageSearchRequest, MessageTarget, RequestedExtent};
+
+    let root = tempfile::tempdir().unwrap();
+    let mut config = config(root.path(), &root.path().join("sources"));
+    config.index.refresh = IndexRefresh::ExistingOnly;
+    let conn = Connection::open(config.db_path()).unwrap();
+    conn.execute_batch(include_str!("fixtures/v1_0_0_populated.sql"))
+        .unwrap();
+    drop(conn);
+    let before = std::fs::read(config.db_path()).unwrap();
+    let app = SessionSearch::open_strict(config.clone()).unwrap();
+    let expected = vec![
+        ("claude:upgrade-claude".to_string(), 0),
+        ("codex:upgrade-codex".to_string(), 0),
+    ];
+    let request = |query| {
+        MessageSearchRequest::builder(query, MessageTarget::content())
+            .role(Role::User)
+            .extent(RequestedExtent::page(Some(10), 0).unwrap())
+            .build()
+            .unwrap()
+    };
+    for query in [
+        MessageQuery::literal("question").unwrap(),
+        MessageQuery::regex("question").unwrap(),
+        MessageQuery::fuzzy("question").unwrap(),
+        MessageQuery::All,
+    ] {
+        let query = request(query);
+        let response = app.messages().search(query.clone()).unwrap();
+        let ids = |response: &ai_session_search::MessageSearchResponse| {
+            response
+                .results()
+                .iter()
+                .map(|hit| (hit.message().session_id.clone(), hit.message().seq))
+                .collect::<Vec<_>>()
+        };
+        let found = ids(&response);
+        assert_eq!(found, ids(&app.messages().search(query).unwrap()));
+        let mut sorted = found;
+        sorted.sort();
+        assert_eq!(sorted, expected);
+    }
+    let rows = app
+        .messages()
+        .read_session(
+            &MessageFilters::default()
+                .with_role(Role::User)
+                .with_session_id("claude:upgrade-claude"),
+            MessageOrder::OldestFirst,
+        )
+        .unwrap();
+    assert_eq!(rows.iter().map(|row| row.seq).collect::<Vec<_>>(), vec![0]);
+    drop(app);
+    assert_eq!(std::fs::read(config.db_path()).unwrap(), before);
+}
+
+#[test]
 fn published_generation_five_refresh_matches_fresh_index() {
     let dir = tempfile::tempdir().unwrap();
     let sources = dir.path().join("sources");
