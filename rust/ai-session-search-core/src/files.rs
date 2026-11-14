@@ -534,22 +534,58 @@ pub fn reconstruct_query(
     query: &FileQuery,
     version: Option<usize>,
 ) -> Result<ReconstructedFile> {
+    reconstruct_query_with_count(db, file, query, version).map(|(file, _)| file)
+}
+
+fn edit_in_date_scope(edit: &FileEdit, query: &FileQuery) -> bool {
+    query
+        .since
+        .is_none_or(|since| edit.ts.is_some_and(|ts| ts >= since))
+        && query
+            .until
+            .is_none_or(|until| edit.ts.is_some_and(|ts| ts <= until))
+}
+
+fn reconstruct_query_with_count(
+    db: &Db,
+    file: &str,
+    query: &FileQuery,
+    version: Option<usize>,
+) -> Result<(ReconstructedFile, usize)> {
+    anyhow::ensure!(query.limit == 0 && query.offset == 0,
+        "single-version reconstruction does not accept paging (limit or offset); use reconstruct_versions");
     let (session_id, provider, edits) = selected_edit_group(db, file, query)?;
-    let selected = version.unwrap_or(edits.len());
+    let selected = match version {
+        Some(version) => version,
+        None => edits
+            .iter()
+            .rposition(|edit| edit_in_date_scope(edit, query))
+            .map(|index| index + 1)
+            .ok_or_else(|| crate::ServiceError::file_not_found(file))?,
+    };
     if selected == 0 || selected > edits.len() {
         return Err(
             crate::ServiceError::file_version_out_of_range(file, selected, edits.len()).into(),
         );
     }
+    anyhow::ensure!(
+        edit_in_date_scope(&edits[selected - 1], query),
+        "version {selected} of '{file}' is outside the date scope (since={:?}, until={:?})",
+        query.since,
+        query.until
+    );
     let content = reconstruct_version(&edits, selected)
         .with_context(|| format!("cannot reconstruct version {selected} of '{file}'"))?;
-    Ok(ReconstructedFile {
-        session_id,
-        provider,
-        version: selected,
-        file_path: edits[selected - 1].file_path.clone(),
-        content,
-    })
+    Ok((
+        ReconstructedFile {
+            session_id,
+            provider,
+            version: selected,
+            file_path: edits[selected - 1].file_path.clone(),
+            content,
+        },
+        edits.len(),
+    ))
 }
 
 fn selected_edit_group(
@@ -585,16 +621,29 @@ pub struct ReconstructedFileVersions {
     edits: std::vec::IntoIter<FileEdit>,
     content: Option<String>,
     version: usize,
+    query: FileQuery,
+    yielded: usize,
 }
 
 impl Iterator for ReconstructedFileVersions {
     type Item = ReconstructedFile;
 
     fn next(&mut self) -> Option<Self::Item> {
+        if self.query.limit != 0 && self.yielded >= self.query.limit {
+            return None;
+        }
         for edit in self.edits.by_ref() {
             self.version += 1;
             advance_reconstruction(&mut self.content, &edit);
+            if !edit_in_date_scope(&edit, &self.query) {
+                continue;
+            }
             if let Some(content) = &self.content {
+                if self.query.offset > 0 {
+                    self.query.offset -= 1;
+                    continue;
+                }
+                self.yielded += 1;
                 return Some(ReconstructedFile {
                     session_id: self.session_id.clone(),
                     provider: self.provider,
@@ -632,6 +681,8 @@ pub fn reconstruct_versions_query(
         edits: edits.into_iter(),
         content: None,
         version: 0,
+        query: query.clone(),
+        yielded: 0,
     })
 }
 
@@ -639,10 +690,16 @@ pub fn reconstruct_versions_query(
 /// Version numbers are 1-based and preserve provider event order.
 pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion>> {
     let groups = group_by_session(db.file_edits_for_query(file, query)?);
+    if groups.is_empty() {
+        return Err(crate::ServiceError::file_not_found(file).into());
+    }
     let mut versions = Vec::new();
     for (session_id, provider, edits) in &groups {
         let line_counts = version_line_counts(edits);
         for (index, edit) in edits.iter().enumerate() {
+            if !edit_in_date_scope(edit, query) {
+                continue;
+            }
             versions.push(FileVersion {
                 session_id: session_id.clone(),
                 provider: *provider,
@@ -653,9 +710,6 @@ pub fn history(db: &Db, file: &str, query: &FileQuery) -> Result<Vec<FileVersion
                 file_path: edit.file_path.clone(),
             });
         }
-    }
-    if versions.is_empty() {
-        return Err(crate::ServiceError::file_not_found(file).into());
     }
     let page = versions
         .into_iter()
@@ -809,6 +863,8 @@ pub struct FilesHistoryArgs {
     pub file: String,
     #[command(flatten)]
     pub scope: FileScopeArgs,
+    #[command(flatten)]
+    pub dates: DateRange,
     /// Max versions to return. Omit or use 0 for every version.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
@@ -858,11 +914,19 @@ pub struct FilesExtractArgs {
     /// atomically publishes a new non-replacing directory when --output-dir is present.
     #[arg(long, conflicts_with = "restore")]
     pub all: bool,
+    /// Max eligible reconstructed versions with --all. Omit or use 0 for every version.
+    #[arg(long, default_value_t = 0, requires = "all")]
+    pub limit: usize,
+    /// Skip this many eligible reconstructed versions with --all, after causal replay.
+    #[arg(long, default_value_t = 0, requires = "all")]
+    pub offset: usize,
     /// Multi-version stdout format. Valid only with --all. Default: framed.
     #[arg(long, value_enum, requires = "all")]
     pub format: Option<ReconstructedVersionsFormat>,
     #[command(flatten)]
     pub scope: FileScopeArgs,
+    #[command(flatten)]
+    pub dates: DateRange,
     /// Write the reconstructed content to a collision-safe `.recovered` sibling
     /// (never overwrites) instead of printing to stdout.
     #[arg(long, conflicts_with = "output_dir")]
@@ -934,7 +998,10 @@ pub(crate) fn run_command(db: &Db, cmd: &FilesCmd) -> Result<()> {
             )
         }
         FilesCmd::History(args) => {
+            let (since, until) = args.dates.resolve_now()?;
             let query = FileQuery {
+                since,
+                until,
                 limit: args.limit,
                 offset: args.offset,
                 ..args.scope.resolved_query(db)?
@@ -946,44 +1013,33 @@ pub(crate) fn run_command(db: &Db, cmd: &FilesCmd) -> Result<()> {
     }
 }
 
-fn file_edits_for_scope(
-    db: &Db,
-    file: &str,
-    scope: &FileScopeArgs,
-) -> Result<Vec<(String, Provider, FileEdit)>> {
-    let query = scope.resolved_query(db)?;
-    db.file_edits_for_query(file, &query)
+impl FilesExtractArgs {
+    fn resolved_query(&self, db: &Db) -> Result<FileQuery> {
+        let (since, until) = self.dates.resolve_now()?;
+        Ok(FileQuery {
+            since,
+            until,
+            limit: self.limit,
+            offset: self.offset,
+            ..self.scope.resolved_query(db)?
+        })
+    }
 }
 
 fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
     if args.all {
         return run_extract_all(db, args);
     }
-    let mut groups = group_by_session(file_edits_for_scope(db, &args.file, &args.scope)?);
-    let (session_id, provider, edits) = match groups.len() {
-        0 => return Err(crate::ServiceError::file_not_found(&args.file).into()),
-        1 => groups.remove(0),
-        n => {
-            let ids: Vec<String> = groups.into_iter().map(|(sid, _, _)| sid).collect();
-            bail!(
-                "'{}' was edited in {n} sessions ({}); pass --session-id with an exact id or unique prefix",
-                args.file,
-                ids.join(", ")
-            );
-        }
-    };
-
-    let version = args.version.unwrap_or(edits.len());
-    if version == 0 || version > edits.len() {
-        bail!(
-            "version {version} out of range for '{}' (1..={})",
-            args.file,
-            edits.len()
-        );
-    }
-    let content = reconstruct_version(&edits, version)
-        .with_context(|| format!("cannot reconstruct '{}' v{version}", args.file))?;
-    let original_path = edits[version - 1].file_path.clone();
+    let query = args.resolved_query(db)?;
+    let (reconstructed, version_count) =
+        reconstruct_query_with_count(db, &args.file, &query, args.version)?;
+    let ReconstructedFile {
+        session_id,
+        provider,
+        version,
+        file_path: original_path,
+        content,
+    } = reconstructed;
     let original = PathBuf::from(&original_path);
     let lines = count_lines(&content);
 
@@ -993,8 +1049,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
         if args.dry_run {
             println!(
                 "session {session_id}: '{}' v{version}/{} ({lines} lines) — dry run, not printed",
-                args.file,
-                edits.len()
+                args.file, version_count
             );
             return Ok(());
         }
@@ -1022,7 +1077,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
         println!(
             "session {session_id}: would restore '{}' v{version}/{} ({lines} lines) -> {}",
             args.file,
-            edits.len(),
+            version_count,
             target.display()
         );
         return Ok(());
@@ -1041,7 +1096,7 @@ fn run_extract(db: &Db, args: &FilesExtractArgs) -> Result<()> {
             &args.file,
             &reconstructed.session_id,
             version,
-            edits.len(),
+            version_count,
             lines,
             &target,
             reconstructed.content.as_bytes(),
@@ -1071,7 +1126,7 @@ fn restored_file_receipt(
 }
 
 fn run_extract_all(db: &Db, args: &FilesExtractArgs) -> Result<()> {
-    let query = args.scope.resolved_query(db)?;
+    let query = args.resolved_query(db)?;
     let versions = crate::service::FileService::new(db).reconstruct_versions(&args.file, &query)?;
 
     if let Some(output_dir) = &args.output_dir {
@@ -1568,6 +1623,8 @@ mod tests {
             edits: edits.into_iter(),
             content: None,
             version: 0,
+            query: FileQuery::default(),
+            yielded: 0,
         }
         .collect::<Vec<_>>();
         assert_eq!(
@@ -1599,6 +1656,8 @@ mod tests {
             edits: edits.into_iter(),
             content: None,
             version: 0,
+            query: FileQuery::default(),
+            yielded: 0,
         }
         .collect::<Vec<_>>();
         assert_eq!(
