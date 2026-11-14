@@ -3711,6 +3711,23 @@ impl<'db> MessageService<'db> {
         self.db.message_context(&session.id, seq, before, after)
     }
 
+    /// Search a chronological timeline, selecting an oldest or newest page before presentation.
+    /// Uses the shared ordered message query; finite pages retain only the selected rows and
+    /// their text, while a zero limit retains every eligible match.
+    pub fn timeline(
+        &self,
+        query: &str,
+        filters: &MessageFilters,
+        order: crate::db::MessageOrder,
+    ) -> Result<Vec<MessageHit>> {
+        self.db.ensure_refreshed_for_read()?;
+        let mut hits = self.db.search_messages_ordered(query, filters, order)?;
+        if order == crate::db::MessageOrder::NewestFirst {
+            hits.reverse();
+        }
+        Ok(hits)
+    }
+
     /// Read one session's messages, selecting the oldest or newest `filters.limit` by `order`,
     /// always returned in chronological (seq-ascending) order. Wraps
     /// [`Db::read_session_messages`]; `filters.session_id` must be set.

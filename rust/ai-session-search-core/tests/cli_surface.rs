@@ -218,3 +218,161 @@ fn analytics_exclusions_remove_the_candidate_population() {
         }
     }
 }
+
+#[test]
+fn deprecated_cli_spellings_keep_the_replacement_output() {
+    let dir = fixture();
+    let aliases = [
+        (vec!["planning"], vec!["slash-commands"]),
+        (
+            vec!["repeats", "needle", "--limit", "2"],
+            vec!["repeats", "needle", "--max-candidates", "2"],
+        ),
+        (
+            vec!["repeats", "needle", "--regex"],
+            vec!["repeats", "needle", "--query-mode", "regex"],
+        ),
+        (
+            vec!["messages", "timeline", "claude:cli-0", "--regex", "needle"],
+            vec![
+                "messages",
+                "timeline",
+                "claude:cli-0",
+                "--grep",
+                "needle",
+                "--query-mode",
+                "regex",
+            ],
+        ),
+        (
+            vec!["files", "cross-ref", "--pattern", "app.rs"],
+            vec!["files", "cross-ref", "app.rs"],
+        ),
+        (
+            vec![
+                "show",
+                "claude:cli-0",
+                "--summary",
+                "--summary-items",
+                "2",
+                "--preview-chars",
+                "40",
+            ],
+            vec![
+                "messages",
+                "evidence",
+                "claude:cli-0",
+                "--summary-items",
+                "2",
+                "--preview-chars",
+                "40",
+            ],
+        ),
+        (
+            vec![
+                "messages",
+                "search",
+                "needle",
+                "--include",
+                "raw_provider_metadata",
+            ],
+            vec!["messages", "search", "needle", "--include", "raw-metadata"],
+        ),
+        (
+            vec!["skills", "corrections", "--limit", "0"],
+            vec!["skills", "corrections", "--all-results"],
+        ),
+    ];
+    for (mut old, mut replacement) in aliases {
+        old.extend(["--format", "json"]);
+        replacement.extend(["--format", "json"]);
+        let old_output = output(&dir, &old);
+        assert_eq!(
+            old_output.stdout,
+            output(&dir, &replacement).stdout,
+            "{old:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&old_output.stderr).contains("deprecated"),
+            "{old:?}"
+        );
+    }
+}
+
+#[test]
+fn cli_read_and_file_output_matches_published_layouts() {
+    let dir = fixture();
+    let commands = [
+        vec!["messages", "get", "claude:cli-0"],
+        vec![
+            "messages",
+            "get",
+            "claude:cli-0",
+            "--seq",
+            "1",
+            "--context",
+            "1",
+        ],
+        vec!["messages", "timeline", "claude:cli-0"],
+        vec![
+            "messages",
+            "timeline",
+            "claude:cli-0",
+            "--grep",
+            "needle",
+            "--order",
+            "newest",
+            "--limit",
+            "1",
+        ],
+        vec!["files", "search", "app.rs"],
+        vec!["files", "cross-ref", "app.rs"],
+        vec![
+            "files",
+            "history",
+            "app.rs",
+            "--session-id",
+            "claude:cli-0",
+            "--limit",
+            "2",
+        ],
+    ];
+    let mut captured = serde_json::Map::new();
+    for command in commands {
+        for format in ["json", "jsonl", "csv", "plain", "table"] {
+            let mut args = command.clone();
+            args.extend(["--format", format]);
+            let mut cmd = support::aise(dir.path());
+            cmd.env("TZ", "UTC")
+                .args(["--index-refresh", "existing-only"])
+                .args(&args);
+            let out = if let Some(program) = std::env::var_os("CLI_SURFACE_BASELINE") {
+                let mut baseline = std::process::Command::new(program);
+                baseline
+                    .env_clear()
+                    .envs(cmd.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))))
+                    .args(cmd.get_args());
+                baseline.output().unwrap()
+            } else {
+                cmd.output().unwrap()
+            };
+            assert!(
+                out.status.success(),
+                "{args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            captured.insert(
+                args.join(" "),
+                Value::String(String::from_utf8(out.stdout).unwrap()),
+            );
+        }
+    }
+    let value = Value::Object(captured);
+    if let Some(path) = std::env::var_os("CLI_SURFACE_RECORD") {
+        std::fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
+    } else {
+        let golden: Value =
+            serde_json::from_str(include_str!("fixtures/cli_surface_output.json")).unwrap();
+        assert_eq!(value, golden);
+    }
+}

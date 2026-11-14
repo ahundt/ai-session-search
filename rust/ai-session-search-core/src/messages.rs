@@ -1018,7 +1018,7 @@ pub(crate) fn run_command(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result
         MessagesCmd::Search(args) => run_search(db, args, config),
         MessagesCmd::Get(args) => {
             let lines_per_message = args.lines_per_message.unwrap_or(cli.lines_per_message);
-            let session = db.resolve_session_record(&args.id)?;
+            let session = CatalogService::new(db).resolve_session(&args.id)?;
             if let Some(seq) = args.seq {
                 if args.role.is_some()
                     || args.kinds.is_some()
@@ -1040,7 +1040,7 @@ pub(crate) fn run_command(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result
                 let context = args.context;
                 let matched_rows: HashSet<(String, i64)> =
                     HashSet::from([(session.id.clone(), seq)]);
-                let rows = db.message_context(
+                let rows = MessageService::new(config, db, SearchSurface::Cli).context_resolved(
                     &session.id,
                     seq,
                     args.context_before.unwrap_or(context),
@@ -1078,7 +1078,8 @@ pub(crate) fn run_command(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result
                 offset: args.offset,
                 ..Default::default()
             };
-            let hits = db.read_session_messages(&filters, args.order.to_message_order())?;
+            let hits = MessageService::new(config, db, SearchSurface::Cli)
+                .read_session(&filters, args.order.to_message_order())?;
             emit_message_hits(&hits, args.refs, args.format, lines_per_message)
         }
         MessagesCmd::Timeline(args) => {
@@ -1093,7 +1094,7 @@ pub(crate) fn run_command(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result
             if args.query_mode.is_some() && args.grep.is_none() && args.regex.is_none() {
                 bail!("--query-mode requires a text filter; pass --grep PATTERN");
             }
-            let session = db.resolve_session_record(&args.id)?;
+            let session = CatalogService::new(db).resolve_session(&args.id)?;
             validate_seq_bounds(args.seq_from, args.seq_to)?;
             let (since, until) = args.dates.resolve_now()?;
             let query = args.regex.as_deref().or(args.grep.as_deref()).unwrap_or("");
@@ -1118,10 +1119,8 @@ pub(crate) fn run_command(db: &Db, cmd: &MessagesCmd, config: &Config) -> Result
             // Order selects which N (oldest vs newest); a newest-first fetch is reversed back to
             // chronological so the timeline always prints oldest→newest.
             let order = args.order.to_message_order();
-            let mut hits = db.search_messages_ordered(query, &filters, order)?;
-            if order == crate::db::MessageOrder::NewestFirst {
-                hits.reverse();
-            }
+            let hits = MessageService::new(config, db, SearchSurface::Cli)
+                .timeline(query, &filters, order)?;
             emit_message_hits(
                 &hits,
                 args.refs,
