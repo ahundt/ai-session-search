@@ -111,6 +111,134 @@ fn upgrade_migrates_published_mcp_registrations_without_installing_skills() {
 }
 
 #[test]
+fn empty_integration_refresh_is_cached_until_the_next_version() {
+    let root = tempfile::tempdir().unwrap();
+    let run = || {
+        let mut command = aise(root.path());
+        for key in include_str!("../harness-environment.txt")
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
+            command.env_remove(key);
+        }
+        let output = command
+            .env("AI_SESSION_SEARCH_HARNESS_HOME", root.path())
+            .args(["dates"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let configs = [
+        (
+            ".codex/config.toml",
+            "[mcp_servers.synthetic]\ncommand = '/synthetic/other'\nargs = ['serve']\n",
+        ),
+        (
+            ".claude.json",
+            r#"{"mcpServers":{"synthetic":{"command":"/synthetic/other","args":["serve"]}}}"#,
+        ),
+        (
+            ".config/opencode/opencode.json",
+            r#"{"mcp":{"ai-session-search":{"command":["/synthetic/other","serve"],"user_setting":true}}}"#,
+        ),
+    ];
+    for (relative, text) in configs {
+        let path = root.path().join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+    assert!(run().stderr.is_empty());
+    let marker = root.path().join("integrations-refreshed-version");
+    assert_eq!(
+        fs::read_to_string(&marker).expect("an empty refresh must record its version"),
+        format!("{}\n", env!("CARGO_PKG_VERSION"))
+    );
+    for (relative, text) in configs {
+        assert_eq!(
+            fs::read_to_string(root.path().join(relative)).unwrap(),
+            text
+        );
+    }
+    assert!(!root.path().join("skill-install-manifest.json").exists());
+    assert!(!root.path().join("skills").exists());
+
+    // A registration added after the completed check is left for the next version.
+    let path = root.path().join(configs[2].0);
+    let recognized = serde_json::json!({"mcp":{"ai-session-search":{"command":[env!("CARGO_BIN_EXE_aise"),"mcp","serve"]}}}).to_string();
+    fs::write(&path, &recognized).unwrap();
+    assert!(run().stderr.is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), recognized);
+    fs::write(&marker, "0.0.0\n").unwrap();
+    run();
+    let after: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        after["mcp"]["servers"]["ai-session-search"]["type"],
+        "local"
+    );
+    assert!(after["mcp"].get("ai-session-search").is_none());
+    assert_eq!(
+        fs::read_to_string(marker).unwrap(),
+        format!("{}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert!(!root.path().join("skill-install-manifest.json").exists());
+}
+
+#[test]
+fn integration_refresh_marker_failure_keeps_mcp_stdout_valid() {
+    let root = tempfile::tempdir().unwrap();
+    let marker = root.path().join("integrations-refreshed-version");
+    fs::create_dir(&marker).unwrap();
+    let mut child = aise(root.path())
+        .args(["mcp", "serve"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for message in [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"synthetic-marker-test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    ] {
+        writeln!(stdin, "{message}").unwrap();
+    }
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let responses: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("stdout must contain only MCP frames"))
+        .collect();
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 1 && response["result"].is_object()));
+    assert!(responses
+        .iter()
+        .any(|response| response["id"] == 2 && response["result"]["tools"].is_array()));
+    assert!(
+        marker.is_dir(),
+        "a failed marker write must not replace the destination"
+    );
+}
+
+#[test]
 fn automatic_mcp_refresh_preserves_unrecognized_duplicates() {
     for case in ["opencode-old", "opencode-current", "claude", "codex"] {
         let root = tempfile::tempdir().unwrap();

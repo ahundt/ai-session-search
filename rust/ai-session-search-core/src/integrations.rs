@@ -4017,6 +4017,9 @@ pub(crate) fn refresh_integrations_after_upgrade(
     config: &IntegrationsConfig,
     harness_home: Option<&Path>,
 ) -> Result<UpgradeRefresh> {
+    if !is_newer_than_refreshed(receipt_path, env!("CARGO_PKG_VERSION")) {
+        return Ok(UpgradeRefresh::NotNeeded);
+    }
     refresh_integrations_for_version(
         receipt_path,
         env!("CARGO_PKG_VERSION"),
@@ -4089,14 +4092,14 @@ fn refresh_integrations_for_version(
         }
         Err(error) => return Err(error),
     };
-    if !has_skill_install && mcp.is_empty() {
-        return Ok(UpgradeRefresh::NotNeeded);
-    }
     // Recorded only after the check completed, so a failure is retried by the next command rather
     // than silenced until the next release; an edited file is an outcome, not a failure, and is
     // reported once. A config directory that cannot hold the marker only costs repeating a check
     // that is safe to repeat, so failing to write it is not reported.
     record_refreshed_version(receipt_path, version);
+    if !has_skill_install && mcp.is_empty() {
+        return Ok(UpgradeRefresh::NotNeeded);
+    }
     Ok(UpgradeRefresh::Checked {
         skills,
         instructions,
@@ -4543,7 +4546,11 @@ fn is_newer_than_refreshed(receipt_path: &Path, version: &str) -> bool {
 fn record_refreshed_version(receipt_path: &Path, version: &str) {
     if is_newer_than_refreshed(receipt_path, version) {
         let marker = crate::skill_manifest::refreshed_version_path(receipt_path);
-        let _ = fs::write(marker, format!("{version}\n"));
+        let _ = crate::durable_fs::atomic_write_file(
+            &marker,
+            format!("{version}\n").as_bytes(),
+            crate::durable_fs::AtomicWriteMode::Replace,
+        );
     }
 }
 
@@ -10387,7 +10394,7 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_with_no_installed_skill_writes_nothing() {
+    fn an_upgrade_with_no_installed_skill_records_only_the_checked_version() {
         let dir = tempdir().unwrap();
         let receipt = default_transaction_receipt(&dir.path().join("config.toml"));
 
@@ -10397,8 +10404,12 @@ mod tests {
         ));
         assert_eq!(
             fs::read_dir(dir.path()).unwrap().count(),
-            0,
-            "a user who never installed integrations gets no files"
+            1,
+            "an empty check creates only its version marker"
+        );
+        assert_eq!(
+            fs::read_to_string(crate::skill_manifest::refreshed_version_path(&receipt)).unwrap(),
+            "9.9.9\n"
         );
     }
 

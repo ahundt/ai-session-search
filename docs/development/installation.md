@@ -305,8 +305,10 @@ workflow.
 Upgrading is one command whichever manager owns `aise`, and nothing else needs rerunning: MCP
 registrations and aliases name the executable path, not its version. The first command after the
 version changes, `aise integrations status` and `aise mcp serve` included, runs a conservative
-refresh once. It rewrites owned skill files that still match what aise recorded, visiting only
-roots in the install manifest, and replaces an aise instruction block in a harness's CLAUDE.md,
+refresh once. An empty check is also recorded beside the install manifest, so later commands
+skip harness discovery until the next version. If that marker cannot be written, commands still
+succeed and retry the check later. It rewrites owned skill files that still match what aise recorded,
+visiting only roots in the install manifest, and replaces an aise instruction block in a harness's CLAUDE.md,
 AGENTS.md, or GEMINI.md in place, as long as that block still holds text some release wrote. An
 edited file or block is left alone and reported on stderr.
 
