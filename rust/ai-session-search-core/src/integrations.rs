@@ -1696,6 +1696,21 @@ fn install_for_layout(
     default_receipt: &Path,
     layout: &ClientLayout,
 ) -> Result<IntegrationInstallOutcome> {
+    let symlinks_available = if args.no_aliases && args.no_skill {
+        true
+    } else {
+        crate::durable_fs::symlinks_available()
+            .context("check Windows symbolic-link capability before integration writes")?
+    };
+    install_for_layout_with_link_capability(args, default_receipt, layout, symlinks_available)
+}
+
+fn install_for_layout_with_link_capability(
+    args: IntegrationInstallArgs,
+    default_receipt: &Path,
+    layout: &ClientLayout,
+    symlinks_available: bool,
+) -> Result<IntegrationInstallOutcome> {
     let (mut targets, instruction_targets, mut skill_targets) =
         args.targets
             .resolve(args.no_instructions, args.no_skill, layout)?;
@@ -1708,7 +1723,23 @@ fn install_for_layout(
         targets.clear();
     }
     let has_mcp_targets = !targets.is_empty();
-    let aliases = if args.no_aliases {
+    // Capability selection precedes alias discovery and every persistent write. Do not copy or
+    // hard-link executables: replacement upgrades would leave aliases running an older binary.
+    if !symlinks_available {
+        if !args.no_aliases {
+            println!("skipped executable aliases aisearch.exe and ai_session_search.exe: Windows symbolic-link privilege is unavailable; use `aise`, or enable Settings > System > Advanced > For developers > Developer Mode and rerun `aise integrations install`");
+        }
+        skill_targets.retain(|target| {
+            if target.discovery_links.is_empty() && target.retired_discovery_links.is_empty() {
+                return true;
+            }
+            for link in &target.discovery_links {
+                println!("skipped skill discovery entry {}: Windows symbolic-link privilege is unavailable; enable Settings > System > Advanced > For developers > Developer Mode and rerun `aise integrations install`", link.display());
+            }
+            false
+        });
+    }
+    let aliases = if args.no_aliases || !symlinks_available {
         None
     } else {
         Some(crate::executable_alias::ExecutableAliases::discover()?)
@@ -7487,6 +7518,46 @@ mod tests {
             assert!(remove_target(&target).unwrap());
             assert_eq!(status_target(&target).unwrap(), "not configured");
         }
+    }
+
+    #[test]
+    fn missing_link_privilege_installs_only_components_that_do_not_need_links() {
+        let dir = tempdir().unwrap();
+        let layout = ClientLayout::new(
+            dir.path().join("home"),
+            dir.path().join("native"),
+            ClientPlatform::Windows,
+        );
+        let receipt = dir.path().join("app/receipt.json");
+        let custom = dir.path().join("custom/ai-session-search");
+        let arguments = vec![
+            "--client".into(),
+            "codex".into(),
+            "--binary".into(),
+            std::env::current_exe().unwrap().into_os_string(),
+            "--skill-root".into(),
+            custom.clone().into_os_string(),
+        ];
+        let mut preview_arguments = arguments.clone();
+        preview_arguments.push("--dry-run".into());
+        let preview = parse_integration_args::<IntegrationInstallArgs>(preview_arguments);
+        install_for_layout_with_link_capability(preview, &receipt, &layout, false).unwrap();
+        assert!(!layout.home.exists());
+        assert!(!receipt.parent().unwrap().exists());
+        assert!(!custom.exists());
+        let args = parse_integration_args::<IntegrationInstallArgs>(arguments);
+        install_for_layout_with_link_capability(args, &receipt, &layout, false).unwrap();
+        assert!(custom.join("SKILL.md").is_file());
+        let manifest =
+            crate::skill_manifest::load_manifest(&crate::skill_manifest::manifest_path(&receipt))
+                .unwrap();
+        assert!(manifest.installation(&custom).is_some());
+        let target = targets_for_layout(McpClient::Codex, &layout).remove(0);
+        assert_eq!(status_target(&target).unwrap(), "configured");
+        assert!(layout.home.join(".codex/AGENTS.md").is_file());
+        assert!(!dir.path().join("app/skills").exists());
+        assert!(!layout.home.join(".agents/skills").exists());
+        assert!(!receipt.exists());
     }
 
     #[test]
