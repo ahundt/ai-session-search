@@ -443,21 +443,30 @@ const CORRECTION_CANDIDATES_PREFIX: &str =
      from messages m
      where m.record_relation = 'original'
        and ";
+/// Source-recorded human authorship, shared by input retrieval and strict prose analytics.
+/// Retrieval additionally admits explicitly unknown input; analytics require this evidence.
+macro_rules! human_authorship_sql {
+    ($alias:literal) => {
+        concat!($alias, ".authorship = 'human'")
+    };
+}
 /// The human-authored clause of [`ATTRIBUTED_HUMAN_INPUT_SQL`], written once for every predicate
 /// that includes it. `human` rows are whole input a person typed: a prompt in a user-started
 /// session, or a queued prompt whose `queued_command` attachment names a human origin. `mixed`
 /// rows qualify through their human parts only.
 macro_rules! attributed_human_input_sql {
     () => {
-        "m.authorship = 'human'
-           or (
+        concat!(
+            human_authorship_sql!("m"),
+            " or (
                m.authorship = 'mixed'
                and exists (
                    select 1
                    from message_content_parts p
-                   where p.message_id = m.id and p.authorship = 'human'
-               )
-           )"
+                   where p.message_id = m.id and ",
+            human_authorship_sql!("p"),
+            "))"
+        )
     };
 }
 /// Queued input whose transcript does not say who typed it: Claude Code versions that wrote a
@@ -471,15 +480,21 @@ macro_rules! unattributed_queued_input_sql {
 }
 /// What corrections, repeats and analysis read: rows with structural evidence that a person
 /// typed them. Callers add `record_relation = 'original'` and [`Db::delivered_copy_exclusion`].
-const ATTRIBUTED_HUMAN_INPUT_SQL: &str = concat!("(", attributed_human_input_sql!(), ")");
+// The authorship envelope is an indexable superset of the disjunction below. Keeping it
+// outside the OR lets SQLite seek provenance indexes rather than scan an ordering index.
+const ATTRIBUTED_HUMAN_INPUT_SQL: &str = concat!(
+    "(m.authorship in ('human','mixed') and (",
+    attributed_human_input_sql!(),
+    "))"
+);
 /// [`ATTRIBUTED_HUMAN_INPUT_SQL`] plus [`UNATTRIBUTED_QUEUED_INPUT_SQL`], for a caller that opted
 /// in to queued input with no recorded sender.
 const ATTRIBUTED_OR_UNATTRIBUTED_INPUT_SQL: &str = concat!(
-    "(",
+    "(m.authorship in ('human','mixed','unknown') and (",
     attributed_human_input_sql!(),
     " or (",
     unattributed_queued_input_sql!(),
-    "))"
+    ")))"
 );
 const UNATTRIBUTED_QUEUED_INPUT_SQL: &str = concat!("(", unattributed_queued_input_sql!(), ")");
 /// Excludes the latest queued copy whose text equals the next direct human input in its session.
@@ -515,18 +530,20 @@ const NOT_DELIVERED_QUEUED_COPY_SQL: &str = "not (
                  )
            )
        )";
-/// The scope a correction run reads: forced to `role = user`, and to user-started sessions when the
-/// caller named no session class.
+/// Human-input analytics select authorship independently of storage role. Explicit non-user
+/// roles still narrow the input population; corrections default to user-started sessions.
 fn correction_scope(filters: &MessageFilters) -> MessageFilters {
     let mut filters = filters.clone();
-    filters.role = Some(Role::User);
+    if filters.role == Some(Role::User) {
+        filters.role = None;
+    }
     // A correction is what a PERSON told the agent. In a subagent transcript the `role='user'`
     // rows are the SPAWNING AGENT's delegation prompt, not anything a human typed, and
     // subagent sessions can far outnumber user-started ones (models.rs SessionKind).
     // Leaving them in lets ordinary orchestrator instructions register as corrections --
     // `\bdon'?t forget\b` matches "don't forget to check the tests" exactly.
     //
-    // Narrowed here, beside the forced role, because both are the same kind of claim about
+    // Narrowed here, beside the input scope, because both are the same kind of claim about
     // what the operation intrinsically means rather than a caller preference.
     // `--session-kinds` can reopen subagent session scope, but it never overrides source
     // authorship: agent delegation prompts remain excluded while genuinely human content in
@@ -5040,7 +5057,11 @@ impl Db {
                and {eligible}",
         );
         let mut args: Vec<Value> = Vec::new();
-        append_stored_role_filters(&mut inner, &mut args, filters, &self.access_scope);
+        let mut filters = filters.clone();
+        if filters.role == Some(Role::User) {
+            filters.role = None;
+        }
+        append_stored_role_filters(&mut inner, &mut args, &filters, &self.access_scope);
         let mut sql = format!("select * from ({inner}) attributable where 1 = 1");
         if !query.is_empty() {
             match filters.match_mode {
@@ -6702,8 +6723,14 @@ fn content_prefilter_pattern(query: &str, match_mode: MessageSearchMode) -> Opti
 /// SQL keeps filtering before paging; models.rs owns the corresponding typed predicates.
 /// The whole_user_input_sql_matches_rust_including_legacy_storage and
 /// user_input_part_sql_matches_rust_case_table tests enforce parity over shared case tables.
-const WHOLE_USER_INPUT_SQL: &str = "(m.authorship='human' or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')) or (m.authorship='unknown' and (m.record_relation='unknown' or (m.record_relation='original' and m.input_origin='unknown')) and coalesce(m.input_origin,'unknown')='unknown' and m.role in ('user','slash')))";
-const USER_INPUT_PART_SQL: &str = "((p.authorship in ('human','unknown') and p.origin='direct_input') or (p.authorship='human' and p.origin in ('quoted_content','unknown')))";
+const WHOLE_USER_INPUT_SQL: &str = concat!(
+    "(", human_authorship_sql!("m"),
+    " or (m.authorship='unknown' and m.input_origin in ('direct_conversation','queued','interactive_answer')) or (m.authorship='unknown' and (m.record_relation='unknown' or (m.record_relation='original' and m.input_origin='unknown')) and coalesce(m.input_origin,'unknown')='unknown' and m.role in ('user','slash')))"
+);
+const USER_INPUT_PART_SQL: &str = concat!(
+    "((", human_authorship_sql!("p"),
+    " and p.origin in ('direct_input','quoted_content','unknown')) or (p.authorship='unknown' and p.origin='direct_input'))"
+);
 
 const MESSAGE_CONTENT_PARTS_JSON: &str = "(select json_group_array(json_object(
     'ordinal',ordinal,'start_char',start_char,'end_char',end_char,
@@ -11079,8 +11106,8 @@ mod tests {
             db.search_attributable_human_messages("answer", &filters, false)
                 .unwrap()
                 .len(),
-            1,
-            "specialized analytics retain their stored-role restriction"
+            3,
+            "human analytics select provenance across storage roles, without legacy unknown input"
         );
         // Statistics still describe stored roles, including an agent-origin user row.
         assert_eq!(
@@ -11208,6 +11235,66 @@ mod tests {
                                 || provenance.is_legacy_user_input(role),
                             "{authorship} {relation} {origin:?} {role:?}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn attributed_input_sql_matches_typed_authorship_across_roles_and_origins() {
+        use crate::models::{MessageAuthorship, MessageProvenance, MessageRecordRelation};
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table message_content_parts(message_id integer, authorship text);",
+        )
+        .unwrap();
+        let mut statement = conn
+            .prepare(&format!(
+                "select coalesce(m.record_relation='original' and {ATTRIBUTED_HUMAN_INPUT_SQL},0)
+             from (select 1 id, ?1 authorship, ?2 record_relation, ?3 input_origin, ?4 role) m"
+            ))
+            .unwrap();
+        for part in ["human", "unknown", "agent", "harness", "generated"] {
+            conn.execute("delete from message_content_parts", [])
+                .unwrap();
+            conn.execute("insert into message_content_parts values(1,?1)", [part])
+                .unwrap();
+            for authorship in ["human", "unknown", "agent", "harness", "generated", "mixed"] {
+                for relation in ["original", "unknown", "mirror"] {
+                    for origin in [
+                        None,
+                        Some("unknown"),
+                        Some("direct_conversation"),
+                        Some("queued"),
+                        Some("interactive_answer"),
+                    ] {
+                        for role in [
+                            Role::User,
+                            Role::Slash,
+                            Role::Assistant,
+                            Role::Tool,
+                            Role::Compaction,
+                        ] {
+                            let source: MessageProvenance = serde_json::from_value(serde_json::json!({
+                                "authorship":authorship, "record_relation":relation, "input_origin":origin, "content_parts":[]
+                            })).unwrap();
+                            let expected = source.record_relation
+                                == MessageRecordRelation::Original
+                                && (source.authorship == MessageAuthorship::Human
+                                    || source.authorship == MessageAuthorship::Mixed
+                                        && part == "human");
+                            let actual: bool = statement
+                                .query_row(
+                                    params![authorship, relation, origin, role.as_str()],
+                                    |r| r.get(0),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                actual, expected,
+                                "{part} {authorship} {relation} {origin:?} {role:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -15580,6 +15667,78 @@ mod tests {
                 !plan.contains("SCAN m"),
                 "analysis must not full-scan messages for one session:\n{plan}"
             );
+        }
+    }
+
+    #[test]
+    fn human_analytics_candidate_plans_stay_indexed_at_100k_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch(
+            "insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+             values('claude:plan','claude','plan','','/synthetic/plan','test','test');
+             with recursive n(i) as (values(0) union all select i+1 from n where i<99999)
+             insert into messages(session_id,provider,seq,role,content,authorship,record_relation,input_origin)
+             select 'claude:plan','claude',i,
+                    case i%3 when 0 then 'user' when 1 then 'tool' else 'slash' end,
+                    'you forgot synthetic tests',
+                    case when i%10=0 then 'human' when i%10=1 then 'mixed' else 'agent' end,
+                    'original',null from n;
+             analyze;"
+        ).unwrap();
+        let exclusion = db.delivered_copy_exclusion().unwrap();
+        for include in [false, true] {
+            for session in [None, Some("claude:plan")] {
+                for before in [true, false] {
+                    for order in [CORRECTION_ORDER_SQL, " order by m.session_id,m.seq,m.id"] {
+                        let eligible = if before {
+                            if include {
+                                format!(
+                                    "({} or ({}))",
+                                    attributed_human_input_sql!(),
+                                    unattributed_queued_input_sql!()
+                                )
+                            } else {
+                                format!("({})", attributed_human_input_sql!())
+                            }
+                        } else {
+                            input_eligibility_sql(include).to_string()
+                        };
+                        let mut sql =
+                            format!("{CORRECTION_CANDIDATES_PREFIX}{exclusion} and {eligible}");
+                        let mut args = Vec::new();
+                        let filters = MessageFilters {
+                            role: before.then_some(Role::User),
+                            session_id: session.map(str::to_string),
+                            ..Default::default()
+                        };
+                        append_stored_role_filters(&mut sql, &mut args, &filters, &db.access_scope);
+                        sql.push_str(order);
+                        let plan = db
+                            .conn
+                            .prepare(&format!("explain query plan {sql}"))
+                            .unwrap()
+                            .query_map(rusqlite::params_from_iter(args.iter()), |r| {
+                                r.get::<_, String>(3)
+                            })
+                            .unwrap()
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .unwrap()
+                            .join("\n");
+                        println!("include={include} session={session:?} before={before} order={order}\n{plan}");
+                        assert!(before || !plan.contains("SCAN m"), "{plan}");
+                        assert!(
+                            plan.contains("idx_messages_session_authorship_relation_seq")
+                                || plan.contains("idx_messages_authorship_relation_ts")
+                                || before
+                                    && (plan.contains("idx_messages_role_ts")
+                                        || plan.contains("idx_messages_session_seq")),
+                            "{plan}"
+                        );
+                        assert!(plan.contains("SEARCH p USING PRIMARY KEY"), "{plan}");
+                    }
+                }
+            }
         }
     }
 
@@ -21348,11 +21507,8 @@ mod tests {
     }
 
     #[test]
-    fn find_corrections_scans_user_rows_and_classifies() {
-        // #224 (revised): corrections scans only `role='user'` rows directly — no trigram prefilter
-        // (see `find_corrections` doc: the role filter is the selective one, the prefilter would
-        // only add cost). Verify it classifies each user row against the ordered patterns and
-        // ignores non-user roles even when their content matches a pattern.
+    fn find_corrections_scans_human_rows_and_classifies() {
+        // Corrections scan original human input directly, without a trigram prefilter.
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         db.conn
@@ -21366,7 +21522,7 @@ mod tests {
             ("user", "you forgot the unit tests again"), // skip_step
             ("user", "we also need integration coverage"), // incomplete
             ("user", "looks great, ship it"),            // no correction
-            ("assistant", "you forgot nothing, here is the fix"), // role=assistant → ignored
+            ("assistant", "you forgot nothing, here is the fix"), // agent output
             ("user", "the deploy hit econnreset once more"), // no correction
         ];
         {
@@ -21376,7 +21532,7 @@ mod tests {
                     .prepare(
                         "insert into messages(
                              session_id, provider, seq, role, content, authorship, record_relation
-                         ) values('claude:s1','claude',?1,?2,?3,'human','original')",
+                         ) values('claude:s1','claude',?1,?2,?3,case when ?2='assistant' then 'agent' else 'human' end,'original')",
                     )
                     .unwrap();
                 for (i, (role, content)) in rows.iter().enumerate() {
@@ -21395,16 +21551,92 @@ mod tests {
         assert_eq!(
             scan.len(),
             2,
-            "exactly the two user corrections, assistant ignored"
+            "exactly the two human corrections, agent output ignored"
         );
         assert!(scan.iter().any(|c| c.category == "skip_step"));
         assert!(scan.iter().any(|c| c.category == "incomplete"));
-        // The assistant row matches the skip_step regex but is role=assistant → must be excluded.
+        // The assistant row matches the regex but has recorded agent authorship.
         assert!(
             !scan
                 .iter()
                 .any(|c| c.content.contains("you forgot nothing")),
-            "assistant-role match excluded by the role='user' filter",
+            "agent-authored match excluded by provenance",
+        );
+    }
+
+    #[test]
+    fn human_analytics_select_original_input_across_storage_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(include_str!("../tests/fixtures/human_analytics.sql"))
+            .unwrap();
+        let policies = test_policies(&[("correction", &[r"\byou forgot\b"])]);
+        for include in [false, true] {
+            let expected = if include {
+                vec![0, 1, 2, 3, 4, 9, 10]
+            } else {
+                vec![0, 1, 2, 3, 9, 10]
+            };
+            for role in [None, Some(Role::User)] {
+                let filters = MessageFilters {
+                    role,
+                    ..Default::default()
+                };
+                let (matches, count) = db
+                    .find_corrections_with_receipt(&policies, &filters, include)
+                    .unwrap();
+                assert_eq!(
+                    matches.iter().map(|m| m.message_seq).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(count, 1);
+                let mixed = matches.iter().find(|m| m.message_seq == 9).unwrap();
+                assert_eq!(
+                    (mixed.match_start_char, mixed.match_end_char_exclusive),
+                    (12, 22)
+                );
+                let hits = db
+                    .search_attributable_human_messages("", &filters, include)
+                    .unwrap();
+                assert_eq!(hits.iter().map(|m| m.seq).collect::<Vec<_>>(), expected);
+                assert_eq!(
+                    hits.iter().find(|m| m.seq == 9).unwrap().content,
+                    "you forgot mixed"
+                );
+            }
+        }
+        let filters = MessageFilters {
+            kinds: Some(vec![crate::models::MessageKind::ToolResult]),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.find_corrections(&policies, &filters)
+                .unwrap()
+                .iter()
+                .map(|m| m.message_seq)
+                .collect::<Vec<_>>(),
+            [1, 9]
+        );
+        assert_eq!(
+            db.search_attributable_human_messages("", &filters, false)
+                .unwrap()
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            [1, 9]
+        );
+        let filters = MessageFilters {
+            role: Some(Role::Tool),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.find_corrections(&policies, &filters)
+                .unwrap()
+                .iter()
+                .map(|m| m.message_seq)
+                .collect::<Vec<_>>(),
+            [1, 9]
         );
     }
 
