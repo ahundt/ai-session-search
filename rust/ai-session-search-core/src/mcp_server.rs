@@ -7059,6 +7059,47 @@ mod tests {
         .is_ok());
     }
 
+    #[test]
+    fn service_read_and_classification_rejections_keep_typed_arguments() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let error = MessageService::new(&config, &db, SearchSurface::Rust)
+            .read_session(
+                &MessageFilters::default(),
+                crate::db::MessageOrder::OldestFirst,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::ServiceError>()
+                .map(crate::ServiceError::code),
+            Some("invalid-argument")
+        );
+        let query = crate::skill_run::SkillRunQuery {
+            skill: crate::skill_catalog::SkillSelector::name("corrections").unwrap(),
+            definition: None,
+            input: crate::skill_run::SkillCapabilityInput::MessageClassification(
+                crate::skill_run::MessageClassificationQuery {
+                    filters: MessageFilters::default(),
+                    additional_skills: vec![crate::skill_catalog::SkillSelector::name(
+                        "corrections",
+                    )
+                    .unwrap()],
+                    include_unattributed_input: false,
+                },
+            ),
+        };
+        let error = crate::service::AnalysisService::new(&config, &db)
+            .run_skill(&query)
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<crate::ServiceError>()
+                .map(crate::ServiceError::code),
+            Some("invalid-argument")
+        );
+    }
+
     fn fixture() -> (tempfile::TempDir, Db) {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
