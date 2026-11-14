@@ -9,7 +9,7 @@ import shutil
 import sqlite3
 import subprocess
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pytest
@@ -150,7 +150,7 @@ def test_resume_command_and_transcript_use_catalog(corpus):
 
 def test_sql_and_vocabulary_enforce_access_scope(corpus, tmp_path: Path):
     config = tmp_path / "scoped.toml"
-    config.write_text('[search.scope]\nmode = "allowed-roots"\nroots = ["/synthetic/project"]\n')
+    config.write_text(f'[search.scope]\nmode = "allowed-roots"\nroots = [{json.dumps(str(tmp_path))}]\n')
     scoped = aise.SessionSearch(corpus.db_path, config_path=config)
     with pytest.raises(RuntimeError, match="allowed-roots"):
         scoped.query_sql("select * from sessions")
@@ -300,20 +300,27 @@ def test_message_ranges_can_include_harness_notices(corpus):
     assert corpus.message_context("synthetic-0", 3)[0].kind == "harness_notice"
 
 
+def test_native_workspace_path_input(corpus, tmp_path: Path):
+    with sqlite3.connect(corpus.db_path) as db:
+        db.execute("UPDATE sessions SET cwd = ?", (str(tmp_path),))
+    assert corpus.list_sessions(aise.SessionQuery(path_prefix=tmp_path))
+    assert aise.QueryScope(path_prefix=tmp_path).path_prefix == str(tmp_path)
+
+
 def test_standard_dates_and_paths_are_native_inputs(corpus):
     from datetime import date, datetime
 
     assert aise.DateRange(when=date(2026, 1, 15)) == aise.DateRange(when="2026-01-15")
     instant = datetime(2026, 1, 15, 12, tzinfo=UTC)
     assert aise.DateRange(since=instant) == aise.DateRange(since=instant.isoformat())
-    assert corpus.list_sessions(aise.SessionQuery(path_prefix=Path("/synthetic")))
-    assert corpus.search_messages("forgot", aise.MessageSearchRequest(path_prefix=Path("/synthetic"), dates=aise.DateRange(when=date(2026, 1, 15)))).results
-    assert aise.QueryScope(path_prefix=Path("/synthetic")) == aise.QueryScope(path_prefix="/synthetic")
-    assert aise.MessageScope(workspace_path_prefix=Path("/synthetic")) == aise.MessageScope(workspace_path_prefix="/synthetic")
-    assert aise.QueryExclusions(path_prefixes=[Path("/excluded")]).path_prefixes == ["/excluded"]
-    assert aise.MessageExclusions(transcript_path_prefixes=[Path("/excluded")]).transcript_path_prefixes == ["/excluded"]
+    assert corpus.list_sessions(aise.SessionQuery(path_prefix=PurePosixPath("/synthetic")))
+    assert corpus.search_messages("forgot", aise.MessageSearchRequest(path_prefix=PurePosixPath("/synthetic"), dates=aise.DateRange(when=date(2026, 1, 15)))).results
+    assert aise.QueryScope(path_prefix=PurePosixPath("/synthetic")) == aise.QueryScope(path_prefix="/synthetic")
+    assert aise.MessageScope(workspace_path_prefix=PurePosixPath("/synthetic")) == aise.MessageScope(workspace_path_prefix="/synthetic")
+    assert aise.QueryExclusions(path_prefixes=[PurePosixPath("/excluded")]).path_prefixes == ["/excluded"]
+    assert aise.MessageExclusions(transcript_path_prefixes=[PurePosixPath("/excluded")]).transcript_path_prefixes == ["/excluded"]
     assert corpus.file_history(Path("app.py"))
-    recovered = corpus.reconstruct_file(Path("app.py"), request=aise.FileQuery(session_id="synthetic-0", path_prefix=Path("/synthetic")))
+    recovered = corpus.reconstruct_file(Path("app.py"), request=aise.FileQuery(session_id="synthetic-0", path_prefix=PurePosixPath("/synthetic")))
     assert recovered.content == "print(42)"
     with pytest.raises(TypeError):
         aise.DateRange(since=object())  # type: ignore[arg-type]
