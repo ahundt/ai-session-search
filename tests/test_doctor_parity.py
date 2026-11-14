@@ -51,6 +51,14 @@ def test_doctor_python_and_mcp_only_omit_cli_config_file_fields(tmp_path: Path) 
             return [keys(v) for v in value]
         return None
     assert keys(python) == keys(cli)
+    mcp = mcp_status(command, env)
+    snapshot = mcp["readiness"].pop("snapshot")
+    snapshot["snapshot_availability"] = snapshot.pop("availability")
+    mcp["readiness"].update(snapshot)
+    assert keys(mcp) == keys(cli)
+
+
+def mcp_status(command: list[str], env: dict[str, str]) -> dict[str, Any]:
     requests = [
         {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "synthetic", "version": "1"}}},
         {"jsonrpc": "2.0", "method": "notifications/initialized"},
@@ -59,8 +67,39 @@ def test_doctor_python_and_mcp_only_omit_cli_config_file_fields(tmp_path: Path) 
     result = subprocess.run([*command, "mcp", "serve"], env=env, text=True, capture_output=True,
                             input="".join(json.dumps(r) + "\n" for r in requests), check=True, timeout=30)
     response = next(json.loads(line) for line in result.stdout.splitlines() if json.loads(line).get("id") == 2)
-    mcp = response["result"]["structuredContent"]
-    snapshot = mcp["readiness"].pop("snapshot")
-    snapshot["snapshot_availability"] = snapshot.pop("availability")
-    mcp["readiness"].update(snapshot)
-    assert keys(mcp) == keys(cli)
+    status: dict[str, Any] = response["result"]["structuredContent"]
+    return status
+
+
+def test_gemini_family_is_represented_in_python_cli_and_mcp_health(tmp_path: Path) -> None:
+    root = tmp_path / "gemini"
+    chats = root / "synthetic-project" / "chats"
+    chats.mkdir(parents=True)
+    message = {"id": "u1", "type": "user", "content": "synthetic input", "timestamp": "2026-01-01T00:00:00Z"}
+    (chats / "session-family.json").write_text(json.dumps({
+        "sessionId": "family", "messages": [message, {
+            "id": "a1", "type": "gemini", "content": "predecessor-only", "timestamp": "2026-01-01T00:00:01Z",
+        }],
+    }))
+    (chats / "session-family.jsonl").write_text(
+        json.dumps({"sessionId": "family"}) + "\n" + json.dumps(message) + "\n")
+    config = tmp_path / "config.toml"
+    config.write_text("[providers.gemini-cli]\nenabled=true\npaths=[" + json.dumps(str(root)) + "]\n")
+    database = tmp_path / "index.db"
+    with aise.SessionSearch(database, config_path=config) as search:
+        search.reindex()
+        status = search.doctor()
+        assert status.index_status.unindexed_files == 0
+        gemini = next(p for p in status.providers if p.provider == "gemini-cli")
+        assert (gemini.discovered_files, gemini.indexed_sessions, gemini.unindexed_files) == (2, 1, 0)
+        assert len(search.search_messages("predecessor-only").results) == 1
+    command = [sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+               "--config", str(config), "--index-refresh", "existing-only"]
+    env = dict(os.environ, AI_SESSION_SEARCH_DATABASE=str(database))
+    cli = json.loads(subprocess.check_output(
+        [*command, "doctor", "--explain-unindexed", "--format", "json"], env=env, text=True))
+    assert cli["unindexed_file_explanations"] == []
+    for report in [cli, mcp_status(command, env)]:
+        assert report["unindexed_files"] == 0
+        provider = next(p for p in report["providers"] if p["provider"] == "gemini-cli")
+        assert (provider["discovered_files"], provider["indexed_sessions"], provider["unindexed_files"]) == (2, 1, 0)

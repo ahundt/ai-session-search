@@ -62,7 +62,7 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
                     .copied()
                     .unwrap_or_default(),
                 unavailable_stale_sessions: 0,
-                // Discovered files for THIS provider that produced no session row. Reported
+                // Discovered files for THIS provider not represented in the index. Reported
                 // beside discovered_files/indexed_sessions so a reader is not left to infer a
                 // relationship between two counters that come from different subsystems.
                 unindexed_files: inventory
@@ -115,7 +115,7 @@ fn index_status_for_discovered(
     ))
 }
 
-/// One discovered file that produced no session row, and why.
+/// One discovered file not represented in the index, and why.
 #[derive(Debug, Clone, serde::Serialize)]
 #[non_exhaustive]
 pub struct UnindexedFile {
@@ -172,14 +172,21 @@ pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>>
     Ok(explained)
 }
 
-/// The (provider, source_path) pairs that produced at least one session row. Paired with the
-/// discovered set, the difference is the set of files that are on disk but absent from the index.
+/// Source paths represented by canonical sessions or unambiguous persisted Gemini families.
+/// Processing receipts alone do not prove representation. The family lookup adds one metadata
+/// scan over Gemini sessions, O(G) rows plus their metadata bytes; transcripts are never read.
 fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {
-    Ok(db
+    let mut indexed: HashSet<_> = db
         .indexed_source_identities()?
         .into_iter()
         .map(|source| (source.provider, source.source_path))
-        .collect())
+        .collect();
+    indexed.extend(
+        db.gemini_family_sessions_by_path()?
+            .into_keys()
+            .map(|path| (Provider::GeminiCli, path)),
+    );
+    Ok(indexed)
 }
 
 fn classify_index_status(
@@ -289,6 +296,197 @@ mod tests {
                     Err(_) => assert!(health.resume_command.is_none(), "{provider}"),
                 }
             });
+        }
+    }
+
+    #[test]
+    fn indexed_sources_include_only_unambiguous_persisted_family_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let predecessor = normalize_path(&dir.path().join("session-family.json"));
+        let successor = normalize_path(&dir.path().join("session-family.jsonl"));
+        let mut parsed = crate::util::minimal_record(
+            Provider::GeminiCli,
+            std::path::Path::new(&successor),
+            String::new(),
+        );
+        parsed.session.id = "gemini-cli:family".into();
+        parsed.session.provider_session_id = "family".into();
+        parsed.session.raw_metadata_json = Some(
+            serde_json::json!({
+                "gemini_migration_family": {
+                    "native_session_id": "family",
+                    "predecessor_json": predecessor,
+                    "successor_jsonl": successor
+                }
+            })
+            .to_string(),
+        );
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let discovered = HashSet::from([
+            (Provider::GeminiCli, predecessor.clone()),
+            (Provider::GeminiCli, successor.clone()),
+        ]);
+        assert_eq!(
+            index_status_for_discovered(&db, &discovered)
+                .unwrap()
+                .unindexed_files,
+            0
+        );
+        // Contradictory persisted claims cannot prove the predecessor is represented.
+        for index in 0..2 {
+            parsed.session.id = format!("gemini-cli:conflict-{index}");
+            parsed.session.provider_session_id = format!("conflict-{index}");
+            parsed.session.source_path =
+                normalize_path(&dir.path().join(format!("other-{index}.jsonl")));
+            let mut metadata: serde_json::Value =
+                serde_json::from_str(parsed.session.raw_metadata_json.as_ref().unwrap()).unwrap();
+            metadata["gemini_migration_family"]["native_session_id"] =
+                serde_json::json!(format!("conflict-{index}"));
+            metadata["gemini_migration_family"]["successor_jsonl"] =
+                serde_json::json!(parsed.session.source_path);
+            parsed.session.raw_metadata_json = Some(metadata.to_string());
+            db.upsert_session(&parsed, 0, 0).unwrap();
+            assert_eq!(
+                index_status_for_discovered(&db, &discovered)
+                    .unwrap()
+                    .unindexed_files,
+                1
+            );
+        }
+    }
+
+    fn assert_represented(config: &Config, db: &Db, provider: Provider, discovered: usize) {
+        let status = collect(config, db).unwrap();
+        assert_eq!(status.index_status.unindexed_files, 0);
+        let health = status
+            .providers
+            .iter()
+            .find(|item| item.provider == provider)
+            .unwrap();
+        assert_eq!(health.discovered_files, discovered);
+        assert_eq!(health.unindexed_files, 0);
+        assert!(explain_unindexed(config, db).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gemini_family_counts_and_explanations_use_persisted_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(dir.path());
+        let root = dir.path().join("gemini");
+        let chats = root.join("synthetic-project").join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        let predecessor = chats.join("session-family.json");
+        let successor = chats.join("session-family.jsonl");
+        std::fs::write(&predecessor, r#"{"sessionId":"family","messages":[{"id":"u1","type":"user","content":"synthetic input","timestamp":"2026-01-01T00:00:00Z"},{"id":"a1","type":"gemini","content":"predecessor-only","timestamp":"2026-01-01T00:00:01Z"}]}"#).unwrap();
+        std::fs::write(&successor, concat!(
+            r#"{"sessionId":"family"}"#, "\n",
+            r#"{"id":"u1","type":"user","content":"synthetic input","timestamp":"2026-01-01T00:00:00Z"}"#, "\n",
+            r#"{"id":"a2","type":"gemini","content":"successor-only","timestamp":"2026-01-01T00:00:02Z"}"#, "\n"
+        )).unwrap();
+        config.providers.gemini_cli.enabled = true;
+        config.providers.gemini_cli.paths = vec![normalize_path(&root)];
+        let db = Db::open(&config.db_path()).unwrap();
+        crate::indexer::reindex(&config, &db, false, None).unwrap();
+        assert_eq!(db.indexed_source_identities().unwrap().len(), 1);
+        assert_eq!(
+            db.search_messages("predecessor-only", &Default::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_represented(&config, &db, Provider::GeminiCli, 2);
+        // Representation is persisted evidence, not a reparse or a filesystem pairing guess.
+        std::fs::write(&predecessor, "not valid JSON").unwrap();
+        std::fs::write(&successor, "not valid JSONL").unwrap();
+        assert_represented(&config, &db, Provider::GeminiCli, 2);
+    }
+
+    #[test]
+    fn codex_plain_and_compressed_siblings_do_not_inflate_doctor_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(dir.path());
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let plain = root.join("rollout-11111111-2222-4333-8444-555555555555.jsonl");
+        let bytes = concat!(
+            r#"{"type":"session_meta","payload":{"id":"11111111-2222-4333-8444-555555555555","cwd":"/synthetic"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"synthetic input"}]}}"#,
+            "\n"
+        );
+        std::fs::write(&plain, bytes).unwrap();
+        std::fs::write(
+            plain.with_extension("jsonl.zst"),
+            zstd::encode_all(bytes.as_bytes(), 1).unwrap(),
+        )
+        .unwrap();
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![normalize_path(&root)];
+        let db = Db::open(&config.db_path()).unwrap();
+        crate::indexer::reindex(&config, &db, false, None).unwrap();
+        assert_represented(&config, &db, Provider::Codex, 1);
+        // The compressed rendering becomes the canonical source once the plain one is gone.
+        std::fs::rename(&plain, plain.with_extension("saved")).unwrap();
+        crate::indexer::reindex(&config, &db, false, None).unwrap();
+        assert_represented(&config, &db, Provider::Codex, 1);
+        assert!(db.indexed_source_identities().unwrap()[0]
+            .source_path
+            .ends_with(".jsonl.zst"));
+    }
+
+    #[test]
+    fn claude_sidecars_and_renamed_sources_do_not_inflate_doctor_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(dir.path());
+        let root = dir.path().join("claude");
+        let runs = root.join("synthetic-parent").join("subagents");
+        std::fs::create_dir_all(&runs).unwrap();
+        let path = runs.join("agent-synthetic.jsonl");
+        std::fs::write(&path, concat!(
+            r#"{"type":"user","sessionId":"synthetic-parent","isSidechain":true,"agentId":"synthetic","message":{"role":"user","content":"synthetic input"}}"#, "\n"
+        )).unwrap();
+        std::fs::write(
+            path.with_extension("meta.json"),
+            r#"{"agentType":"synthetic"}"#,
+        )
+        .unwrap();
+        config.providers.claude.enabled = true;
+        config.providers.claude.paths = vec![normalize_path(&root)];
+        let db = Db::open(&config.db_path()).unwrap();
+        crate::indexer::reindex(&config, &db, false, None).unwrap();
+        assert_represented(&config, &db, Provider::Claude, 1);
+        let renamed = runs.join("agent-renamed.jsonl");
+        std::fs::rename(&path, &renamed).unwrap();
+        crate::indexer::reindex(&config, &db, false, None).unwrap();
+        assert_represented(&config, &db, Provider::Claude, 1);
+        assert!(indexed_source_set(&db).unwrap().contains(&(
+            Provider::Claude,
+            normalize_path(&renamed.canonicalize().unwrap())
+        )));
+    }
+
+    #[test]
+    fn collision_receipts_alone_do_not_prove_source_representation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = isolated_config(dir.path());
+        let root = dir.path().join("claude");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in ["first", "second"] {
+            std::fs::write(root.join(format!("{name}.jsonl")), concat!(
+                r#"{"type":"user","sessionId":"collision","message":{"role":"user","content":"synthetic input"}}"#, "\n"
+            )).unwrap();
+        }
+        config.providers.claude.enabled = true;
+        config.providers.claude.paths = vec![normalize_path(&root)];
+        let db = Db::open(&config.db_path()).unwrap();
+        for _ in 0..2 {
+            crate::indexer::reindex(&config, &db, false, None).unwrap();
+            assert_eq!(
+                collect(&config, &db).unwrap().index_status.unindexed_files,
+                1
+            );
+            assert_eq!(explain_unindexed(&config, &db).unwrap().len(), 1);
         }
     }
 
