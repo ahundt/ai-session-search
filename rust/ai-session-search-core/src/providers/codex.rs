@@ -195,7 +195,7 @@ impl CodexAdapter {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
         let mut valid_record_count: usize = 0;
-        let mut unrecognized = super::health::UnrecognizedRecordTypes::default();
+        let mut unrecognized = super::health::UnrecognizedRecordTypes::for_context(context);
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
@@ -239,6 +239,7 @@ impl CodexAdapter {
 
         for line in crate::util::lines_with_byte_offsets(reader) {
             let (byte_offset, line) = line?;
+            unrecognized.record(context, byte_offset);
             let is_new = context.is_none_or(|c| byte_offset >= c.new_bytes_start);
             line_count += 1;
             if line.trim().is_empty() {

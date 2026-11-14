@@ -9,15 +9,43 @@ pub(crate) const UNRECOGNIZED_RECORD_TYPES_KEY: &str = "unrecognized_record_type
 
 /// Names only, never payload text. Retains 16 names of at most 64 characters plus one
 /// overflow bucket, matching the original Claude inventory bound.
-#[derive(Default)]
 pub(crate) struct UnrecognizedRecordTypes {
     pub(crate) counts: std::collections::BTreeMap<String, usize>,
+    count_record: bool,
+}
+
+impl Default for UnrecognizedRecordTypes {
+    fn default() -> Self {
+        Self {
+            counts: Default::default(),
+            count_record: true,
+        }
+    }
 }
 
 impl UnrecognizedRecordTypes {
     const MAX_TYPES: usize = 16;
     const MAX_NAME_CHARS: usize = 64;
     const OVERFLOW: &'static str = "(other types)";
+
+    pub(crate) fn for_context(context: Option<crate::tail::TailContext<'_>>) -> Self {
+        let counts = context
+            .filter(|context| context.new_bytes_start != usize::MAX)
+            .and_then(|context| context.health_seed)
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|metadata| metadata.get(UNRECOGNIZED_RECORD_TYPES_KEY).cloned())
+            .and_then(|inventory| serde_json::from_value(inventory).ok())
+            .unwrap_or_default();
+        Self {
+            counts,
+            count_record: true,
+        }
+    }
+
+    /// All diagnostics produced by one physical record share its byte-boundary decision.
+    pub(crate) fn record(&mut self, context: Option<crate::tail::TailContext<'_>>, offset: usize) {
+        self.count_record = context.is_none_or(|context| offset >= context.new_bytes_start);
+    }
 
     pub(crate) fn count(&mut self, record_type: Option<&str>) {
         self.count_in("", record_type);
@@ -28,6 +56,9 @@ impl UnrecognizedRecordTypes {
     }
 
     fn add(&mut self, scope: &str, record_type: Option<&str>, count: usize) {
+        if !self.count_record {
+            return;
+        }
         let name: String = scope
             .chars()
             .chain(record_type.unwrap_or("(no type)").chars())
@@ -237,9 +268,6 @@ impl UnrecognizedRecordTypes {
     pub(crate) fn publish(&self, metadata: &mut Value) {
         if !self.counts.is_empty() {
             metadata[UNRECOGNIZED_RECORD_TYPES_KEY] = json!(self.counts);
-            // The append-only persistence path cannot merge overlap health counts. Reparse
-            // conservatively when an unfamiliar record occurs in overlap or appended bytes.
-            metadata["requires_full_parse_for_tail"] = json!(true);
         }
     }
 
