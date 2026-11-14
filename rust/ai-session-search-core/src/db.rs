@@ -610,6 +610,12 @@ const CODEX_FORK_PARENT_INDEX_SQL: &str =
          (case when json_valid(raw_metadata_json)
           then 'codex:' || json_extract(raw_metadata_json, '$.forked_from_id') end) is not null;";
 
+const PI_FORK_PARENT_INDEX_SQL: &str =
+    "create index if not exists idx_sessions_pi_fork_parent on sessions(
+        case when json_valid(raw_metadata_json)
+            then provider || ':' || json_extract(raw_metadata_json, '$.forked_from_id') end
+     ) where provider in ('pi', 'prime-agent');";
+
 const MESSAGE_INPUT_INDEXES_SQL: &str =
     "create index if not exists idx_messages_session_authorship_relation_seq
                  on messages(session_id, authorship, record_relation, seq, input_origin);
@@ -1036,6 +1042,16 @@ impl Db {
             if !installed {
                 db.with_open_writer_permit(path, || db.with_immediate_transaction(|| {
                     db.conn.execute_batch(CODEX_FORK_PARENT_INDEX_SQL)?;
+                    Ok(())
+                }))?;
+            }
+            let has_pi_forks: bool = db.conn.query_row(
+                "select exists(select 1 from sqlite_schema where name='idx_sessions_pi_fork_parent')",
+                [], |row| row.get(0),
+            )?;
+            if !has_pi_forks {
+                db.with_open_writer_permit(path, || db.with_immediate_transaction(|| {
+                    db.conn.execute_batch(PI_FORK_PARENT_INDEX_SQL)?;
                     Ok(())
                 }))?;
             }
@@ -1688,6 +1704,7 @@ impl Db {
         )?;
         self.conn.execute_batch(MESSAGE_INPUT_INDEXES_SQL)?;
         self.conn.execute_batch(CODEX_FORK_PARENT_INDEX_SQL)?;
+        self.conn.execute_batch(PI_FORK_PARENT_INDEX_SQL)?;
         // `sessions_fts` (an FTS5 copy of every title, summary, preview, and transcript) stopped
         // being read on 2026-07-22, when session search moved to scoring the complete corpus, and
         // stayed maintained, duplicating transcript storage and tokenization. This
@@ -7851,20 +7868,23 @@ fn stored_message_content_parts(
 }
 
 fn codex_fork_parent(session: &SessionRecord) -> Option<String> {
-    (session.provider == Provider::Codex)
-        .then(|| {
-            session
-                .raw_metadata_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        })
-        .flatten()
-        .and_then(|metadata| {
-            metadata["forked_from_id"]
-                .as_str()
-                .map(|id| format!("codex:{id}"))
-        })
-        .filter(|id| id != &session.id)
+    matches!(
+        session.provider,
+        Provider::Codex | Provider::Pi | Provider::PrimeAgent
+    )
+    .then(|| {
+        session
+            .raw_metadata_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+    })
+    .flatten()
+    .and_then(|metadata| {
+        metadata["forked_from_id"]
+            .as_str()
+            .map(|id| format!("{}:{id}", session.provider.as_str()))
+    })
+    .filter(|id| id != &session.id)
 }
 
 /// Bring a session's file-edit rows in line with a full parse, under the same unchanged,
@@ -7875,7 +7895,7 @@ fn codex_fork_parent(session: &SessionRecord) -> Option<String> {
 /// seqs are an order within the session, independent of message seqs, so renumbering moves no
 /// message reference. Returns whether edits changed.
 /// O((stored + parsed) log(stored + parsed)) time, O(stored + parsed) memory,
-/// plus the indexed ancestry lookup below for Codex replays.
+/// plus the indexed ancestry lookup below for Codex and Pi-family replays.
 fn store_parsed_file_edits(
     tx: &rusqlite::Transaction<'_>,
     parsed: &ParsedSession,
@@ -7901,8 +7921,8 @@ fn store_parsed_file_edits(
             .query_row(
                 "select case when json_valid(raw_metadata_json) then
                     case when json_type(raw_metadata_json, '$.forked_from_id') = 'text'
-                    then 'codex:' || json_extract(raw_metadata_json, '$.forked_from_id') end
-                 end from sessions where id = ?1 and provider = 'codex'",
+                    then provider || ':' || json_extract(raw_metadata_json, '$.forked_from_id') end
+                 end from sessions where id = ?1 and provider in ('codex', 'pi', 'prime-agent')",
                 [&id],
                 |row| row.get::<_, Option<String>>(0),
             )
@@ -7910,7 +7930,10 @@ fn store_parsed_file_edits(
             .flatten();
     }
     for edit in &parsed.retracted.file_edits {
-        if session.provider == Provider::Codex {
+        if matches!(
+            session.provider,
+            Provider::Codex | Provider::Pi | Provider::PrimeAgent
+        ) {
             let count = parent_edits
                 .entry(parsed_file_edit_keys(edit)?.edit)
                 .or_default();
@@ -8067,6 +8090,25 @@ select p.tool, p.file_path, p.new_content, p.edits_json from ancestry a
 cross join file_edits p indexed by idx_file_edits_session
 where p.session_id = a.id";
 
+const PI_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f.size_bytes
+     from sessions s join files_seen f on f.provider = s.provider and f.source_path = s.source_path
+     where s.provider in ('pi', 'prime-agent') and
+         (case when json_valid(s.raw_metadata_json)
+          then s.provider || ':' || json_extract(s.raw_metadata_json, '$.forked_from_id') end) = ?1";
+
+const PI_FORK_PUBLISHER_EDITS_SQL: &str = "with recursive ancestry(id) as (
+    select ?1
+    union
+    select s.provider || ':' || json_extract(s.raw_metadata_json, '$.forked_from_id')
+    from ancestry a join sessions s on s.id = a.id
+    where s.provider in ('pi', 'prime-agent') and
+        case when json_valid(s.raw_metadata_json)
+        then json_type(s.raw_metadata_json, '$.forked_from_id') = 'text' else 0 end
+)
+select p.tool, p.file_path, p.new_content, p.edits_json from ancestry a
+cross join file_edits p indexed by idx_file_edits_session
+where p.session_id = a.id";
+
 pub(crate) const CODEX_FORK_CHILD_EDITS_SQL: &str =
     "select tool, file_path, new_content, edits_json
      from file_edits indexed by idx_file_edits_session where session_id = ?1";
@@ -8080,7 +8122,7 @@ fn fork_probe_edit_key(row: &rusqlite::Row<'_>) -> Result<RowDigest> {
     ))
 }
 
-/// Reconcile indexed descendants before publishing changed Codex edits. For S sessions and R
+/// Reconcile indexed descendants before publishing changed Codex or Pi-family edits. For S sessions and R
 /// receipts, each parent lookup costs O(log S + K(log S + log R)) for K children, retaining
 /// O(K) paths plus O(D) visited identities for D reachable descendants. A no-fork publication
 /// visits no unrelated session metadata or source receipts.
@@ -8094,16 +8136,23 @@ fn fork_probe_edit_key(row: &rusqlite::Row<'_>) -> Result<RowDigest> {
 /// and reads its ancestry (bounded by chain depth, stopping at cycles). Memory adds one parsed
 /// fork, its stored/parsed keys and ancestor keys, plus visited ancestor identities and the
 /// largest stored edit body.
-/// This work extends the writer transaction; non-Codex publications skip it.
+/// This work extends the writer transaction; providers without copied fork entries skip it.
 fn reconcile_codex_fork_edits(
     tx: &Transaction<'_>,
     session: &SessionRecord,
     new_edits: Option<&[FileEdit]>,
 ) -> Result<()> {
-    if session.provider != Provider::Codex {
+    if !matches!(
+        session.provider,
+        Provider::Codex | Provider::Pi | Provider::PrimeAgent
+    ) {
         return Ok(());
     }
-    let mut statement = tx.prepare_cached(CODEX_FORK_CHILDREN_SQL)?;
+    let mut statement = tx.prepare_cached(if session.provider == Provider::Codex {
+        CODEX_FORK_CHILDREN_SQL
+    } else {
+        PI_FORK_CHILDREN_SQL
+    })?;
     if !statement.exists([&session.id])? {
         return Ok(());
     }
@@ -8113,7 +8162,11 @@ fn reconcile_codex_fork_edits(
             publisher_keys.insert(parsed_file_edit_keys(edit)?.edit);
         }
     } else {
-        let mut publisher = tx.prepare_cached(CODEX_FORK_PUBLISHER_EDITS_SQL)?;
+        let mut publisher = tx.prepare_cached(if session.provider == Provider::Codex {
+            CODEX_FORK_PUBLISHER_EDITS_SQL
+        } else {
+            PI_FORK_PUBLISHER_EDITS_SQL
+        })?;
         let mut rows = publisher.query([&session.id])?;
         while let Some(row) = rows.next()? {
             publisher_keys.insert(fork_probe_edit_key(row)?);
@@ -8132,7 +8185,7 @@ fn reconcile_codex_fork_edits(
                 Ok((
                     row.get::<_, String>(0)?,
                     SourceFile {
-                        provider: Provider::Codex,
+                        provider: session.provider,
                         path: std::path::PathBuf::from(row.get::<_, String>(1)?),
                         mtime_ns: row.get(2)?,
                         size_bytes: row.get(3)?,
@@ -8178,9 +8231,17 @@ fn reconcile_codex_fork_edits(
                     return None;
                 }
                 let reader = crate::source::open_source_reader(&source.path).ok()?;
-                let parsed = adapter
-                    .parse_reader(std::io::BufReader::new(reader), &source.path)
-                    .ok()?;
+                let reader = std::io::BufReader::new(reader);
+                let parsed = match session.provider {
+                    Provider::Pi => crate::providers::pi::PiAdapter::new(Vec::new())
+                        .parse_reader(reader, &source.path),
+                    Provider::PrimeAgent => {
+                        crate::providers::pi::PiAdapter::prime_agent(Vec::new())
+                            .parse_reader(reader, &source.path)
+                    }
+                    _ => adapter.parse_reader(reader, &source.path),
+                }
+                .ok()?;
                 #[cfg(test)]
                 CODEX_FORK_AFTER_READ.with(|hook| {
                     if let Some(after_read) = hook.take() {
@@ -8196,8 +8257,11 @@ fn reconcile_codex_fork_edits(
                 // Keep the archive and retry even if the source returns with an identical stamp.
                 tx.execute(
                     "update files_seen set parse_version = '', tail_byte_offset = null,
-                        prefix_fingerprint = null where provider = 'codex' and source_path = ?1",
-                    params![crate::util::normalize_path(&source.path)],
+                        prefix_fingerprint = null where provider = ?2 and source_path = ?1",
+                    params![
+                        crate::util::normalize_path(&source.path),
+                        session.provider.as_str()
+                    ],
                 )?;
                 continue;
             };
@@ -9564,6 +9628,37 @@ mod tests {
                 "{plan:?}"
             );
         }
+    }
+
+    #[test]
+    fn pi_fork_lookup_is_indexed_and_upgrades_on_writable_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let db = Db::open(&path).unwrap();
+        let mut statement = db
+            .conn
+            .prepare(&format!("explain query plan {PI_FORK_CHILDREN_SQL}"))
+            .unwrap();
+        let plans = statement
+            .query_map(["pi:parent"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plans
+                .iter()
+                .any(|line| line.contains("SEARCH s USING INDEX idx_sessions_pi_fork_parent")),
+            "{plans:?}"
+        );
+        drop(statement);
+        db.conn
+            .execute_batch("drop index idx_sessions_pi_fork_parent")
+            .unwrap();
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        assert!(db.conn.query_row(
+            "select exists(select 1 from sqlite_schema where name='idx_sessions_pi_fork_parent')",
+            [], |r| r.get::<_, bool>(0)).unwrap());
     }
 
     #[test]
