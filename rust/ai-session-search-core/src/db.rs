@@ -6522,7 +6522,7 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 /// query whose rows expose `session_id` as `id_col` (e.g. `m.session_id` or a bare `session_id`).
 /// The `sessions` table is tiny relative to messages/file edits, so a subquery is cheap and needs
 /// no dedicated index. Mirrors the session-level `path_prefix` semantics in `list_recent`/`search`
-/// (exact directory or a child path, with LIKE metacharacters escaped) so `--path` behaves
+/// (exact directory or a component-boundary child, with literal path characters) so `--path` behaves
 /// identically across session, message, analytics, and file surfaces. No-op when `path_prefix` is
 /// None.
 fn push_path_prefix(
@@ -6540,19 +6540,7 @@ fn push_path_prefix(
 }
 
 fn push_path_condition(sql: &mut String, args: &mut Vec<rusqlite::types::Value>, prefix: &str) {
-    use rusqlite::types::Value;
-    sql.push_str(
-        "(coalesce(cwd, '') = ? or coalesce(cwd, '') like ? escape '\\' \
-          or coalesce(repo_root, '') = ? or coalesce(repo_root, '') like ? escape '\\' \
-          or coalesce(source_path, '') = ? or coalesce(source_path, '') like ? escape '\\')",
-    );
-    let (exact, child_pattern) = path_prefix_patterns(prefix);
-    args.push(Value::Text(exact.clone()));
-    args.push(Value::Text(child_pattern.clone()));
-    args.push(Value::Text(exact.clone()));
-    args.push(Value::Text(child_pattern.clone()));
-    args.push(Value::Text(exact));
-    args.push(Value::Text(child_pattern));
+    push_path_columns(sql, args, prefix, &["cwd", "repo_root", "source_path"]);
 }
 
 #[derive(Clone, Copy)]
@@ -6582,27 +6570,11 @@ fn push_domain_path_condition(
     prefix: &str,
     domain: SessionPathDomain,
 ) {
-    use rusqlite::types::Value;
-    let (exact, child_pattern) = path_prefix_patterns(prefix);
-    match domain {
-        SessionPathDomain::Workspace => {
-            sql.push_str(
-                "(coalesce(cwd, '') = ? or coalesce(cwd, '') like ? escape '\\' \
-                  or coalesce(repo_root, '') = ? or coalesce(repo_root, '') like ? escape '\\')",
-            );
-            args.push(Value::Text(exact.clone()));
-            args.push(Value::Text(child_pattern.clone()));
-            args.push(Value::Text(exact));
-            args.push(Value::Text(child_pattern));
-        }
-        SessionPathDomain::Transcript => {
-            sql.push_str(
-                "(coalesce(source_path, '') = ? or coalesce(source_path, '') like ? escape '\\')",
-            );
-            args.push(Value::Text(exact));
-            args.push(Value::Text(child_pattern));
-        }
-    }
+    let columns: &[&str] = match domain {
+        SessionPathDomain::Workspace => &["cwd", "repo_root"],
+        SessionPathDomain::Transcript => &["source_path"],
+    };
+    push_path_columns(sql, args, prefix, columns);
 }
 
 fn push_access_scope(
@@ -6640,15 +6612,7 @@ fn push_session_access_scope(
         if index > 0 {
             sql.push_str(" or ");
         }
-        let (exact, child_pattern) = path_prefix_patterns(prefix);
-        sql.push_str(
-            "(coalesce(s.cwd, '') = ? or coalesce(s.cwd, '') like ? escape '\\' \
-              or coalesce(s.repo_root, '') = ? or coalesce(s.repo_root, '') like ? escape '\\')",
-        );
-        args.push(exact.clone());
-        args.push(child_pattern.clone());
-        args.push(exact);
-        args.push(child_pattern);
+        push_path_columns(sql, args, prefix, &["s.cwd", "s.repo_root"]);
     }
     sql.push(')');
 }
@@ -9048,19 +9012,60 @@ fn push_file_filters(
     }
 }
 
-fn path_prefix_parts(prefix: &str) -> (String, String) {
-    let bytes = prefix.as_bytes();
-    let windows_style = prefix.starts_with(r"\\")
-        || matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic());
-    let separator = if windows_style { '\\' } else { '/' };
-    let exact = prefix.trim_end_matches(separator).to_string();
-    let child = format!("{exact}{separator}");
-    (exact, child)
-}
-
-fn path_prefix_patterns(prefix: &str) -> (String, String) {
-    let (exact, child) = path_prefix_parts(prefix);
-    (exact, literal_like_prefix_pattern(&child))
+/// One component-containment rule for inclusion, exclusion and authorization. POSIX paths
+/// compare byte-exactly; Windows drive/UNC paths accept either separator and ASCII case.
+/// Never use LIKE here: its ASCII folding would broaden POSIX authorization roots.
+///
+/// Query construction takes O(columns * prefix bytes) time and memory. Evaluation scans the
+/// already-scanned session paths, O(path bytes) per comparison, with O(path bytes) transient
+/// memory only for Windows separator replacement. No stored keys, migration or disk cost.
+/// Existing message/file lookup and session ordering indexes remain usable.
+fn push_path_columns<A: From<String>>(
+    sql: &mut String,
+    args: &mut Vec<A>,
+    prefix: &str,
+    columns: &[&str],
+) {
+    use std::fmt::Write as _;
+    let windows = crate::util::is_windows_absolute_path(prefix);
+    let normalized = if windows {
+        prefix.replace('\\', "/")
+    } else {
+        prefix.to_string()
+    };
+    let trimmed = normalized.trim_end_matches('/');
+    let exact = if trimmed.is_empty() && normalized.starts_with('/') {
+        "/".to_string()
+    } else if windows && trimmed.len() == 2 && trimmed.ends_with(':') {
+        format!("{trimmed}/")
+    } else {
+        trimmed.to_string()
+    };
+    let child = if exact.ends_with('/') {
+        exact.clone()
+    } else {
+        format!("{exact}/")
+    };
+    // Every child prefix ends with ASCII '/', so its strict upper bound always exists.
+    let upper = prefix_upper_bound(&child).expect("path child prefix has an upper bound");
+    let collation = if windows { "nocase" } else { "binary" };
+    sql.push('(');
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            sql.push_str(" or ");
+        }
+        let expression = if windows {
+            format!("replace(coalesce({column}, ''), '\\', '/') collate {collation}")
+        } else {
+            format!("coalesce({column}, '') collate {collation}")
+        };
+        let _ = write!(
+            sql,
+            "({expression} = ? or ({expression} >= ? and {expression} < ?))"
+        );
+        args.extend([exact.clone(), child.clone(), upper.clone()].map(A::from));
+    }
+    sql.push(')');
 }
 
 /// Escape a caller-authored literal for a SQLite `LIKE ... ESCAPE '\'` prefix probe.
@@ -9083,18 +9088,13 @@ fn literal_like_prefix_pattern(value: &str) -> String {
 }
 
 fn push_session_path_prefix(sql: &mut String, args: &mut Vec<String>, path_prefix: &str) {
-    let (exact, child_pattern) = path_prefix_patterns(path_prefix);
-    sql.push_str(
-        " and ((coalesce(s.cwd, '') = ? or coalesce(s.cwd, '') like ? escape '\\') \
-         or (coalesce(s.repo_root, '') = ? or coalesce(s.repo_root, '') like ? escape '\\') \
-         or (coalesce(s.source_path, '') = ? or coalesce(s.source_path, '') like ? escape '\\')) ",
+    sql.push_str(" and ");
+    push_path_columns(
+        sql,
+        args,
+        path_prefix,
+        &["s.cwd", "s.repo_root", "s.source_path"],
     );
-    args.push(exact.clone());
-    args.push(child_pattern.clone());
-    args.push(exact.clone());
-    args.push(child_pattern.clone());
-    args.push(exact);
-    args.push(child_pattern);
 }
 
 fn push_session_exclusions(sql: &mut String, args: &mut Vec<String>, filters: &SearchFilters) {
@@ -9103,18 +9103,13 @@ fn push_session_exclusions(sql: &mut String, args: &mut Vec<String>, filters: &S
         args.push(session_id.clone());
     }
     for prefix in &filters.exclude_path_prefixes {
-        let (exact, child_pattern) = path_prefix_patterns(prefix);
-        sql.push_str(
-            " and not ((coalesce(s.cwd, '') = ? or coalesce(s.cwd, '') like ? escape '\\') \
-             or (coalesce(s.repo_root, '') = ? or coalesce(s.repo_root, '') like ? escape '\\') \
-             or (coalesce(s.source_path, '') = ? or coalesce(s.source_path, '') like ? escape '\\')) ",
+        sql.push_str(" and not ");
+        push_path_columns(
+            sql,
+            args,
+            prefix,
+            &["s.cwd", "s.repo_root", "s.source_path"],
         );
-        args.push(exact.clone());
-        args.push(child_pattern.clone());
-        args.push(exact.clone());
-        args.push(child_pattern.clone());
-        args.push(exact);
-        args.push(child_pattern);
     }
 }
 
@@ -12476,6 +12471,384 @@ mod tests {
         };
         assert_eq!(seqs(one(MessageOrder::OldestFirst)), vec![0]);
         assert_eq!(seqs(one(MessageOrder::NewestFirst)), vec![0]);
+    }
+
+    #[test]
+    fn path_scope_inclusions_exclusions_and_authority_return_the_same_sessions() {
+        use crate::config::{SearchScopeConfig, SearchScopeMode};
+        use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
+        let dir = tempfile::tempdir().unwrap();
+        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
+        let paths = [
+            "/work/Proj",
+            "/work/Proj/sub",
+            "/work/proj",
+            "/work/proj/sub",
+            "C:/work/Proj",
+            r"c:\work\proj/sub",
+            "C:/work/project-other",
+            r"\\Server\Share\Proj",
+            "//server/share/proj/sub",
+            "//server/share/project-other",
+        ];
+        for (index, path) in paths.iter().enumerate() {
+            let id = format!("s{index}");
+            db.conn.execute(
+                "insert into sessions(id,provider,provider_session_id,cwd,preview_text,source_path,parse_version,discovery_source)
+                 values (?1,'claude',?1,?2,'','','1','test')", params![id,path]).unwrap();
+            db.conn
+                .execute(
+                    "insert into messages(session_id,provider,seq,role,kind,content)
+                 values (?1,'claude',0,'user','conversation','needle')",
+                    [&id],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "insert into file_edits(session_id,provider,seq,tool,file_path,file_name)
+                 values (?1,'claude',0,'Write',?1,?1)",
+                    [&id],
+                )
+                .unwrap();
+        }
+        for (prefix, expected) in [
+            ("/work/Proj/", vec!["s0", "s1"]),
+            ("/work/proj", vec!["s2", "s3"]),
+            (r"C:\WORK\proj/", vec!["s4", "s5"]),
+            ("//SERVER/share/Proj/", vec!["s7", "s8"]),
+        ] {
+            let sorted = |mut ids: Vec<String>| {
+                ids.sort();
+                ids
+            };
+            assert_eq!(
+                sorted(
+                    db.list_recent(&SearchFilters {
+                        path_prefix: Some(prefix.into()),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect()
+                ),
+                expected
+            );
+            assert_eq!(
+                sorted(
+                    db.search_messages(
+                        "needle",
+                        &MessageFilters {
+                            path_prefix: Some(prefix.into()),
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.session_id)
+                    .collect()
+                ),
+                expected
+            );
+            assert_eq!(
+                sorted(
+                    db.file_search(&FileQuery {
+                        path_prefix: Some(prefix.into()),
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.file_path)
+                    .collect()
+                ),
+                expected
+            );
+            let excluded = db
+                .list_recent(&SearchFilters {
+                    exclude_path_prefixes: vec![prefix.into()],
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(excluded.len(), paths.len() - expected.len());
+            assert!(excluded.iter().all(|s| !expected.contains(&s.id.as_str())));
+            let remaining = sorted(excluded.into_iter().map(|s| s.id).collect());
+            assert_eq!(
+                sorted(
+                    db.search_messages(
+                        "needle",
+                        &MessageFilters {
+                            exclude_path_prefixes: vec![prefix.into()],
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.session_id)
+                    .collect()
+                ),
+                remaining
+            );
+            assert_eq!(
+                sorted(
+                    db.file_search(&FileQuery {
+                        exclude_path_prefixes: vec![prefix.into()],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                    .into_iter()
+                    .map(|s| s.file_path)
+                    .collect()
+                ),
+                remaining
+            );
+            for index in 0..paths.len() {
+                let id = format!("s{index}");
+                let history = db
+                    .file_edits_for_query(
+                        &id,
+                        &FileQuery {
+                            path_prefix: Some(prefix.into()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(history.len(), usize::from(expected.contains(&id.as_str())));
+            }
+
+            // Authority roots are local filesystem paths; test their native spelling on each OS.
+            if Path::new(prefix).is_absolute()
+                && cfg!(windows) == crate::util::is_windows_absolute_path(prefix)
+                // A synthetic UNC server must not require network access on Windows.
+                && !prefix.starts_with("//")
+            {
+                let access = EffectiveAccessScope::resolve(
+                    &SearchScopeConfig {
+                        mode: SearchScopeMode::AllowedRoots,
+                        roots: vec![prefix.into()],
+                        include_invocation_directory: false,
+                    },
+                    TrustedAccessInputs::default(),
+                )
+                .unwrap();
+                db.set_access_scope(access);
+                assert_eq!(
+                    sorted(
+                        db.list_recent(&SearchFilters::default())
+                            .unwrap()
+                            .into_iter()
+                            .map(|s| s.id)
+                            .collect()
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    sorted(
+                        db.search_messages("needle", &MessageFilters::default())
+                            .unwrap()
+                            .into_iter()
+                            .map(|s| s.session_id)
+                            .collect()
+                    ),
+                    expected
+                );
+                assert_eq!(
+                    sorted(
+                        db.file_search(&FileQuery::default())
+                            .unwrap()
+                            .into_iter()
+                            .map(|s| s.file_path)
+                            .collect()
+                    ),
+                    expected
+                );
+                db.set_access_scope(EffectiveAccessScope::All);
+            }
+        }
+    }
+
+    #[test]
+    fn path_prefix_query_plans_preserve_session_message_and_file_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn
+            .execute_batch(
+                "with recursive n(x) as (values(1) union all select x+1 from n where x<1000)
+             insert into sessions (id,provider,provider_session_id,cwd,preview_text,
+                 source_path,parse_version,discovery_source)
+             select 's'||x,'claude','s'||x,'/work/proj/'||x,'','/fixture/'||x,'1','test' from n;
+             insert into messages(session_id,provider,seq,role,kind,content)
+             select id,'claude',0,'user','conversation','needle' from sessions;
+             insert into file_edits(session_id,provider,seq,tool,file_path,file_name)
+             select id,'claude',0,'Write','/work/proj/file.rs','file.rs' from sessions;",
+            )
+            .unwrap();
+        for prefix in ["/work/proj", r"C:\work\proj"] {
+            let mut sql = format!(
+                "select {} from sessions s where 1 = 1",
+                session_record_columns!()
+            );
+            let mut args = Vec::new();
+            push_session_filters(
+                &mut sql,
+                &mut args,
+                &SearchFilters {
+                    path_prefix: Some(prefix.into()),
+                    ..Default::default()
+                },
+                &db.access_scope,
+            );
+            sql.push_str(" order by s.updated_at desc, s.id asc limit 20");
+            let args = args
+                .into_iter()
+                .map(rusqlite::types::Value::Text)
+                .collect::<Vec<_>>();
+            let plan = query_plan(&db, &sql, &args);
+            println!("session-list {prefix:?}: {plan}");
+            assert!(plan.contains("idx_sessions_updated"), "{plan}");
+
+            let prepared = db
+                .prepare_non_fuzzy_message_query(
+                    "needle",
+                    &MessageFilters {
+                        path_prefix: Some(prefix.into()),
+                        ..Default::default()
+                    },
+                    false,
+                    MessageOrder::OldestFirst,
+                )
+                .unwrap();
+            let plan = query_plan(&db, &prepared.sql, &prepared.args);
+            println!("message-search {prefix:?}: {plan}");
+            assert!(
+                plan.contains("SEARCH m USING INTEGER PRIMARY KEY")
+                    && plan.contains("messages_trigram VIRTUAL TABLE INDEX"),
+                "{plan}"
+            );
+
+            let mut sql = String::from(
+                "select file_path, file_name, count(*) as edits, count(distinct session_id) \
+                 as sessions, max(ts) as last_edited from file_edits where 1 = 1",
+            );
+            let mut args = Vec::new();
+            push_file_filters(
+                &mut sql,
+                &mut args,
+                &FileQuery {
+                    path_prefix: Some(prefix.into()),
+                    ..Default::default()
+                },
+                &db.access_scope,
+            );
+            sql.push_str(" group by file_path order by edits desc, last_edited desc");
+            let plan = query_plan(&db, &sql, &args);
+            println!("files-search {prefix:?}: {plan}");
+            assert!(plan.contains("idx_file_edits_session"), "{plan}");
+        }
+    }
+
+    #[test]
+    fn portable_path_predicates_share_case_separator_and_boundary_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let cases = [
+            ("/work/Proj", "/work/proj", false),
+            ("/work/Proj", "/work/proj/sub", false),
+            ("C:/work/proj", "C:/work/proj/sub", true),
+            (r"C:\work\Proj", r"c:\work\proj", true),
+            (r"C:\work\Proj", r"c:\work\proj\sub", true),
+            ("/work/proj/", "/work/proj/sub", true),
+            ("C:/work/proj/", r"c:\work/proj\sub/", true),
+            (r"C:\work/proj\", "c:/WORK/proj/", true),
+            (r"\\Server\Share\Proj", "//server/share/proj/sub", true),
+            ("//server/share/proj/", r"\\SERVER\share\proj\", true),
+            ("/work/Proj", "/work/Proj/", true),
+            ("/work/Proj", "/work/Proj/sub", true),
+            ("/work/Proj", "/work/Proj-other", false),
+            ("/work/proj", "/work/Proj/sub", false),
+            (r"/work/proj\name", r"/work/proj\name/sub", true),
+            (r"/work/proj\name", "/work/proj/name/sub", false),
+            ("/work/proj%_", "/work/proj%_/sub", true),
+            ("/work/proj%_", "/work/project/sub", false),
+            (r"C:\work\proj%_", "c:/work/proj%_/sub", true),
+            (r"C:\work\proj%_", "c:/work/project/sub", false),
+            ("/", "/work", true),
+            ("C:/", r"c:\work", true),
+            ("C:/", "c:/", true),
+            ("/work/Ä", "/work/ä/sub", false),
+            ("C:/work/Ä", "c:/work/ä/sub", false),
+        ];
+        for (prefix, value, expected) in cases {
+            for column in ["cwd", "repo_root", "source_path"] {
+                db.conn.execute("delete from sessions", []).unwrap();
+                db.conn
+                    .execute(
+                        "insert into sessions (id, provider, provider_session_id, preview_text, \
+                        source_path, parse_version, discovery_source) \
+                        values ('fixture','claude','fixture','','','1','test')",
+                        [],
+                    )
+                    .unwrap();
+                db.conn
+                    .execute(&format!("update sessions set {column} = ?"), [value])
+                    .unwrap();
+                let mut sql = "select count(*) from sessions s where 1=1".to_string();
+                let mut args = Vec::new();
+                push_session_path_prefix(&mut sql, &mut args, prefix);
+                let count: i64 = db
+                    .conn
+                    .query_row(&sql, rusqlite::params_from_iter(&args), |row| row.get(0))
+                    .unwrap();
+                assert_eq!(count, i64::from(expected), "{prefix:?} {value:?} {column}");
+
+                let mut sql = "select count(*) from sessions s where 1=1".to_string();
+                let mut args = Vec::new();
+                push_session_exclusions(
+                    &mut sql,
+                    &mut args,
+                    &SearchFilters {
+                        exclude_path_prefixes: vec![prefix.into()],
+                        ..Default::default()
+                    },
+                );
+                let count: i64 = db
+                    .conn
+                    .query_row(&sql, rusqlite::params_from_iter(&args), |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    count,
+                    i64::from(!expected),
+                    "exclusion {prefix:?} {value:?}"
+                );
+
+                for domain in [
+                    None,
+                    Some(SessionPathDomain::Workspace),
+                    Some(SessionPathDomain::Transcript),
+                ] {
+                    let mut sql = "select count(*) from sessions where ".to_string();
+                    let mut args = Vec::new();
+                    if let Some(domain) = domain {
+                        push_domain_path_condition(&mut sql, &mut args, prefix, domain);
+                    } else {
+                        push_path_condition(&mut sql, &mut args, prefix);
+                    }
+                    let in_domain = match domain {
+                        None => true,
+                        Some(SessionPathDomain::Workspace) => column != "source_path",
+                        Some(SessionPathDomain::Transcript) => column == "source_path",
+                    };
+                    let count: i64 = db
+                        .conn
+                        .query_row(&sql, rusqlite::params_from_iter(&args), |row| row.get(0))
+                        .unwrap();
+                    assert_eq!(
+                        count,
+                        i64::from(expected && in_domain),
+                        "domain {prefix:?} {value:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

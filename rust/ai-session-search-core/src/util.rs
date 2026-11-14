@@ -191,10 +191,10 @@ pub fn normalize_path_prefix(path: &str) -> String {
         .unwrap_or_else(|_| normalize_path(&expanded))
 }
 
-#[cfg(not(windows))]
-fn is_windows_absolute_path(path: &str) -> bool {
+pub(crate) fn is_windows_absolute_path(path: &str) -> bool {
     let bytes = path.as_bytes();
     path.starts_with(r"\\")
+        || path.starts_with("//")
         || matches!(bytes, [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic())
 }
 
@@ -3186,6 +3186,38 @@ pub(crate) mod tests {
         assert_eq!(expand_tilde("~bob/x"), PathBuf::from("~bob/x"));
         // A non-tilde path is returned unchanged by expand_tilde.
         assert_eq!(expand_tilde("/abs/path"), PathBuf::from("/abs/path"));
+    }
+
+    #[test]
+    fn path_prefix_canonicalization_preserves_foreign_paths_and_missing_case() {
+        for path in [
+            r"C:\work\Proj\",
+            "C:/work/Proj/",
+            r"\\Server\Share\Proj",
+            "//Server/Share/Proj",
+        ] {
+            if !cfg!(windows) {
+                assert_eq!(normalize_path_prefix(path), path);
+            }
+            assert!(is_windows_absolute_path(path));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mixed = dir.path().join("MixedCase");
+        std::fs::create_dir(&mixed).unwrap();
+        let canonical = normalize_path(&std::fs::canonicalize(&mixed).unwrap());
+        assert_eq!(normalize_path_prefix(mixed.to_str().unwrap()), canonical);
+        let alternate = dir.path().join("mixedcase");
+        if alternate.exists() {
+            // A case-insensitive filesystem supplies the on-disk spelling during canonicalize.
+            assert_eq!(
+                normalize_path_prefix(alternate.to_str().unwrap()),
+                canonical
+            );
+        }
+        let missing = dir.path().join("MissingCase");
+        let expected = normalize_path(&std::path::absolute(&missing).unwrap());
+        assert_eq!(normalize_path_prefix(missing.to_str().unwrap()), expected);
+        assert!(normalize_path_prefix(missing.to_str().unwrap()).ends_with("MissingCase"));
     }
 
     #[test]
