@@ -481,6 +481,8 @@ pub(crate) fn merge_migration_family(
     merge_file_mutations(&mut successor, &predecessor)?;
     super::health::UnrecognizedRecordTypes::merge_sources(&mut successor, &predecessor);
     let mut predecessor_ids = HashSet::new();
+    let successor_order = (0..successor.messages.len()).collect::<Vec<_>>();
+    let mut predecessor_order = Vec::new();
     let mut additions = Vec::new();
     for message in predecessor.messages {
         if let Some(identity) = &message.provenance.correlation_identity {
@@ -493,6 +495,7 @@ pub(crate) fn merge_migration_family(
                         || retained_input_overlap(&message, &successor.messages[*index]),
                     "Gemini migration family has conflicting content for native message identity {identity:?}"
                 );
+                predecessor_order.push(*index);
                 continue;
             }
         } else if let Some(index) = successor_by_slot
@@ -505,8 +508,10 @@ pub(crate) fn merge_migration_family(
                     || retained_input_overlap(&message, candidate),
                 "Gemini migration family has conflicting identity-less overlapping records"
             );
+            predecessor_order.push(index);
             continue;
         }
+        predecessor_order.push(successor.messages.len() + additions.len());
         additions.push(message);
     }
     let next_seq = successor
@@ -518,6 +523,17 @@ pub(crate) fn merge_migration_family(
         + 1;
     for (offset, mut message) in additions.into_iter().enumerate() {
         message.seq = next_seq + offset as i64;
+        successor.messages.push(message);
+    }
+    let timestamps = successor.messages.iter().map(|m| m.ts).collect::<Vec<_>>();
+    let (order, _) = migration_order(&successor_order, &predecessor_order, &timestamps)?;
+    let mut rows = std::mem::take(&mut successor.messages)
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    for (seq, index) in order.into_iter().enumerate() {
+        let mut message = rows[index].take().expect("unique merged message");
+        message.seq = seq as i64;
         successor.messages.push(message);
     }
     successor.session.message_count = Some(successor.messages.len() as i64);
@@ -571,16 +587,67 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
         Ok(ids)
     };
     let mut successor_ids = ids(successor)?;
-    let mut seen = successor_ids.iter().cloned().collect::<HashSet<_>>();
+    let mut seen = successor_ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| (id.clone(), i))
+        .collect::<HashMap<_, _>>();
+    anyhow::ensure!(
+        seen.len() == successor_ids.len(),
+        "Gemini successor repeats file call identity"
+    );
+    let successor_order = (0..successor_ids.len()).collect::<Vec<_>>();
+    let mut predecessor_order = Vec::new();
+    let mut predecessor_seen = HashSet::new();
     for (id, edit) in ids(predecessor)?.into_iter().zip(&predecessor.file_edits) {
-        if !seen.insert(id.clone()) {
-            continue;
+        anyhow::ensure!(
+            predecessor_seen.insert(id.clone()),
+            "Gemini predecessor repeats file call identity"
+        );
+        if let Some(&index) = seen.get(&id) {
+            let existing = &successor.file_edits[index];
+            anyhow::ensure!(
+                existing.ts == edit.ts
+                    && existing.tool == edit.tool
+                    && existing.file_path == edit.file_path
+                    && existing.new_content == edit.new_content
+                    && existing.edits == edit.edits,
+                "Gemini migration family has conflicting file call {id}"
+            );
+            predecessor_order.push(index);
+        } else {
+            let index = successor.file_edits.len();
+            seen.insert(id.clone(), index);
+            predecessor_order.push(index);
+            successor.file_edits.push(edit.clone());
+            successor_ids.push(id);
         }
-        let mut edit = edit.clone();
-        edit.seq = successor.file_edits.last().map_or(0, |edit| edit.seq + 1);
-        successor.file_edits.push(edit);
-        successor_ids.push(id);
     }
+    let timestamps = successor
+        .file_edits
+        .iter()
+        .map(|e| e.ts)
+        .collect::<Vec<_>>();
+    let (order, ambiguous_from) =
+        migration_order(&successor_order, &predecessor_order, &timestamps)?;
+    let mut edits = std::mem::take(&mut successor.file_edits)
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    let mut ordered_ids = Vec::new();
+    for (seq, index) in order.into_iter().enumerate() {
+        let mut edit = edits[index].take().expect("unique merged edit");
+        edit.seq = seq as i64;
+        // No snapshot after an unresolved branch can establish which write was latest.
+        // Retain each version as path-only; the original payload remains in its tool row.
+        if ambiguous_from.is_some_and(|first| seq >= first) {
+            edit.new_content = None;
+            edit.edits.clear();
+        }
+        successor.file_edits.push(edit);
+        ordered_ids.push(successor_ids[index].clone());
+    }
+    successor_ids = ordered_ids;
     let mut metadata: Value = serde_json::from_str(
         successor
             .session
@@ -591,6 +658,58 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
     metadata["file_edit_call_ids"] = json!(successor_ids);
     successor.session.raw_metadata_json = Some(metadata.to_string());
     Ok(())
+}
+
+/// Union two source orders using shared native identities as anchors. Only strictly ordered
+/// timestamps disambiguate independent branch heads; ties/missing timestamps retain a stable
+/// archive order, but identify the first unprovable position for reconstruction to refuse.
+/// Each node has at most two outgoing edges and at most two heads are ready: O(N) time/space.
+fn migration_order(
+    successor: &[usize],
+    predecessor: &[usize],
+    timestamps: &[Option<DateTime<Utc>>],
+) -> Result<(Vec<usize>, Option<usize>)> {
+    let mut edges = vec![Vec::new(); timestamps.len()];
+    let mut incoming = vec![0usize; timestamps.len()];
+    for source in [successor, predecessor] {
+        for pair in source.windows(2) {
+            if !edges[pair[0]].contains(&pair[1]) {
+                edges[pair[0]].push(pair[1]);
+                incoming[pair[1]] += 1;
+            }
+        }
+    }
+    let mut ready = incoming
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &n)| (n == 0).then_some(i))
+        .collect::<Vec<_>>();
+    let mut order = Vec::new();
+    let mut ambiguous = None;
+    while !ready.is_empty() {
+        let mut selected = 0;
+        if ready.len() > 1 {
+            match (timestamps[ready[0]], timestamps[ready[1]]) {
+                (Some(a), Some(b)) if a != b => selected = usize::from(b < a),
+                _ => {
+                    ambiguous.get_or_insert(order.len());
+                }
+            }
+        }
+        let index = ready.swap_remove(selected);
+        order.push(index);
+        for &next in &edges[index] {
+            incoming[next] -= 1;
+            if incoming[next] == 0 {
+                ready.push(next);
+            }
+        }
+    }
+    anyhow::ensure!(
+        order.len() == timestamps.len(),
+        "Gemini migration family has contradictory native order"
+    );
+    Ok((order, ambiguous))
 }
 
 fn message_payload_equal(left: &Message, right: &Message) -> bool {
@@ -1834,8 +1953,13 @@ mod tests {
     fn migration_family_keeps_predecessor_only_file_mutations_by_call_identity() {
         let adapter = GeminiCliAdapter::new(Vec::new());
         let call = |id: &str| {
-            json!({"id":id,"name":"write_file",
-            "args":{"file_path":"/tmp/example.txt","content":"same content"},
+            let timestamp = match id {
+                "shared" => "2026-01-01T00:00:01Z",
+                "old" => "2026-01-01T00:00:02Z",
+                _ => "2026-01-01T00:00:03Z",
+            };
+            json!({"id":id,"name":"write_file","timestamp":timestamp,
+            "args":{"file_path":"/tmp/example.txt","content":id},
             "result":[{"functionResponse":{"id":id,"name":"write_file","response":{"output":"written"}}}]})
         };
         let record =
@@ -1862,8 +1986,110 @@ mod tests {
         assert_eq!(
             merged.file_edits.len(),
             3,
-            "identical payloads from distinct calls are separate versions"
+            "distinct calls are separate versions"
         );
+        assert_eq!(
+            merged
+                .file_edits
+                .iter()
+                .map(|e| e.new_content.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["shared", "old", "new"]
+        );
+        assert_eq!(
+            crate::files::reconstruct(&merged.file_edits, 3).as_deref(),
+            Some("new")
+        );
+        assert_eq!(merged.session.parse_version, "gemini-cli-v11");
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+        let mut old = merged.clone();
+        old.session.parse_version = "gemini-cli-v10".into();
+        old.file_edits.swap(1, 2);
+        for (seq, edit) in old.file_edits.iter_mut().enumerate() {
+            edit.seq = seq as i64;
+        }
+        db.upsert_session(&old, 1, 1).unwrap();
+        for generation in [2, 3] {
+            db.upsert_session(&merged, generation, generation).unwrap();
+            let edits = db
+                .file_edits_for("example.txt", None)
+                .unwrap()
+                .into_iter()
+                .map(|(_, _, e)| e)
+                .collect::<Vec<_>>();
+            assert_eq!(edits.len(), 3);
+            assert_eq!(crate::files::reconstruct(&edits, 3).as_deref(), Some("new"));
+        }
+        assert_eq!(
+            merged
+                .messages
+                .iter()
+                .filter(|m| m.kind == MessageKind::ToolCall)
+                .map(|m| m.tool_call_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["shared", "old", "new"]
+        );
+    }
+
+    #[test]
+    fn migration_order_uses_anchors_and_refuses_ambiguous_latest_writes() {
+        let adapter = GeminiCliAdapter::new(Vec::new());
+        let record = |id: &str, ts: Option<&str>| {
+            json!({"id":id,"type":"gemini","content":[],"timestamp":ts,"toolCalls":[
+            {"id":id,"name":"write_file","args":{"file_path":"/tmp/example.txt","content":id},
+             "result":[{"functionResponse":{"id":id,"name":"write_file","response":{"output":"written"}}}]}]})
+        };
+        for ts in [None, Some("2026-01-01T00:00:00Z")] {
+            for anchored in [false, true] {
+                let mut before = vec![record("a", ts), record("b", ts)];
+                let mut after = vec![record("a", ts)];
+                if anchored {
+                    before.push(record("anchor", ts));
+                    after.push(record("anchor", ts));
+                }
+                after.push(record("c", ts));
+                let predecessor = adapter
+                    .parse_raw(
+                        Path::new("session-order.json"),
+                        json!({"sessionId":"order","messages":before}).to_string(),
+                    )
+                    .unwrap();
+                let lines = std::iter::once(json!({"sessionId":"order"}))
+                    .chain(after)
+                    .map(|v| format!("{v}\n"))
+                    .collect::<String>();
+                let successor = adapter
+                    .parse_reader(
+                        std::io::Cursor::new(lines),
+                        Path::new("session-order.jsonl"),
+                    )
+                    .unwrap();
+                let merged = merge_migration_family(successor, predecessor).unwrap();
+                assert_eq!(
+                    crate::files::reconstruct(&merged.file_edits, 1).as_deref(),
+                    Some("a")
+                );
+                if anchored {
+                    assert_eq!(
+                        merged
+                            .file_edits
+                            .iter()
+                            .map(|e| e.new_content.as_deref().unwrap())
+                            .collect::<Vec<_>>(),
+                        ["a", "b", "anchor", "c"]
+                    );
+                    assert_eq!(
+                        crate::files::reconstruct(&merged.file_edits, 4).as_deref(),
+                        Some("c")
+                    );
+                } else {
+                    assert_eq!(merged.file_edits.len(), 3);
+                    assert_eq!(crate::files::reconstruct(&merged.file_edits, 2), None);
+                    assert_eq!(crate::files::reconstruct(&merged.file_edits, 3), None);
+                }
+            }
+        }
     }
 
     #[test]
