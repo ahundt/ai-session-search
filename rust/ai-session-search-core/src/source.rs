@@ -808,6 +808,62 @@ mod tests {
     }
 
     #[test]
+    fn gemini_runtime_roots_deduplicate_physical_aliases_not_independent_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let native = dir.path().join("native");
+        let sandbox = dir.path().join("sandbox");
+        for root in [&native, &sandbox] {
+            std::fs::create_dir_all(root.join("project/chats")).unwrap();
+            std::fs::write(root.join("project/chats/session-shared.json"),
+                r#"{"sessionId":"shared-runtime","messages":[{"id":"u1","type":"user","content":"shared runtime prompt"}]}"#
+            ).unwrap();
+        }
+        let mut config = Config::default();
+        disable_all(&mut config);
+        config.providers.gemini_cli.enabled = true;
+        config.providers.gemini_cli.paths =
+            vec![native.display().to_string(), sandbox.display().to_string()];
+        let db_path = dir.path().join("index.db");
+        config.index.db_path = Some(db_path.display().to_string());
+        let db = crate::db::Db::open(&db_path).unwrap();
+        // Independent snapshots have path-based session keys, even with equal provider IDs.
+        crate::indexer::reindex(&config, &db, false, None).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("select count(*) from sessions", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        drop(conn);
+        // The same physical file reachable from two roots is only one input.
+        let sandbox_file = sandbox.join("project/chats/session-shared.json");
+        std::fs::remove_file(&sandbox_file).unwrap();
+        std::fs::hard_link(
+            native.join("project/chats/session-shared.json"),
+            &sandbox_file,
+        )
+        .unwrap();
+        let alias_db_path = dir.path().join("alias-index.db");
+        config.index.db_path = Some(alias_db_path.display().to_string());
+        let db = crate::db::Db::open(&alias_db_path).unwrap();
+        for _ in 0..3 {
+            crate::indexer::reindex(&config, &db, false, None).unwrap();
+            let conn = rusqlite::Connection::open(&alias_db_path).unwrap();
+            assert_eq!(
+                conn.query_row("select count(*) from sessions", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                db.search_messages("shared runtime prompt", &Default::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn inventory_canonicalizes_alias_roots_before_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("claude");
