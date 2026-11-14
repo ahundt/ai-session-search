@@ -835,7 +835,7 @@ impl ClaudeAdapter {
         let mut pending_enqueues = std::collections::VecDeque::<Option<usize>>::new();
         let mut pending_direct_delivery = false;
         let mut stored_pending_delivery = context.is_some_and(|c| c.pending_direct_delivery);
-        let mut unrecognized = UnrecognizedRecordTypes::default();
+        let mut unrecognized = UnrecognizedRecordTypes::for_context(context);
         // What earlier parsers made of the records this one declines; see `RetractedRows`.
         let mut retracted_messages = Vec::new();
         let mut retracted_file_edits = Vec::new();
@@ -850,6 +850,7 @@ impl ClaudeAdapter {
 
         for line in crate::util::lines_with_byte_offsets(reader) {
             let (byte_offset, line) = line?;
+            unrecognized.record(context, byte_offset);
             let is_new = context.is_none_or(|c| byte_offset >= c.new_bytes_start);
             if is_new && std::mem::take(&mut stored_pending_delivery) {
                 pending_direct_delivery = true;

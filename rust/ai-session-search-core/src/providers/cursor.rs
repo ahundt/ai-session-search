@@ -89,10 +89,19 @@ impl CursorAdapter {
         reader: R,
         path: &Path,
     ) -> Result<ParsedSession> {
+        self.parse_reader_with_context(reader, path, None)
+    }
+
+    pub(crate) fn parse_reader_with_context<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        path: &Path,
+        context: Option<crate::tail::TailContext<'_>>,
+    ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
         let mut valid_record_count: usize = 0;
-        let mut unrecognized = super::health::UnrecognizedRecordTypes::default();
+        let mut unrecognized = super::health::UnrecognizedRecordTypes::for_context(context);
         // A top-level cursor transcript is named for its session id, so the stem is the id. A
         // subagent transcript is named for its role instead (`subagents/subagent.jsonl` under
         // every parent), which is unique only within one parent — so it takes the parent's id
@@ -118,8 +127,9 @@ impl CursorAdapter {
         // with the tool it came from, the same way the claude adapter does.
         let mut tool_use_names: HashMap<String, String> = HashMap::new();
 
-        for line in crate::util::lines_replacing_invalid_utf8(reader) {
-            let line = line?;
+        for line in crate::util::lines_with_byte_offsets(reader) {
+            let (byte_offset, line) = line?;
+            unrecognized.record(context, byte_offset);
             line_count += 1;
             if line.trim().is_empty() {
                 continue;

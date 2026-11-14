@@ -444,7 +444,7 @@ fn nested_and_unimplemented_content_types_are_reported_without_new_indexing() {
         );
         let metadata: Value =
             serde_json::from_str(parsed.session.raw_metadata_json.as_deref().unwrap()).unwrap();
-        assert_eq!(metadata["requires_full_parse_for_tail"], true);
+        assert_ne!(metadata["requires_full_parse_for_tail"], true);
     }
 }
 

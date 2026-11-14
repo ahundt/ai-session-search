@@ -3029,6 +3029,24 @@ impl Db {
             new_count,
         ])?;
 
+        {
+            // The parser seeded health from this session and observed only appended records.
+            // Publish it in the row/checkpoint transaction, preserving unrelated metadata.
+            let metadata: serde_json::Value = session
+                .raw_metadata_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            let key = crate::providers::health::UNRECOGNIZED_RECORD_TYPES_KEY;
+            let patch = serde_json::json!({key: metadata[key]});
+            tx.execute(
+                "update sessions set raw_metadata_json = json_patch(
+                    case when json_valid(raw_metadata_json) then raw_metadata_json else '{}' end,
+                    ?2) where id = ?1",
+                params![session.id, patch.to_string()],
+            )?;
+        }
+
         if matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop) {
             let metadata: serde_json::Value = session
                 .raw_metadata_json

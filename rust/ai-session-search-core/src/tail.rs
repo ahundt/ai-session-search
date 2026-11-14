@@ -179,7 +179,9 @@ pub struct TailParse {
 
 /// The boundary is relative to the parser slice, before any UTF-8 decoding.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct TailContext {
+pub(crate) struct TailContext<'a> {
+    /// Persisted inventory seeds only the overlap+tail parse, never the overlap-only parse.
+    pub health_seed: Option<&'a str>,
     pub new_bytes_start: usize,
     pub prefix_truncated: bool,
     pub pending_direct_delivery: bool,

@@ -949,7 +949,11 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p, _| adapters.cursor.parse_reader(r, p),
+                    |r, p, context| {
+                        adapters
+                            .cursor
+                            .parse_reader_with_context(r, p, Some(context))
+                    },
                 )?,
                 Provider::Antigravity => try_tail(
                     source,
@@ -957,7 +961,11 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p, _| adapters.antigravity.parse_reader(r, p),
+                    |r, p, context| {
+                        adapters
+                            .antigravity
+                            .parse_reader_with_context(r, p, Some(context))
+                    },
                 )?,
                 Provider::Pi => try_tail(
                     source,
@@ -965,7 +973,7 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p, _| adapters.pi.parse_reader(r, p),
+                    |r, p, context| adapters.pi.parse_reader_with_context(r, p, Some(context)),
                 )?,
                 Provider::PrimeAgent => try_tail(
                     source,
@@ -973,7 +981,11 @@ pub(crate) fn reindex_until(
                     expected_session_id,
                     db,
                     should_cancel,
-                    |r, p, _| adapters.prime_agent.parse_reader(r, p),
+                    |r, p, context| {
+                        adapters
+                            .prime_agent
+                            .parse_reader_with_context(r, p, Some(context))
+                    },
                 )?,
                 Provider::AiStudio | Provider::GeminiCli => TailOutcome::FullParse,
             };
@@ -1801,11 +1813,17 @@ where
     let Some(stored_digest) = db.file_overlap_digest(source.provider, source_path)? else {
         return Ok(TailOutcome::FullParse);
     };
+    // Reuse the persisted bounded inventory; the parser counts only new physical records.
+    let stored_session = expected_session_id
+        .map(|id| db.resolve_session_record(id))
+        .transpose()?;
+    let health_seed = stored_session
+        .as_ref()
+        .and_then(|session| session.raw_metadata_json.as_deref());
     // Carry only an unresolved dequeue across overlap eviction, never a lifetime guard.
     let mut pending_direct_delivery = false;
     if matches!(source.provider, Provider::Claude | Provider::ClaudeDesktop) {
-        if let Some(id) = expected_session_id {
-            let stored = db.resolve_session_record(id)?;
+        if let Some(stored) = stored_session.as_ref() {
             let metadata: serde_json::Value = stored
                 .raw_metadata_json
                 .as_deref()
@@ -1821,9 +1839,17 @@ where
         offset,
         Some(&stored_digest),
         should_cancel,
-        |r, p, mut context| {
-            context.pending_direct_delivery = pending_direct_delivery;
-            parse_slice(r, p, context)
+        |r, p, context| {
+            parse_slice(
+                r,
+                p,
+                crate::tail::TailContext {
+                    pending_direct_delivery,
+                    health_seed,
+                    new_bytes_start: context.new_bytes_start,
+                    prefix_truncated: context.prefix_truncated,
+                },
+            )
         },
     ) {
         Ok(crate::tail::TailParseRun::Complete(Some(mut tail))) => {
@@ -3793,6 +3819,127 @@ mod tests {
             rows(&root.parent().unwrap().join("index.db")),
             rows(&fresh_path)
         );
+    }
+
+    fn health_refresh_sequence(mib: usize, benchmark: bool) {
+        use std::io::Write as _;
+        for provider in [
+            Provider::Codex,
+            Provider::Pi,
+            Provider::GeminiCli,
+            Provider::Claude,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("sources");
+            let id = "cafe0000-cafe-cafe-cafe-000000000002";
+            let relative = if provider == Provider::GeminiCli {
+                "project/chats/session-synthetic.jsonl".to_owned()
+            } else {
+                format!("{id}.jsonl")
+            };
+            let path = root.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let header = match provider {
+                Provider::Codex => json!({"type":"session_meta","payload":{"id":id}}),
+                Provider::Pi => json!({"type":"session","id":id}),
+                Provider::GeminiCli => json!({"sessionId":id,"kind":"main"}),
+                _ => {
+                    json!({"type":"user","sessionId":id,"message":{"role":"user","content":"synthetic start"}})
+                }
+            };
+            let unknown =
+                |n: usize| json!({"type":format!("future-{n}"),"padding":"x".repeat(65536)});
+            let mut file = std::fs::File::create(&path).unwrap();
+            writeln!(file, "{header}").unwrap();
+            // Admit the first 16 names before they leave the actual overlap window.
+            for n in 0..20 {
+                writeln!(file, "{}", unknown(n)).unwrap();
+            }
+            while file.metadata().unwrap().len() < (mib * 1024 * 1024) as u64 {
+                let record = match provider {
+                    Provider::Codex => {
+                        json!({"type":"response_item","payload":{"type":"reasoning","encrypted_content":"synthetic opaque","padding":"x".repeat(65536)}})
+                    }
+                    _ => unknown(19),
+                };
+                writeln!(file, "{record}").unwrap();
+            }
+            file.flush().unwrap();
+            let db_path = dir.path().join("index.db");
+            let mut config = config_with_no_providers(&db_path);
+            let selected = match provider {
+                Provider::Codex => &mut config.providers.codex,
+                Provider::Pi => &mut config.providers.pi,
+                Provider::GeminiCli => &mut config.providers.gemini_cli,
+                _ => &mut config.providers.claude,
+            };
+            selected.enabled = true;
+            selected.paths = vec![normalize_path(&root)];
+            let db = Db::open(&db_path).unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let mut full_count = 0;
+            let mut latencies = Vec::new();
+            for turn in 0..16 {
+                writeln!(file, "{}", json!({"type":format!("future-{}",turn % 21)})).unwrap();
+                let message = match provider {
+                    Provider::Codex => {
+                        json!({"type":"response_item","payload":{"type":"message","role":"user","content":"synthetic append"}})
+                    }
+                    Provider::Pi => {
+                        json!({"type":"message","id":format!("turn-{turn}"),"message":{"role":"user","content":"synthetic append"}})
+                    }
+                    Provider::GeminiCli => {
+                        json!({"type":"user","id":format!("turn-{turn}"),"content":"synthetic append"})
+                    }
+                    _ => {
+                        json!({"type":"user","uuid":format!("turn-{turn}"),"sessionId":id,"message":{"role":"user","content":"synthetic append"}})
+                    }
+                };
+                writeln!(file, "{message}").unwrap();
+                file.flush().unwrap();
+                TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().clear());
+                let start = std::time::Instant::now();
+                reindex(&config, &db, false, None).unwrap();
+                latencies.push(start.elapsed().as_secs_f64());
+                let full = TEST_TAIL_OUTCOMES.with(|outcomes| {
+                    let outcomes = std::mem::take(&mut *outcomes.borrow_mut());
+                    assert_eq!(outcomes.len(), 1, "{provider:?}");
+                    matches!(outcomes[0], TailOutcome::FullParse)
+                });
+                full_count += usize::from(full);
+                if !benchmark {
+                    if provider != Provider::GeminiCli {
+                        assert!(!full, "{provider:?}: health forced full parse");
+                    }
+                    let fresh_path = dir.path().join(format!("fresh-{turn}.db"));
+                    let fresh = Db::open(&fresh_path).unwrap();
+                    let mut fresh_config = config.clone();
+                    fresh_config.index.db_path = Some(normalize_path(&fresh_path));
+                    reindex(&fresh_config, &fresh, true, None).unwrap();
+                    assert_eq!(
+                        serde_json::to_value(db.parser_health().unwrap().unrecognized_record_types)
+                            .unwrap(),
+                        serde_json::to_value(
+                            fresh.parser_health().unwrap().unrecognized_record_types
+                        )
+                        .unwrap(),
+                        "{provider:?} turn {turn}"
+                    );
+                }
+            }
+            eprintln!("HEALTH_REFRESH provider={provider:?} bytes={} full={full_count} tail={} seconds={latencies:?}",file.metadata().unwrap().len(),16-full_count);
+        }
+    }
+
+    #[test]
+    fn health_refresh_inventory_equals_full_beyond_overlap() {
+        health_refresh_sequence(3, false);
+    }
+
+    #[test]
+    #[ignore = "60 MiB whole-refresh timing workload"]
+    fn health_refresh_benchmark() {
+        health_refresh_sequence(60, true);
     }
 
     #[test]

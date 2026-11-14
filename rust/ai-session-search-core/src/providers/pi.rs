@@ -198,10 +198,19 @@ impl PiAdapter {
         reader: R,
         path: &Path,
     ) -> Result<ParsedSession> {
+        self.parse_reader_with_context(reader, path, None)
+    }
+
+    pub(crate) fn parse_reader_with_context<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        path: &Path,
+        context: Option<crate::tail::TailContext<'_>>,
+    ) -> Result<ParsedSession> {
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
         let mut valid_record_count: usize = 0;
-        let mut unrecognized = super::health::UnrecognizedRecordTypes::default();
+        let mut unrecognized = super::health::UnrecognizedRecordTypes::for_context(context);
         // Pi gives a spawned run a session id from the same space as a top-level one, so the
         // `session` record below binds it either way and no parent qualification is needed —
         // unlike claude, whose subagent records carry only the PARENT's id. The origin is used
@@ -228,8 +237,9 @@ impl PiAdapter {
         let mut copied_any = false;
         let mut retracted = crate::models::RetractedRows::default();
 
-        for line in crate::util::lines_replacing_invalid_utf8(reader) {
-            let line = line?;
+        for line in crate::util::lines_with_byte_offsets(reader) {
+            let (byte_offset, line) = line?;
+            unrecognized.record(context, byte_offset);
             line_count += 1;
             if line.trim().is_empty() {
                 continue;
