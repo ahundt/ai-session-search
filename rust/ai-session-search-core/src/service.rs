@@ -2315,16 +2315,30 @@ impl<'config> SqlService<'config> {
         &self,
         query: &crate::sql_query::SqlQuery,
     ) -> Result<crate::sql_query::QueryResult> {
-        crate::search_scope::ensure_raw_sql_allowed(
-            &self.config.search.scope,
-            "SessionSearch::sql().query",
-        )?;
+        self.query_cancellable(query, None, "SessionSearch::sql().query")
+    }
+
+    pub(crate) fn query_cancellable(
+        &self,
+        query: &crate::sql_query::SqlQuery,
+        cancellation: Option<&QueryCancellation>,
+        operation: &str,
+    ) -> Result<crate::sql_query::QueryResult> {
+        crate::search_scope::ensure_raw_sql_allowed(&self.config.search.scope, operation)?;
         let args = query.resolve(&self.config.db);
-        let mut result = crate::sql_query::query_path(
-            &self.config.db_path(),
-            self.config.index.busy_timeout_ms,
-            &args,
-        )?;
+        let mut result = match cancellation {
+            Some(cancellation) => crate::sql_query::query_path_cancellable(
+                &self.config.db_path(),
+                self.config.index.busy_timeout_ms,
+                &args,
+                cancellation,
+            ),
+            None => crate::sql_query::query_path(
+                &self.config.db_path(),
+                self.config.index.busy_timeout_ms,
+                &args,
+            ),
+        }?;
         crate::sql_query::truncate_cells(&mut result, query.max_cell_chars);
         Ok(result)
     }
@@ -2336,15 +2350,32 @@ impl<'config> SqlService<'config> {
         &self,
         query: &crate::sql_query::SqlSchemaQuery,
     ) -> Result<crate::sql_query::QueryResult> {
-        crate::sql_query::schema_path(
-            &self.config.db_path(),
-            self.config.index.busy_timeout_ms,
-            &crate::sql_query::DbSchemaArgs {
-                table: query.table.clone(),
-                include_internal: query.include_internal,
-                format: crate::render::OutputFormat::Table,
-            },
-        )
+        self.schema_cancellable(query, None)
+    }
+
+    pub(crate) fn schema_cancellable(
+        &self,
+        query: &crate::sql_query::SqlSchemaQuery,
+        cancellation: Option<&QueryCancellation>,
+    ) -> Result<crate::sql_query::QueryResult> {
+        let args = crate::sql_query::DbSchemaArgs {
+            table: query.table.clone(),
+            include_internal: query.include_internal,
+            format: crate::render::OutputFormat::Table,
+        };
+        match cancellation {
+            Some(cancellation) => crate::sql_query::schema_path_cancellable(
+                &self.config.db_path(),
+                self.config.index.busy_timeout_ms,
+                &args,
+                cancellation,
+            ),
+            None => crate::sql_query::schema_path(
+                &self.config.db_path(),
+                self.config.index.busy_timeout_ms,
+                &args,
+            ),
+        }
     }
 }
 
