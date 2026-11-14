@@ -181,7 +181,7 @@ impl GeminiCliAdapter {
         let mut messages = Vec::new();
         let mut file_edits = Vec::new();
         let mut file_edit_call_ids = Vec::new();
-        let mut mutations = PendingFileMutations::default();
+        let mut mutations = GeminiFileMutations::default();
         for message in data
             .get("messages")
             .and_then(Value::as_array)
@@ -969,7 +969,7 @@ struct NativeReplay {
 
 struct RenderedMessages {
     messages: Vec<RawMessage>,
-    mutations: PendingFileMutations,
+    mutations: GeminiFileMutations,
     file_edits: Vec<FileEdit>,
     file_edit_call_ids: Vec<String>,
     keys: HashSet<String>,
@@ -1202,7 +1202,7 @@ impl NativeReplay {
     fn render(&self, evidence: UserRoleEvidence, provider_id: &str) -> RenderedMessages {
         let mut rendered = RenderedMessages {
             messages: Vec::new(),
-            mutations: PendingFileMutations::default(),
+            mutations: GeminiFileMutations::default(),
             file_edits: Vec::new(),
             file_edit_call_ids: Vec::new(),
             keys: HashSet::new(),
@@ -1449,13 +1449,21 @@ impl NativeReplay {
     }
 }
 
+/// One causal replay state per touched file, never read from the live filesystem.
+/// Count checking scans only the current content, not the complete edit history.
+#[derive(Default)]
+struct GeminiFileMutations {
+    pending: PendingFileMutations,
+    content: HashMap<String, String>,
+}
+
 /// Decode only outcomes bound to the recorded call. Missing outcomes, errors and rejected
-/// calls are not filesystem evidence. Time and retained memory are linear in argument bytes;
-/// the shared mutation tracker assigns causal edit sequences without buffering the source.
+/// calls are not filesystem evidence. O(argument bytes + replayed bytes) time, with one latest
+/// content per touched file retained; no whole-source buffering or repeated history replay.
 fn collect_file_mutation(
     call: &Value,
     timestamp: Option<DateTime<Utc>>,
-    pending: &mut PendingFileMutations,
+    mutations: &mut GeminiFileMutations,
     edits: &mut Vec<FileEdit>,
     call_ids: &mut Vec<String>,
 ) {
@@ -1497,20 +1505,42 @@ fn collect_file_mutation(
     if !success {
         return;
     }
-    pending.stage(
-        Some(id),
-        timestamp,
-        name,
-        file_mutation_payload(name, call.get("args")),
-    );
+    let args = call.get("args");
+    let previous = args
+        .and_then(|args| args.get("file_path"))
+        .and_then(Value::as_str)
+        .and_then(|path| mutations.content.get(path));
+    let payload = file_mutation_payload(name, args, previous.map(String::as_str));
+    mutations.pending.stage(Some(id), timestamp, name, payload);
     let previous_count = edits.len();
-    pending.finish(Some(id), true, edits);
+    mutations.pending.finish(Some(id), true, edits);
     if edits.len() > previous_count {
         call_ids.push(id.to_string());
+        let edit = edits.last().expect("newly completed edit");
+        let current = if let Some(full) = &edit.new_content {
+            Some(full.clone())
+        } else {
+            // Reuse the shared replay semantics with one cached base and one delta.
+            mutations
+                .content
+                .remove(&edit.file_path)
+                .and_then(|content| {
+                    let mut base = FileEdit::new(0, "write_file", &edit.file_path);
+                    base.new_content = Some(content);
+                    crate::files::reconstruct(&[base, edit.clone()], 2)
+                })
+        };
+        if let Some(current) = current {
+            mutations.content.insert(edit.file_path.clone(), current);
+        }
     }
 }
 
-fn file_mutation_payload(name: &str, args: Option<&Value>) -> Option<FileMutationPayload> {
+fn file_mutation_payload(
+    name: &str,
+    args: Option<&Value>,
+    previous: Option<&str>,
+) -> Option<FileMutationPayload> {
     let args = args?;
     let path = args.get("file_path")?.as_str()?.to_string();
     match name {
@@ -1526,14 +1556,27 @@ fn file_mutation_payload(name: &str, args: Option<&Value>) -> Option<FileMutatio
             if old.is_empty() {
                 return Some((path, Some(new), Vec::new()));
             }
-            let replace_all = args
+            let allow_multiple = args
                 .get("allow_multiple")
                 .and_then(Value::as_bool)
-                .unwrap_or(false)
-                || args
-                    .get("expected_replacements")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|n| n > 1);
+                .unwrap_or(false);
+            let expected = args.get("expected_replacements").and_then(Value::as_u64);
+            let replace_all = allow_multiple || expected.is_some_and(|n| n > 1);
+            // The old count-bearing schema promises an exact count, not merely "replace all".
+            // Missing bases and contradictory counts retain a path-only gap instead of bytes
+            // that a later extractor could mistake for a successful partial replacement.
+            if let Some(expected) = expected {
+                if expected == 0
+                    || !previous.is_some_and(|text| text.matches(&old).count() as u64 == expected)
+                {
+                    return Some((path, None, Vec::new()));
+                }
+            } else if let Some(previous) = previous {
+                let count = previous.matches(&old).count();
+                if count == 0 || (!allow_multiple && count != 1) {
+                    return Some((path, None, Vec::new()));
+                }
+            }
             Some((
                 path,
                 None,
@@ -1980,6 +2023,88 @@ mod tests {
                 Some("two two")
             );
             assert_eq!(parsed.file_edits[1].seq, 1);
+        }
+    }
+
+    #[test]
+    fn replacement_counts_match_indexed_content_in_both_formats() {
+        for (options, expected) in [
+            (json!({"allow_multiple":true}), Some("two two")),
+            (json!({"expected_replacements":2}), Some("two two")),
+            (json!({"expected_replacements":1}), None),
+            (json!({"expected_replacements":3}), None),
+            (
+                json!({"allow_multiple":true,"expected_replacements":3}),
+                None,
+            ),
+        ] {
+            let mut args =
+                json!({"file_path":"/tmp/example.txt","old_string":"one","new_string":"two"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            let record = json!({"id":"m","type":"gemini","content":[],"toolCalls":[
+                {"id":"w","name":"write_file","args":{"file_path":"/tmp/example.txt","content":"one one"},
+                 "result":[{"functionResponse":{"id":"w","name":"write_file","response":{"output":"written"}}}]},
+                {"id":"r","name":"replace","args":args,
+                 "result":[{"functionResponse":{"id":"r","name":"replace","response":{"output":"replaced"}}}]}
+            ]});
+            let adapter = GeminiCliAdapter::new(Vec::new());
+            let legacy = adapter
+                .parse_raw(
+                    Path::new("session-count.json"),
+                    json!({"sessionId":"count","messages":[record.clone()]}).to_string(),
+                )
+                .unwrap();
+            let native = adapter
+                .parse_reader(
+                    std::io::Cursor::new(format!("{}\n{record}\n", json!({"sessionId":"count"}))),
+                    Path::new("session-count.jsonl"),
+                )
+                .unwrap();
+            for parsed in [legacy, native] {
+                assert_eq!(parsed.file_edits.len(), 2);
+                assert_eq!(
+                    crate::files::reconstruct(&parsed.file_edits, 1).as_deref(),
+                    Some("one one")
+                );
+                assert_eq!(
+                    crate::files::reconstruct(&parsed.file_edits, 2).as_deref(),
+                    expected,
+                    "{options}"
+                );
+                if expected.is_none() {
+                    let mut old = parsed.clone();
+                    old.session.parse_version = "gemini-cli-v10".into();
+                    old.file_edits[1].edits = vec![EditOp {
+                        old: "one".into(),
+                        new: "two".into(),
+                        replace_all: options
+                            .get("expected_replacements")
+                            .and_then(Value::as_u64)
+                            .is_some_and(|n| n > 1)
+                            || options.get("allow_multiple") == Some(&json!(true)),
+                    }];
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+                    db.upsert_session(&old, 1, 1).unwrap();
+                    for generation in [2, 3] {
+                        db.upsert_session(&parsed, generation, generation).unwrap();
+                        let edits = db
+                            .file_edits_for("example.txt", None)
+                            .unwrap()
+                            .into_iter()
+                            .map(|(_, _, e)| e)
+                            .collect::<Vec<_>>();
+                        assert_eq!(
+                            edits.len(),
+                            3,
+                            "retain the archived delta and append the refusal boundary once"
+                        );
+                        assert_eq!(crate::files::reconstruct(&edits, edits.len()), None);
+                    }
+                }
+            }
         }
     }
 
