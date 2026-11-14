@@ -2123,6 +2123,101 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
         )
 
 
+@pytest.mark.parametrize("surface", ["python", "cli", "mcp"])
+@pytest.mark.parametrize(
+    ("prefix", "expected"),
+    [
+        (r"C:\WORK\proj/", ["claude:w0", "claude:w1"]),
+        ("//SERVER/share/proj/", ["claude:u0", "claude:u1"]),
+        ("/work/Proj/", ["claude:p0", "claude:p1"]),
+        ("/work/proj", ["claude:p2", "claude:p3"]),
+    ],
+)
+def test_portable_path_matching_across_python_cli_and_mcp(
+    tmp_path: Path, surface: str, prefix: str, expected: list[str],
+) -> None:
+    database = tmp_path / "index.db"
+    with native.SessionSearch(database):
+        pass
+    paths = [
+        ("w0", "C:/work/Proj/"), ("w1", r"c:\work\proj/sub"),
+        ("w2", "C:/work/project-other"),
+        ("u0", r"\\Server\Share\Proj"), ("u1", "//server/share/proj/sub"),
+        ("u2", "//server/share/project-other"),
+        ("p0", "/work/Proj"), ("p1", "/work/Proj/sub"),
+        ("p2", "/work/proj"), ("p3", "/work/proj/sub"),
+    ]
+    with write_database(database) as connection:
+        for name, cwd in paths:
+            session_id = "claude:" + name
+            connection.execute(
+                """insert into sessions(id,provider,provider_session_id,cwd,preview_text,
+                   source_path,parse_version,discovery_source)
+                   values (?,'claude',?,?,'','/fixture','test','fixture')""",
+                (session_id, name, cwd),
+            )
+            connection.execute(
+                """insert into messages(session_id,provider,seq,role,kind,content)
+                   values (?,'claude',0,'user','conversation','needle')""",
+                (session_id,),
+            )
+    env = isolated_environment(tmp_path / "runtime")
+    env["AI_SESSION_SEARCH_DATABASE"] = str(database)
+    command = [sys.executable, "-c", "from ai_session_search.entrypoint import cli_main; cli_main()",
+               "--index-refresh", "existing-only"]
+    for exclude in [False, True]:
+        if surface == "python":
+            with native.SessionSearch(database, index_refresh="existing-only") as search:
+                scope = native.MessageScope(
+                    workspace_path_prefix=None if exclude else prefix,
+                    exclusions=native.MessageExclusions(
+                        workspace_path_prefixes=[prefix] if exclude else [],
+                    ),
+                )
+                results = search.search_messages("needle", native.MessageSearchRequest(scope=scope)).results
+                if not exclude:
+                    assert sorted(s.id for s in search.list_sessions(native.SessionQuery(path_prefix=prefix))) == expected
+        elif surface == "cli":
+            result = subprocess.run(
+                [*command, "messages", "search", "needle", "--format", "json",
+                 "--exclude-workspace-path" if exclude else "--workspace-path", prefix],
+                env=env, capture_output=True, text=True, check=True, timeout=30,
+            )
+            results = json.loads(result.stdout)["results"]
+            if not exclude:
+                listed = subprocess.run(
+                    [*command, "list", "--path", prefix, "--format", "json"],
+                    env=env, capture_output=True, text=True, check=True, timeout=30,
+                )
+                assert sorted(s["id"] for s in json.loads(listed.stdout)) == expected
+        else:
+            arguments = {
+                "query": "needle", "index_refresh": "existing-only",
+                **({"exclude_workspace_path_prefixes": [prefix]} if exclude
+                   else {"workspace_path_prefix": prefix}),
+            }
+            requests = [
+                {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-11-25", "capabilities": {},
+                    "clientInfo": {"name": "synthetic-test", "version": "1"}}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+                    "name": "search_messages", "arguments": arguments}},
+            ]
+            result = subprocess.run(
+                [*command, "mcp", "serve"],
+                input="".join(json.dumps(request) + "\n" for request in requests),
+                env=env, capture_output=True, text=True, check=True, timeout=30,
+            )
+            response = next(json.loads(line) for line in result.stdout.splitlines()
+                            if json.loads(line).get("id") == 2)
+            assert "error" not in response, response
+            assert not response["result"].get("isError"), response
+            results = response["result"]["structuredContent"]["results"]
+        wanted = sorted("claude:" + name for name, _ in paths if "claude:" + name not in expected) if exclude else expected
+        assert sorted(hit["message_ref"]["session_id"] for hit in results) == wanted
+
+
 def test_native_message_scope_keeps_workspace_and_transcript_paths_independent(
     tmp_path: Path,
 ) -> None:
