@@ -313,14 +313,15 @@ fn automatic_mcp_refresh_preserves_unrecognized_duplicates() {
             if args[0] == "integrations" {
                 let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert!(
-                    status["integrations"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .any(|entry| entry["component"] == "mcp"
-                            && entry["path"] == path.to_str().unwrap()
+                    status["integrations"].as_array().unwrap().iter().any(
+                        |entry| entry["component"] == "mcp"
+                            // Compare as paths: the fixture joins a `/`-separated suffix,
+                            // and the report uses the host separator.
+                            && entry["path"].as_str().map(std::path::Path::new)
+                                == Some(path.as_path())
                             && entry["state"] == "stale"
-                            && entry["current"] == false),
+                            && entry["current"] == false
+                    ),
                     "{status}"
                 );
             }
