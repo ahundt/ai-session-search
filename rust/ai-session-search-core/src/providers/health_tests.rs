@@ -449,6 +449,37 @@ fn nested_and_unimplemented_content_types_are_reported_without_new_indexing() {
 }
 
 #[test]
+fn supported_native_type_fallbacks_are_not_reported_as_unknown() {
+    for (provider, record) in [
+        (
+            Provider::Pi,
+            json!({"type":"message","message":{"role":null,"type":"bashExecution","command":"echo synthetic","output":"synthetic"}}),
+        ),
+        (
+            Provider::PrimeAgent,
+            json!({"type":"message","message":{"role":null,"type":"bashExecution","command":"echo synthetic","output":"synthetic"}}),
+        ),
+        (
+            Provider::Antigravity,
+            json!({"type":"","source":"MODEL","content":"synthetic fallback"}),
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let parsed = parse(provider, &dir.path().join("synthetic.jsonl"), &[record]);
+        assert!(!parsed.messages.is_empty(), "{provider:?}");
+        let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        assert!(
+            db.parser_health()
+                .unwrap()
+                .unrecognized_record_types
+                .is_empty(),
+            "{provider:?}"
+        );
+    }
+}
+
+#[test]
 fn explicitly_ignored_bookkeeping_is_not_reported() {
     for (provider, names) in [
         (Provider::Codex, vec!["turn_context", "token_usage_record"]),
