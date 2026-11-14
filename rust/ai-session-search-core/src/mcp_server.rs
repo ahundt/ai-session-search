@@ -4890,7 +4890,7 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                 {
                     "name": "get_index_status",
                     "annotations": read_only_tool_annotations(),
-                    "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, actionable automatic index-update status when work is running or requires attention, and applicable repair commands. Equivalent to `aise doctor --format json`."),
+                    "description": format!("Return index and parser status for {provider_summary}: current and stale session counts, parse warnings, discoverable sessions that can be reindexed, retained sessions whose source files are unavailable, actionable automatic index-update status when work is running or requires attention, and applicable repair commands. Like `aise doctor --format json`, without config-file metadata."),
                     "outputSchema": get_index_status_output_schema(),
                     "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
                 },
