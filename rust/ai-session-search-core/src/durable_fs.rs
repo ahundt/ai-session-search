@@ -23,6 +23,46 @@ pub(crate) fn entry_exists(path: &Path) -> io::Result<bool> {
     }
 }
 
+/// Check Windows link privilege before publishing any installation files.
+/// Only ERROR_PRIVILEGE_NOT_HELD is a missing capability; other I/O failures remain errors.
+#[cfg(windows)]
+pub(crate) fn symlinks_available() -> io::Result<bool> {
+    let sequence = STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "aise-link-probe-{}-{stamp}-{sequence}",
+        std::process::id()
+    ));
+    fs::create_dir(&root)?;
+    let target = root.join("target");
+    let file = root.join("file");
+    let directory = root.join("directory");
+    let result = (|| {
+        std::os::windows::fs::symlink_file(&target, &file)?;
+        std::os::windows::fs::symlink_dir(&target, &directory)
+    })();
+    // Cleanup only entries this probe created, including dangling directory links.
+    for link in [&file, &directory] {
+        if entry_exists(link)? {
+            remove_owned_link(link, &target)?;
+        }
+    }
+    fs::remove_dir(&root)?;
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.raw_os_error() == Some(1314) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn symlinks_available() -> io::Result<bool> {
+    Ok(true)
+}
+
 /// Remove only a link whose stored target still matches the transaction's ownership evidence.
 /// Never traverse the entry or recursively delete anything beneath it.
 pub(crate) fn remove_owned_link(path: &Path, expected_target: &Path) -> io::Result<()> {
