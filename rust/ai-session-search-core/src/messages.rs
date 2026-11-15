@@ -617,7 +617,6 @@ const ADVANCED_HEADING: &str = "Advanced (purpose bundles, receipts, self-descri
             "positional_query",
             "query_arg",
             "role",
-            "kind",
             "kinds",
             "field",
             "argument_path",
@@ -677,15 +676,16 @@ pub struct MessageSearchArgs {
     /// other values select stored assistant, tool, slash or compaction records. Omit for all content.
     #[arg(help_heading = FILTER_HEADING, long = "role", value_enum)]
     pub role: Option<Role>,
-    /// Restrict by semantic message kind; tool calls and results are distinct. One-value alias
-    /// for --kinds.
-    #[arg(help_heading = FILTER_HEADING, long, value_enum)]
+    /// Deprecated Rust argument field; use kinds. Not a separate CLI parameter.
+    /// Direct adapter callers may still supply one class here; it combines with kinds.
+    #[arg(skip)]
     pub kind: Option<MessageKind>,
     /// Message classes to return. Omit for every class except harness-notice, which is what the
     /// harness told the agent (Stop-hook feedback, PreToolUse blocks, local-command caveats,
     /// task notifications) rather than what the user wrote. Pass harness-notice to answer why an
-    /// agent stopped, looped, or was blocked. This is the single class filter; --kind selects one.
-    #[arg(help_heading = FILTER_HEADING, long, value_enum, num_args = 1.., value_delimiter = ',', conflicts_with = "kind")]
+    /// agent stopped, looped, or was blocked. Alias: --kind; repeated spellings combine
+    /// comma- or space-separated values.
+    #[arg(help_heading = FILTER_HEADING, long, alias = "kind", value_enum, num_args = 1.., value_delimiter = ',')]
     pub kinds: Vec<MessageKind>,
     /// QUERY searches only this field: content, canonical tool name, or one tool-argument path.
     #[arg(help_heading = QUERY_HEADING, long, value_enum, default_value_t = SearchField::Content)]
@@ -1221,12 +1221,8 @@ fn run_search(db: &Db, args: &MessageSearchArgs, config: &Config) -> Result<()> 
     if let Some(role) = args.role {
         builder = builder.role(role);
     }
-    // clap enforces that --kind and --kinds are not both given, so this cannot silently
-    // discard one: they are two spellings of one selection, not two filters that combine.
-    if let Some(kind) = args.kind {
-        builder = builder.kind(kind);
-    } else if !args.kinds.is_empty() {
-        builder = builder.kinds(args.kinds.clone());
+    if !args.kinds.is_empty() || args.kind.is_some() {
+        builder = builder.kinds(args.kinds.iter().copied().chain(args.kind).collect());
     }
     if !args.providers.is_empty() {
         builder = builder.providers(args.providers.clone())?;
