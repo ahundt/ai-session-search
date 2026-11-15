@@ -133,11 +133,18 @@ fn filtered_range_reads_share_event_dates_role_and_newest_order() {
     ] {
         let mut read = filter.clone();
         read["session_id"] = json!(id);
-        read["seq_from"] = json!(0);
+
         let mut search = filter;
         search["session_id"] = json!(id);
         search["all_results"] = json!(true);
+        let check_cli_kinds = read.get("kinds").is_some();
         let mut range = read_rows(&mcp_calls(&f, &[("get_session", read)]).remove(0).unwrap());
+        if check_cli_kinds {
+            assert_eq!(
+                cli_read(&f, &["--kinds".into(), "conversation".into()]),
+                range
+            );
+        }
         let result = mcp_calls(&f, &[("search_messages", search)])
             .remove(0)
             .unwrap();
