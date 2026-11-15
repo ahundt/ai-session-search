@@ -5212,7 +5212,8 @@ mod tests {
             "--max-groups",
             "20",
         ]);
-        assert_parses(["aise", "repeats", "--format", "json", "--report"]);
+        assert_parses(["aise", "repeats", "--format", "json"]);
+        assert!(Cli::try_parse_from(["aise", "repeats", "--report"]).is_err());
         assert_rejects(["aise", "repeats", "you forgot", "--similarity"]);
         assert_rejects(["aise", "repeats", "you forgot", "--groups"]);
         assert_rejects(["aise", "repeats", "--context", "-1"]);

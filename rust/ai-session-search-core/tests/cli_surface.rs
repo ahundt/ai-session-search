@@ -298,7 +298,7 @@ fn analytics_exclusions_remove_the_candidate_population() {
             );
         }
         if command[0] == "repeats" {
-            assert!(!unfiltered.as_array().unwrap().is_empty());
+            assert!(!unfiltered["groups"].as_array().unwrap().is_empty());
         }
         if command[0] == "stats" {
             assert_eq!(
@@ -328,13 +328,13 @@ fn analytics_exclusions_remove_the_candidate_population() {
             );
         } else {
             let scoped = rows(&dir, &session_args);
-            assert!(scoped.as_array().unwrap().is_empty());
+            assert!(scoped["groups"].as_array().unwrap().is_empty());
         }
         let mut args = command;
         args.extend(["--exclude-path", "/synthetic", "--format", "json"]);
         let value: Value = serde_json::from_slice(&output(&dir, &args).stdout).unwrap();
         if args[0] == "repeats" {
-            assert_eq!(value, json!([]));
+            assert_eq!(value["groups"], json!([]));
         } else if args[0] == "skills" {
             assert_eq!(value["output"]["result"]["report"]["matches"], json!([]));
         } else {

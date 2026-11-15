@@ -753,7 +753,7 @@ pub struct RepeatsReport {
 }
 
 impl RepeatsReport {
-    /// JSON report rendered by `aise repeats --report --format json`.
+    /// JSON report rendered by `aise repeats --format json`.
     ///
     /// `context` supplies the neighbor count in each example's follow-up command; it does
     /// not change the mined groups or example membership. Conversion allocates `O(E + G)`
@@ -818,7 +818,7 @@ struct RepeatExampleRow {
     context_command: String,
 }
 
-/// `aise repeats` row for one group. Its JSON shape is what `--format json` has always printed.
+/// One repeat group, nested under `groups` in JSON reports and rendered as a row for human output.
 #[derive(Debug, Serialize)]
 struct RepeatGroupRow {
     repeat: String,
@@ -915,7 +915,7 @@ pub(crate) struct RepeatsArgs {
     pub limit: usize,
     /// Also mine messages typed while the agent was working whose transcript does not record who
     /// sent them (older Claude Code versions). Off by default because a program may have sent
-    /// them; a note on stderr counts how many were left out. Applies to user text only.
+    /// them. JSON/JSONL reports include the count; human output warns on stderr. Applies to user text only.
     #[arg(long)]
     pub include_unattributed_input: bool,
     /// Max repeat groups to output. Omit to use `[analytics].repeat_max_groups`. 0 = every group.
@@ -936,14 +936,10 @@ pub(crate) struct RepeatsArgs {
     /// Maximum words in a discovered phrase. Omit to use `[analytics].repeat_phrase_max_words`.
     #[arg(long)]
     pub phrase_max_words: Option<usize>,
-    /// Output format.
+    /// Output: table (default), json, jsonl, csv or plain. JSON/JSONL emit one report with groups
+    /// and attribution counts; table, csv and plain emit group rows. Omit for table.
     #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
     pub format: OutputFormat,
-    /// With --format json or jsonl, print one object {groups, unattributed_input_count,
-    /// unattributed_input_included} instead of the bare array of groups, so the count of queued
-    /// messages left out travels with the result. Omit to keep the bare array.
-    #[arg(long)]
-    pub report: bool,
 }
 
 pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Result<()> {
@@ -955,9 +951,6 @@ pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Resul
     }
     if (args.regex || args.query_mode.is_some()) && args.query.is_none() {
         bail!("--query-mode and deprecated --regex require QUERY");
-    }
-    if args.report && !matches!(args.format, OutputFormat::Json | OutputFormat::Jsonl) {
-        bail!("--report requires --format json or --format jsonl");
     }
     let (since, until) = args.dates.resolve_now()?;
     let query = RepeatsQuery {
@@ -992,7 +985,7 @@ pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Resul
         .iter()
         .map(|group| RepeatGroupRow::new(group, args.context))
         .collect::<Vec<_>>();
-    if args.report {
+    if matches!(args.format, OutputFormat::Json | OutputFormat::Jsonl) {
         let envelope = report.to_json(args.context);
         if args.format == OutputFormat::Json {
             println!("{}", serde_json::to_string_pretty(&envelope)?);
@@ -1003,7 +996,7 @@ pub(crate) fn run_repeats(db: &Db, config: &Config, args: &RepeatsArgs) -> Resul
     }
     emit(&rows, args.format)?;
     if !report.unattributed_input_included {
-        // On stderr: the bare JSON array of groups has nowhere to carry it; --report does.
+        // Human formats show attribution omissions on stderr; machine formats include counts.
         if let Some(note) = unattributed_input_note(report.unattributed_input_count) {
             eprintln!("{note}");
         }

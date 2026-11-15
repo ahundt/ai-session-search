@@ -147,7 +147,7 @@ def test_invalid_version_keeps_legacy_overflow_handler(corpus):
 
 def test_analysis_calls_match_cli(corpus):
     assert corpus.vocabulary(limit=4) == cli(corpus, "vocab", "--limit", "4", "--format", "json")
-    assert corpus.repeats(max_groups=3) == cli(corpus, "repeats", "--max-groups", "3", "--report", "--format", "json")
+    assert corpus.repeats(max_groups=3) == cli(corpus, "repeats", "--max-groups", "3", "--format", "json")
     assert corpus.repeats("forgot", query_mode="regex", min_matches=2)["groups"]
 
 

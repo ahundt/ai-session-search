@@ -166,7 +166,7 @@ fn cli_corrections_repeats_and_doctor_read_only_typed_text() {
         let output = indexed.aise().args(&args).output().unwrap();
         assert!(output.status.success(), "{output:?}");
         let groups: Value = serde_json::from_slice(&output.stdout).unwrap();
-        let groups = groups.as_array().unwrap();
+        let groups = groups["groups"].as_array().unwrap();
         let mut texts = strings(groups.iter().map(|group| group["repeat"].clone()));
         texts.extend(strings(groups.iter().flat_map(|group| {
             group["examples"]
@@ -184,7 +184,7 @@ fn cli_corrections_repeats_and_doctor_read_only_typed_text() {
         !texts.iter().any(|text| text == QUEUED_UNATTRIBUTED),
         "{texts:#?}"
     );
-    assert!(stderr.contains("1 queued message left out"), "{stderr}");
+    assert!(!stderr.contains("left out"), "{stderr}");
     let (texts, stderr) = repeats(&["--include-unattributed-input"]);
     assert!(
         texts.iter().any(|text| text == QUEUED_UNATTRIBUTED),
@@ -192,16 +192,14 @@ fn cli_corrections_repeats_and_doctor_read_only_typed_text() {
     );
     assert!(!stderr.contains("left out"), "{stderr}");
 
-    // `--report` carries the same groups with the left-out count inside the JSON, while plain
-    // `--format json` keeps printing the bare array current readers parse.
-    let bare = indexed.json(&["repeats", "--format", "json"]);
-    let report = indexed.json(&["repeats", "--format", "json", "--report"]);
-    assert_eq!(report["groups"], bare, "{report:#}");
+    // Both machine formats carry attribution counts alongside the selected groups.
+    let report = indexed.json(&["repeats", "--format", "json"]);
+    assert!(report["groups"].is_array(), "{report:#}");
     assert_eq!(report["unattributed_input_count"], json!(1), "{report:#}");
     assert_eq!(report["unattributed_input_included"], json!(false));
     let line = indexed
         .aise()
-        .args(["repeats", "--format", "jsonl", "--report"])
+        .args(["repeats", "--format", "jsonl"])
         .output()
         .unwrap();
     assert!(line.status.success(), "{line:?}");
@@ -214,8 +212,7 @@ fn cli_corrections_repeats_and_doctor_read_only_typed_text() {
         .unwrap();
     assert!(!table.status.success());
     assert!(
-        String::from_utf8_lossy(&table.stderr)
-            .contains("--report requires --format json or --format jsonl"),
+        String::from_utf8_lossy(&table.stderr).contains("unexpected argument '--report'"),
         "{table:?}"
     );
 

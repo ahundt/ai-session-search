@@ -1648,7 +1648,12 @@ fn timeline_and_repeats_query_mode_regex_preserves_legacy_matches() {
                     "{stderr}"
                 );
             }
-            serde_json::from_slice::<Value>(&output.stdout).unwrap()
+            let value = serde_json::from_slice::<Value>(&output.stdout).unwrap();
+            if command == "repeats" {
+                value["groups"].clone()
+            } else {
+                value
+            }
         };
         let canonical = run(false, "regex");
         assert!(!canonical.as_array().unwrap().is_empty(), "{command}");
