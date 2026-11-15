@@ -1719,6 +1719,7 @@ fn default_antigravity_paths() -> Vec<String> {
     let mut paths = Vec::new();
     push_unique_path(&mut paths, home.join(".gemini/antigravity-cli/brain"));
     push_unique_path(&mut paths, home.join(".gemini/antigravity/brain"));
+    push_unique_path(&mut paths, home.join(".gemini/antigravity-ide/brain"));
     paths
 }
 
@@ -3230,9 +3231,42 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_default_paths_include_cli_and_legacy_brain_roots() {
+    fn antigravity_default_paths_include_app_cli_and_ide_brain_roots() {
         let cfg = Config::default();
         let paths = &cfg.providers.antigravity.paths;
+        assert!(paths
+            .iter()
+            .any(|path| path.ends_with(".gemini/antigravity-ide/brain")));
+        let dir = tempfile::tempdir().unwrap();
+        let roots: Vec<PathBuf> = paths
+            .iter()
+            .map(|path| {
+                // Relocate the default suffixes; never traverse the caller's actual session roots.
+                let root = std::path::Path::new(path);
+                dir.path()
+                    .join(".gemini")
+                    .join(root.parent().unwrap().file_name().unwrap())
+                    .join("brain")
+            })
+            .collect();
+        let transcript = dir.path().join(
+            ".gemini/antigravity-ide/brain/synthetic-ide/.system_generated/logs/transcript.jsonl",
+        );
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"type\":\"USER_INPUT\",\"content\":\"synthetic\"}\n",
+        )
+        .unwrap();
+        let files = crate::providers::antigravity::AntigravityAdapter::new(roots).discover();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, transcript);
+        let custom: Config =
+            toml::from_str("[providers.antigravity]\npaths = [\"custom-only\"]").unwrap();
+        assert_eq!(
+            custom.antigravity_paths(),
+            vec![PathBuf::from("custom-only")]
+        );
         let unique: std::collections::HashSet<_> = paths.iter().collect();
         assert_eq!(
             unique.len(),
