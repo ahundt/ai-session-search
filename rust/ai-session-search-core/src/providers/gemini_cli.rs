@@ -647,6 +647,26 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
         );
         Ok(ids)
     };
+    // Tool rows retain count-bearing arguments even when a member lacks the base.
+    // Revalidate against the merged history, never infer a count from a lossy EditOp.
+    let mut calls = HashMap::new();
+    for message in successor.messages.iter().chain(&predecessor.messages) {
+        if message.kind != MessageKind::ToolCall
+            || !matches!(message.tool_name.as_deref(), Some("write_file" | "replace"))
+        {
+            continue;
+        }
+        if let Some(id) = message.tool_call_id.as_deref() {
+            let value: Value = serde_json::from_str(&message.content)?;
+            let args = value.get("args").cloned().unwrap_or(Value::Null);
+            if let Some(existing) = calls.insert(id, args.clone()) {
+                anyhow::ensure!(
+                    existing == args,
+                    "Gemini migration family has conflicting file call {id}"
+                );
+            }
+        }
+    }
     let mut successor_ids = ids(successor)?;
     let mut seen = successor_ids
         .iter()
@@ -671,8 +691,9 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
                 existing.ts == edit.ts
                     && existing.tool == edit.tool
                     && existing.file_path == edit.file_path
-                    && existing.new_content == edit.new_content
-                    && existing.edits == edit.edits,
+                    && (calls.contains_key(id.as_str())
+                        || (existing.new_content == edit.new_content
+                            && existing.edits == edit.edits)),
                 "Gemini migration family has conflicting file call {id}"
             );
             predecessor_order.push(index);
@@ -735,6 +756,7 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
         .map(Some)
         .collect::<Vec<_>>();
     let mut ordered_ids = Vec::new();
+    let mut content = HashMap::new();
     for (seq, index) in order.into_iter().enumerate() {
         let mut edit = edits[index].take().expect("unique merged edit");
         edit.seq = seq as i64;
@@ -742,7 +764,17 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
         if uncertain.contains(&index) {
             edit.new_content = None;
             edit.edits.clear();
+        } else if let Some(args) = calls.get(successor_ids[index].as_str()) {
+            if let Some((_, full, delta)) = file_mutation_payload(
+                &edit.tool,
+                Some(args),
+                content.get(&edit.file_path).map(String::as_str),
+            ) {
+                edit.new_content = full;
+                edit.edits = delta;
+            }
         }
+        advance_file_content(&edit, &mut content);
         successor.file_edits.push(edit);
         ordered_ids.push(successor_ids[index].clone());
     }
@@ -1614,22 +1646,25 @@ fn collect_file_mutation(
     if edits.len() > previous_count {
         call_ids.push(id.to_string());
         let edit = edits.last().expect("newly completed edit");
-        let current = if let Some(full) = &edit.new_content {
-            Some(full.clone())
-        } else {
-            // Reuse the shared replay semantics with one cached base and one delta.
-            mutations
-                .content
-                .remove(&edit.file_path)
-                .and_then(|content| {
-                    let mut base = FileEdit::new(0, "write_file", &edit.file_path);
-                    base.new_content = Some(content);
-                    crate::files::reconstruct(&[base, edit.clone()], 2)
-                })
-        };
-        if let Some(current) = current {
-            mutations.content.insert(edit.file_path.clone(), current);
-        }
+        advance_file_content(edit, &mut mutations.content);
+    }
+}
+
+/// Advance one file once per mutation, retaining only its latest recoverable bytes.
+/// O(base bytes + delta bytes) time and temporary space; a gap removes the cached base.
+fn advance_file_content(edit: &FileEdit, content: &mut HashMap<String, String>) {
+    let previous = content.remove(&edit.file_path);
+    let current = if let Some(full) = &edit.new_content {
+        Some(full.clone())
+    } else {
+        previous.and_then(|previous| {
+            let mut base = FileEdit::new(0, "write_file", &edit.file_path);
+            base.new_content = Some(previous);
+            crate::files::reconstruct(&[base, edit.clone()], 2)
+        })
+    };
+    if let Some(current) = current {
+        content.insert(edit.file_path.clone(), current);
     }
 }
 
@@ -2407,6 +2442,57 @@ mod tests {
                     assert_eq!(crate::files::reconstruct(&edits, 1), None);
                     assert_eq!(crate::files::reconstruct(&edits, 2), None);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn migration_replacements_validate_against_the_merged_base() {
+        let adapter = GeminiCliAdapter::new(Vec::new());
+        for expected in [1, 2, 3] {
+            let record = |id: &str, name: &str, args: Value, ts: &str| {
+                json!({
+                    "id":id,"type":"gemini","content":[],"timestamp":ts,"toolCalls":[{
+                        "id":id,"name":name,"args":args,
+                        "result":[{"functionResponse":{"id":id,"name":name,"response":{"output":"done"}}}]
+                    }]
+                })
+            };
+            let write = record(
+                "w",
+                "write_file",
+                json!({"file_path":"/tmp/example.txt","content":"one one"}),
+                "2026-01-01T00:00:01Z",
+            );
+            let replace = record(
+                "r",
+                "replace",
+                json!({
+                    "file_path":"/tmp/example.txt","old_string":"one","new_string":"two",
+                    "expected_replacements":expected
+                }),
+                "2026-01-01T00:00:02Z",
+            );
+            for overlap in [false, true] {
+                let predecessor = adapter.parse_raw(
+                    Path::new("session-count-family.json"),
+                    json!({"sessionId":"count-family","messages":if overlap { vec![write.clone(), replace.clone()] } else { vec![write.clone()] }}).to_string()
+                ).unwrap();
+                let successor = adapter
+                    .parse_reader(
+                        std::io::Cursor::new(format!(
+                            "{}\n{replace}\n",
+                            json!({"sessionId":"count-family"})
+                        )),
+                        Path::new("session-count-family.jsonl"),
+                    )
+                    .unwrap();
+                let merged = merge_migration_family(successor, predecessor).unwrap();
+                assert_eq!(merged.file_edits.len(), 2);
+                assert_eq!(
+                    crate::files::reconstruct(&merged.file_edits, 2).as_deref(),
+                    if expected == 2 { Some("two two") } else { None }
+                );
             }
         }
     }
