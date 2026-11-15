@@ -1051,9 +1051,24 @@ pub(crate) fn reindex_until(
         } else {
             (false, None)
         };
+        // Cursor's file-derived anchor survives a full refresh on filesystems that
+        // have no birth time. This keyed session lookup reads no source bytes.
+        let cursor_clock_seed = if source.provider == Provider::Cursor {
+            expected_session_id
+                .map(|id| db.resolve_session_record(id))
+                .transpose()?
+                .as_ref()
+                .map(crate::providers::cursor::clock_seed)
+        } else {
+            None
+        };
         let mut parsed = match parsed_from_family {
             Some(parsed) => parsed,
-            None => match adapters.parse_until(source, should_cancel) {
+            None => match adapters.parse_until_with_clock_seed(
+                source,
+                should_cancel,
+                cursor_clock_seed.as_deref(),
+            ) {
                 Ok(Some(parsed)) => parsed,
                 Ok(None) => {
                     return Ok(ReindexRun::Cancelled {

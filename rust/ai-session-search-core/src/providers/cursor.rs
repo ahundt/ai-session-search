@@ -106,6 +106,50 @@ impl CursorAdapter {
         path: &Path,
         context: Option<crate::tail::TailContext<'_>>,
     ) -> Result<ParsedSession> {
+        self.parse_reader_with_clock_seed(
+            reader,
+            path,
+            context,
+            context.and_then(|c| c.health_seed),
+        )
+    }
+
+    pub(crate) fn parse_reader_with_clock_seed<R: std::io::BufRead>(
+        &self,
+        reader: R,
+        path: &Path,
+        context: Option<crate::tail::TailContext<'_>>,
+        clock_seed: Option<&str>,
+    ) -> Result<ParsedSession> {
+        let metadata = path.metadata().ok();
+        let seed: Value = clock_seed
+            .and_then(|seed| serde_json::from_str(seed).ok())
+            .unwrap_or(Value::Null);
+        let clock = |key: &str| {
+            seed.get(key)
+                .and_then(Value::as_str)
+                .and_then(crate::util::parse_datetime)
+        };
+        let locked_anchor = clock("cursor_clock_anchor");
+        let initial_fallback = cursor_file_time(
+            metadata
+                .as_ref()
+                .and_then(|m| m.created().ok())
+                .map(DateTime::<Utc>::from),
+            metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(DateTime::<Utc>::from),
+            clock("cursor_previous_created_at"),
+        );
+        let mut first_native = None;
+        // Only newly appended rows use this seed. Overlap rows reconstruct state and
+        // are discarded; a result closing an older mutation forces a full parse.
+        let mut last_native = if context.is_some_and(|c| c.prefix_truncated) {
+            clock("cursor_last_native_timestamp")
+        } else {
+            None
+        };
         let mut line_count: usize = 0;
         let mut malformed_line_count: usize = 0;
         let mut valid_record_count: usize = 0;
@@ -128,8 +172,8 @@ impl CursorAdapter {
             .path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned());
-        let mut created_at: Option<DateTime<Utc>> = None;
-        let mut updated_at: Option<DateTime<Utc>> = None;
+        let created_at = None;
+        let updated_at = None;
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
@@ -170,9 +214,13 @@ impl CursorAdapter {
                 .then(|| cursor_native_timestamp(&text).map(|(timestamp, _)| timestamp))
                 .flatten();
             if let Some(timestamp) = timestamp {
-                created_at = Some(created_at.map_or(timestamp, |old| old.min(timestamp)));
-                updated_at = Some(updated_at.map_or(timestamp, |old| old.max(timestamp)));
+                first_native.get_or_insert(timestamp);
+                last_native = Some(timestamp);
             }
+            // Cursor exposes clocks on framed user turns only. Replies, calls and
+            // results inherit the preceding turn's clock; this is not an independent
+            // event measurement. The canonical model has no timestamp-origin field.
+            let timestamp = timestamp.or(last_native);
             // Reuse the claude content-block helpers: capture file-mutating tool calls and
             // tag tool output. (Tool outputs are frequently absent from cursor transcripts on
             // disk; when present they are indexed as Role::Tool.)
@@ -212,10 +260,10 @@ impl CursorAdapter {
                         let (raw_message, transcript_text) = mixed.into_raw_message(timestamp);
                         messages.push(raw_message);
                         if !transcript_text.is_empty() {
-                            transcript_lines.push(format_transcript_line(
-                                "user",
-                                timestamp,
-                                &transcript_text,
+                            transcript_lines.push((
+                                messages.len() - 1,
+                                "user".to_string(),
+                                transcript_text,
                             ));
                         }
                         continue;
@@ -253,9 +301,8 @@ impl CursorAdapter {
                     }
                 }
             }
-            // Unknown clocks remain None, including after the shared indexing fallback.
-            messages.push(RawMessage::message(role, text.clone(), timestamp, None));
-            transcript_lines.push(format_transcript_line(role, timestamp, &text));
+            transcript_lines.push((messages.len(), role.to_string(), text.clone()));
+            messages.push(RawMessage::message(role, text, timestamp, None));
         }
 
         let first_user = messages
@@ -276,11 +323,16 @@ impl CursorAdapter {
             .or_else(|| first_user.clone())
             .map(|text| preview_from_text(&text))
             .unwrap_or_else(|| "(no preview available)".to_string());
+        // Freeze an indexed anchor, even if the first native clock is appended later:
+        // newly available evidence must not move previously dated leading rows.
+        let anchor = locked_anchor.or(first_native).unwrap_or(initial_fallback);
         let repo_root = cwd.as_deref().and_then(find_repo_root);
         let mut raw_metadata = json!({
             "line_count": line_count,
             "valid_record_count": valid_record_count,
             "session_path": normalize_path(path),
+            "cursor_clock_anchor": anchor,
+            "cursor_last_native_timestamp": last_native,
         });
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
@@ -294,7 +346,7 @@ impl CursorAdapter {
         unrecognized.publish(&mut raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
 
-        let session = SessionRecord {
+        let mut session = SessionRecord {
             id: format!("cursor:{provider_session_id}"),
             provider: Provider::Cursor,
             provider_session_id,
@@ -330,8 +382,38 @@ impl CursorAdapter {
             },
         );
         for message in &mut messages {
+            message.ts.get_or_insert(anchor);
             cursor_input_provenance(message);
         }
+        for edit in &mut file_edits {
+            edit.ts.get_or_insert(anchor);
+        }
+        session.created_at = messages
+            .iter()
+            .filter_map(|message| message.ts)
+            .min()
+            .or(Some(anchor));
+        session.updated_at = messages
+            .iter()
+            .filter_map(|message| message.ts)
+            .max()
+            .or(Some(anchor));
+        // With no native clock, mtime still reports the session's observed end.
+        // Only event estimates are frozen; an appended clockless session remains
+        // discoverable by session-span filters for the day it changed.
+        if last_native.is_none() {
+            let modified = metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .map(DateTime::<Utc>::from);
+            session.updated_at = session.updated_at.into_iter().chain(modified).max();
+        }
+        session.last_message_at = session.updated_at;
+        let transcript_text = transcript_lines
+            .into_iter()
+            .map(|(index, role, text)| format_transcript_line(&role, messages[index].ts, &text))
+            .collect::<Vec<_>>()
+            .join("\n\n");
         retracted.messages = crate::util::normalize_raw_messages_with_evidence(
             legacy_messages,
             None,
@@ -343,12 +425,37 @@ impl CursorAdapter {
         );
         Ok(ParsedSession {
             session,
-            transcript_text: transcript_lines.join("\n\n"),
+            transcript_text,
             messages,
             file_edits,
             retracted,
         })
     }
+}
+
+/// Initial clockless sessions use file birth time where available, otherwise the
+/// prior indexed session time, then the first observed mtime. The parser persists
+/// that anchor and reuses it on every full or tail refresh. No-file readers use
+/// the Unix epoch, an explicit unknown-file estimate rather than a changing clock.
+fn cursor_file_time(
+    created: Option<DateTime<Utc>>,
+    modified: Option<DateTime<Utc>>,
+    previous: Option<DateTime<Utc>>,
+) -> DateTime<Utc> {
+    created
+        .or(previous)
+        .or(modified)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
+pub(crate) fn clock_seed(session: &SessionRecord) -> String {
+    let mut metadata = session
+        .raw_metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .unwrap_or_else(|| json!({}));
+    metadata["cursor_previous_created_at"] = json!(session.created_at);
+    metadata.to_string()
 }
 
 fn cursor_message_text(value: &Value) -> String {
@@ -946,19 +1053,9 @@ mod tests {
                 initial.push_str(&padding);
             }
             fs::write(&path, initial).unwrap();
-            let mut config = crate::config::Config::default();
-            config.providers.claude.enabled = false;
-            config.providers.claude_desktop.enabled = false;
-            config.providers.codex.enabled = false;
-            config.providers.antigravity.enabled = false;
-            config.providers.pi.enabled = false;
-            config.providers.prime_agent.enabled = false;
-            config.providers.aistudio.enabled = false;
-            config.providers.gemini_cli.enabled = false;
-            config.providers.cursor.paths = vec![crate::util::normalize_path(&root)];
             let tail_path = temp.path().join("tail.db");
             let tail_db = crate::db::Db::open(&tail_path).unwrap();
-            config.index.db_path = Some(crate::util::normalize_path(&tail_path));
+            let mut config = cursor_fixture_config(&root, &tail_path);
             crate::indexer::reindex(&config, &tail_db, false, None).unwrap();
             assert_eq!(tail_db.file_edit_count().unwrap(), 0);
             writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", json!({
@@ -1099,6 +1196,203 @@ mod tests {
         assert_eq!(message.content, text);
     }
 
+    fn cursor_fixture_config(
+        root: &std::path::Path,
+        database: &std::path::Path,
+    ) -> crate::config::Config {
+        let mut config = crate::config::Config::default();
+        config.providers.claude.enabled = false;
+        config.providers.claude_desktop.enabled = false;
+        config.providers.codex.enabled = false;
+        config.providers.antigravity.enabled = false;
+        config.providers.pi.enabled = false;
+        config.providers.prime_agent.enabled = false;
+        config.providers.aistudio.enabled = false;
+        config.providers.gemini_cli.enabled = false;
+        config.providers.cursor.paths = vec![crate::util::normalize_path(root)];
+        config.index.db_path = Some(crate::util::normalize_path(database));
+        config
+    }
+
+    #[test]
+    fn indexed_clocks_do_not_move_after_a_day_later_append_or_full_refresh() {
+        use std::io::Write;
+        for case in ["clockless", "later-native", "distant-inheritance"] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("projects");
+            let dir = root.join("empty-window").join("agent-transcripts");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("synthetic.jsonl");
+            let first = if case == "distant-inheritance" {
+                "<timestamp>Monday, Nov 2, 2026, 3:04 PM (UTC+5:30)</timestamp>\n<user_query>first request</user_query>"
+            } else {
+                "<user_query>first request</user_query>"
+            };
+            let mut source = format!(
+                "{}\n{}\n",
+                json!({"role":"user","message":{"content":first}}),
+                json!({"role":"assistant","message":{"content":"first reply"}})
+            );
+            if case == "distant-inheritance" {
+                let padding = format!(
+                    "{}\n",
+                    json!({"role":"assistant","message":{"content":"x".repeat(1024)}})
+                );
+                while source.len() < crate::tail::OVERLAP_BYTES as usize + 8192 {
+                    source.push_str(&padding);
+                }
+            }
+            fs::write(&path, source).unwrap();
+            let db_path = temp.path().join("index.db");
+            let config = cursor_fixture_config(&root, &db_path);
+            let db = crate::db::Db::open(&db_path).unwrap();
+            crate::indexer::reindex(&config, &db, false, None).unwrap();
+            let snapshot = || {
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                let mut statement = conn
+                    .prepare("select json_array(seq,role,content,ts) from messages order by seq,id")
+                    .unwrap();
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows
+            };
+            let before = snapshot();
+            let anchor = db
+                .resolve_session_record("cursor:synthetic")
+                .unwrap()
+                .created_at
+                .unwrap();
+            let next_day = anchor + chrono::Duration::days(1);
+            let new_record = if case == "later-native" {
+                let text = format!(
+                    "<timestamp>{}</timestamp>\n<user_query>next day</user_query>",
+                    next_day.format("%A, %b %-d, %Y, %-I:%M %p (UTC+0)")
+                );
+                json!({"role":"user","message":{"content":text}})
+            } else {
+                json!({"role":"assistant","message":{"content":"next day reply"}})
+            };
+            writeln!(
+                fs::OpenOptions::new().append(true).open(&path).unwrap(),
+                "{new_record}"
+            )
+            .unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::from(next_day))
+                .unwrap();
+            crate::indexer::reindex(&config, &db, false, None).unwrap();
+            let incremental = snapshot();
+            assert_eq!(incremental.len(), before.len() + 1);
+            let changed = before
+                .iter()
+                .zip(&incremental)
+                .filter(|(old, new)| old != new)
+                .count();
+            assert_eq!(changed, 0, "{case}: earlier rows whose timestamps changed");
+            if case == "clockless" {
+                let query = crate::models::SearchFilters {
+                    since: Some(next_day),
+                    until: Some(next_day),
+                    ..Default::default()
+                };
+                assert_eq!(db.list_recent(&query).unwrap().len(), 1);
+            }
+            crate::indexer::reindex(&config, &db, true, None).unwrap();
+            assert_eq!(snapshot(), incremental);
+        }
+    }
+
+    #[test]
+    fn clockless_cursor_messages_remain_date_filterable() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("synthetic.jsonl");
+        fs::write(&path, concat!(
+            r#"{"role":"user","message":{"content":"<user_query>clockless request</user_query>"}}"#, "\n",
+            r#"{"role":"assistant","message":{"content":"clockless reply"}}"#, "\n",
+        )).unwrap();
+        let parsed = CursorAdapter::new(vec![]).parse_inner(&path).unwrap();
+        assert!(parsed.messages.iter().all(|message| message.ts.is_some()));
+        assert!(parsed.session.created_at.is_some());
+        assert!(parsed.session.updated_at.is_some());
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let anchor = parsed.messages[0].ts.unwrap();
+        let sessions = crate::models::SearchFilters {
+            since: Some(anchor - chrono::Duration::seconds(1)),
+            until: Some(anchor + chrono::Duration::seconds(1)),
+            ..Default::default()
+        };
+        assert_eq!(db.list_recent(&sessions).unwrap().len(), 1);
+        let messages = crate::models::MessageFilters {
+            since: sessions.since,
+            until: sessions.until,
+            ..Default::default()
+        };
+        assert_eq!(db.search_messages("clockless", &messages).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn leading_records_replies_calls_and_results_inherit_turn_time() {
+        let records = [
+            json!({"role":"assistant","message":{"content":"leading record"}}),
+            json!({"role":"user","message":{"content":"<timestamp>Monday, Nov 2, 2026, 3:04 PM (UTC+5:30)</timestamp>\n<user_query>request</user_query>"}}),
+            json!({"role":"assistant","message":{"content":[
+                {"type":"text","text":"reply"},
+                {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"ok.txt","content":"bytes"}}
+            ]}}),
+            json!({"role":"user","message":{"content":[{"type":"tool_result","tool_use_id":"write","content":"done"}]}}),
+        ];
+        let text = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = CursorAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(text),
+                std::path::Path::new("synthetic.jsonl"),
+            )
+            .unwrap();
+        assert_eq!(parsed.messages.len(), 5);
+        let expected = crate::util::parse_datetime("2026-11-02T09:34:00Z");
+        assert_eq!(
+            parsed.messages.iter().map(|m| m.ts).collect::<Vec<_>>(),
+            vec![expected; 5]
+        );
+        assert_eq!(parsed.file_edits.len(), 1);
+        assert_eq!(parsed.file_edits[0].ts, expected);
+    }
+
+    #[test]
+    fn clockless_fallback_without_birth_time_reuses_first_indexed_mtime() {
+        let first = crate::util::parse_datetime("2026-11-02T09:34:00Z").unwrap();
+        let later = first + chrono::Duration::days(1);
+        assert_eq!(super::cursor_file_time(None, Some(first), None), first);
+        assert_eq!(
+            super::cursor_file_time(None, Some(later), Some(first)),
+            first
+        );
+        let text = json!({"role":"assistant","message":{"content":"clockless"}}).to_string();
+        let seed = json!({"cursor_clock_anchor": first}).to_string();
+        let parsed = CursorAdapter::new(vec![])
+            .parse_reader_with_clock_seed(
+                std::io::Cursor::new(text),
+                std::path::Path::new("no-file-clock.jsonl"),
+                None,
+                Some(&seed),
+            )
+            .unwrap();
+        assert_eq!(parsed.messages[0].ts, Some(first));
+        assert_eq!(parsed.session.created_at, Some(first));
+    }
+
     #[test]
     fn native_and_missing_timestamps_survive_append_row_by_row() {
         use std::io::Write;
@@ -1122,7 +1416,7 @@ mod tests {
             before.messages[0].ts,
             crate::util::parse_datetime("2026-11-02T09:34:00Z")
         );
-        assert_eq!(before.messages[1].ts, None);
+        assert_eq!(before.messages[1].ts, before.messages[0].ts);
         let offset = crate::tail::complete_prefix_offset(&path).unwrap();
         let next = json!({"role":"user","message":{"content":"<timestamp>Tuesday, Nov 3, 2026, 9:00 AM (UTC-7)</timestamp>\n<user_query>today</user_query>"}});
         writeln!(
@@ -1144,10 +1438,10 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap()
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2000))
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(87400))
             .unwrap();
         let mut full = adapter.parse_inner(&path).unwrap();
-        crate::util::backfill_parsed_dates(&mut full, 2_000_000_000_000);
+        crate::util::backfill_parsed_dates(&mut full, 87_400_000_000_000);
         let mut incremental = before.messages;
         incremental.extend(tail.new_messages);
         assert_eq!(incremental.len(), full.messages.len());

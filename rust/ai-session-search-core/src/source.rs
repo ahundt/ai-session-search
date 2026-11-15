@@ -145,6 +145,15 @@ impl ProviderSet {
         source: &SourceFile,
         should_cancel: &dyn Fn() -> bool,
     ) -> Result<Option<crate::models::ParsedSession>> {
+        self.parse_until_with_clock_seed(source, should_cancel, None)
+    }
+
+    pub(crate) fn parse_until_with_clock_seed(
+        &self,
+        source: &SourceFile,
+        should_cancel: &dyn Fn() -> bool,
+        cursor_clock_seed: Option<&str>,
+    ) -> Result<Option<crate::models::ParsedSession>> {
         if should_cancel() {
             return Ok(None);
         }
@@ -158,7 +167,12 @@ impl ProviderSet {
                 self.codex.parse_reader(reader, &source.path)
             }),
             Provider::Cursor => parse_jsonl_until(source, should_cancel, |reader| {
-                self.cursor.parse_reader(reader, &source.path)
+                self.cursor.parse_reader_with_clock_seed(
+                    reader,
+                    &source.path,
+                    None,
+                    cursor_clock_seed,
+                )
             }),
             Provider::Antigravity => parse_jsonl_until(source, should_cancel, |reader| {
                 self.antigravity.parse_reader(reader, &source.path)
