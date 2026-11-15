@@ -1854,6 +1854,7 @@ class SessionSearch:
         but still counts it. context accepts integers 0..2**63-1, default 0, and sets only the
         sequence-number radius in example follow-up commands, not retrieved rows.
         Invalid values raise InvalidArgumentError; wrong argument types raise TypeError.
+        Integers outside the signed 64-bit range raise OverflowError.
         """
     def query_sql(self, sql: str, *, limit: int | None = None, offset: int = 0, timeout_ms: int | None = None, max_cell_chars: int = 0) -> dict[str, Any]:
         """Run one read-only SQL statement with configured access restrictions and bounds."""

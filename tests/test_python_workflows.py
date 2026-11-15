@@ -242,7 +242,11 @@ def test_repeat_candidate_and_group_bounds_are_independent(corpus):
     with pytest.raises(aise.InvalidArgumentError, match="max_candidates"):
         corpus.repeats(max_candidates=-1)
     with pytest.raises(TypeError, match="limit"):
-        corpus.repeats(**{"limit": 1})
+        corpus.repeats(limit=1)
+    with pytest.raises(aise.InvalidArgumentError, match="sequence-number radius"):
+        corpus.repeats(context=-1)
+    with pytest.raises(OverflowError):
+        corpus.repeats(max_candidates=2**63)
 
 
 def test_sql_cell_truncation_retains_receipt(corpus):
@@ -353,7 +357,7 @@ def test_query_filters_accept_flat_and_scope_shapes(corpus):
     assert not corpus.search_messages("forgot", aise.MessageSearchRequest(workspace_path_prefix=transcript_prefix)).results
     assert not corpus.search_messages("forgot", aise.MessageSearchRequest(scope=aise.QueryScope(path_prefix=transcript_prefix))).results
     with pytest.raises(TypeError, match="path_prefix"):
-        aise.MessageSearchRequest(**{"path_prefix": "/synthetic"})
+        aise.MessageSearchRequest(path_prefix="/synthetic")  # type: ignore[call-arg]
     with pytest.raises(aise.InvalidArgumentError, match="workspace_path_prefix"):
         aise.MessageSearchRequest(scope=scope, workspace_path_prefix="/synthetic")
     with pytest.raises(aise.InvalidArgumentError, match="scope"):
