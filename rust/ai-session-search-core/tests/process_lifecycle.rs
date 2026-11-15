@@ -3699,6 +3699,9 @@ fn dynamic_skill_help_exits_zero_on_stdout_without_opening_configuration() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().next().unwrap(), "Classify indexed messages with the selected skill package\'s categories and report the matches.");
+    assert!(!stdout
+        .starts_with("Session-wide exclusions shared by CLI queries before ordering and paging"));
     // The usage line names the runnable invocation, not the internal argv[0] placeholder.
     assert!(stdout.contains("Usage: aise skills <SKILL>"), "{stdout}");
     assert!(!stdout.contains("aise-skill-capability"), "{stdout}");

@@ -123,6 +123,7 @@ pub(crate) struct SkillExecution {
     // after `aise skills <SKILL>` (or `aise skills run <SKILL>`), and clap would otherwise print
     // the internal argv[0] placeholder, which is no executable at all.
     bin_name = "aise skills <SKILL>",
+    about = "Classify indexed messages with the selected skill package\'s categories and report the matches.",
     disable_help_subcommand = true,
     after_help = "Selected packaged and direct capability definitions share a 1 MiB aggregate \
                   parsing safety ceiling. Exceeding it returns the consumed and attempted byte \
@@ -1533,8 +1534,12 @@ mod tests {
     fn capability_help_names_the_real_invocation_not_the_internal_placeholder() {
         use clap::CommandFactory;
         let rendered = MessageClassificationCommand::command()
-            .render_help()
+            .render_long_help()
             .to_string();
+        assert_eq!(rendered.lines().next().unwrap(), "Classify indexed messages with the selected skill package\'s categories and report the matches.");
+        assert!(!rendered.starts_with(
+            "Session-wide exclusions shared by CLI queries before ordering and paging"
+        ));
         assert!(
             rendered.contains("Usage: aise skills <SKILL>"),
             "usage line does not name the runnable invocation:\n{rendered}"
