@@ -2128,8 +2128,8 @@ def test_native_message_timeline_exposes_general_tool_arguments(tmp_path: Path) 
     [
         (r"C:\WORK\proj/", ["claude:w0", "claude:w1"]),
         ("//SERVER/share/proj/", ["claude:u0", "claude:u1"]),
-        ("/work/Proj/", ["claude:p0", "claude:p1"]),
-        ("/work/proj", ["claude:p2", "claude:p3"]),
+        ("/work/Proj/", ["claude:p0", "claude:p1", "claude:p2", "claude:p3"] if sys.platform == "darwin" else ["claude:p0", "claude:p1"]),
+        ("/work/proj", ["claude:p0", "claude:p1", "claude:p2", "claude:p3"] if sys.platform == "darwin" else ["claude:p2", "claude:p3"]),
     ],
 )
 def test_portable_path_matching_across_python_cli_and_mcp(
