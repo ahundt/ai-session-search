@@ -318,7 +318,7 @@ fn main() -> ai_session_search::anyhow::Result<()> {
 
 Long native operations release the GIL so other Python threads can progress. The
 application service API uses provider-neutral requests and results. Word counts are available through Python `vocabulary()` and Rust
-`AnalysisService::vocabulary`; `aise vocab` remains a hidden compatibility command. The
+`AnalysisService::vocabulary`; `aise vocab` also provides index-wide word counts. The
 [library guide](docs/development/library-api.md) has the full API, feature flags, and concurrency
 semantics.
 

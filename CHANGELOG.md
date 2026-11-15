@@ -118,14 +118,12 @@ reads, and resume commands. See the [library guide](docs/development/library-api
 3. Empty message-search hints point to harness notices, tool arguments, or recoverable files as
    other places to look. A hint means the current query found no matches; it does not promise an
    answer in those alternatives.
-4. `aise vocab` remains callable as a hidden compatibility command. Use Python `vocabulary()` or
-   Rust `AnalysisService::vocabulary` for word counts in applications.
-5. Unknown configuration keys in ordinary tables are reported and ignored, so a configuration
+4. Unknown configuration keys in ordinary tables are reported and ignored, so a configuration
    written for a newer release still loads; access-restricting and search policy tables remain
    strict. Upgrades preserve existing configuration without adding active keys. Install records
    written by a newer release keep their extra fields, and migration recovery refuses a receipt
    in an unsupported format before it writes anything.
-6. MCP keeps `purpose` and `purpose_version` in its schema when no search presets are configured;
+5. MCP keeps `purpose` and `purpose_version` in its schema when no search presets are configured;
    configured presets supply the accepted purpose names.
    Server instructions name `aise files extract`, `aise export`, `aise analyze`, and `aise reindex`
    for operations performed through the CLI or libraries.

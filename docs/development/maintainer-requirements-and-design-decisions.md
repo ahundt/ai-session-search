@@ -763,9 +763,8 @@ directly from `cli.rs` through 1.0.0. In 1.1.0 both run through `AnalysisService
 json` and `jsonl` emit one report object with `groups`, `unattributed_input_count`, and
 `unattributed_input_included`; 1.0.0 emitted a bare array of groups for JSON and one group per
 JSONL line. Table and plain output retain their group rows. The Rust vocabulary call refuses under an `allowed-roots` access scope
-because full-text term counts span every session. The hidden compatibility command `aise vocab`
-retains historical index-wide counts even under an `allowed-roots` scope; it is omitted from
-root help. Library `vocabulary()` enforces the scope refusal. Python `vocabulary()` and `repeats()` call those services. Neither has an MCP analytics tool.
+because full-text term counts span every session. The released `aise vocab` command retains historical index-wide counts even under an
+`allowed-roots` scope and remains visible in root help. Library `vocabulary()` enforces the scope refusal. Python `vocabulary()` and `repeats()` call those services. Neither has an MCP analytics tool.
 
 Read-only SQL goes through `SqlService` (`SessionSearch::sql`), which applies the `allowed-roots`
 refusal itself; `sql_query::run`, which took a path and skipped it, is deprecated. A library
