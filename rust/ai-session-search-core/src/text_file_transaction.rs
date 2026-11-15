@@ -170,6 +170,9 @@ struct TransactionReceipt {
     changes: Vec<ReceiptChange>,
     #[serde(default)]
     symlink_changes: Vec<ReceiptSymlinkChange>,
+    /// Absent copy directories to prune after restoring file preimages, deepest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rollback_directories: Vec<EncodedPath>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -313,6 +316,29 @@ fn execute_transaction_with<F, G>(
     receipt_path: &Path,
     changes: &[TextFileChange],
     symlink_changes: &[SymlinkChange],
+    publish_text: F,
+    publish_symlink: G,
+) -> Result<()>
+where
+    F: FnMut(usize, &TextFileChange) -> Result<()>,
+    G: FnMut(usize, &SymlinkChange) -> Result<()>,
+{
+    execute_transaction_with_directories(
+        receipt_path,
+        changes,
+        symlink_changes,
+        &[],
+        publish_text,
+        publish_symlink,
+    )
+}
+
+/// Directory evidence is optional so ordinary link transactions keep their existing receipt.
+pub(crate) fn execute_transaction_with_directories<F, G>(
+    receipt_path: &Path,
+    changes: &[TextFileChange],
+    symlink_changes: &[SymlinkChange],
+    rollback_directories: &[PathBuf],
     mut publish_text: F,
     mut publish_symlink: G,
 ) -> Result<()>
@@ -359,7 +385,26 @@ where
         verify_symlink_image(&change.path, &change.before)?;
     }
 
+    let mut directories = Vec::new();
+    for path in rollback_directories {
+        let path = std::path::absolute(path)?;
+        if !entry_exists(&path)? {
+            if !changes.iter().any(|change| change.path.starts_with(&path)) {
+                bail!(
+                    "rollback directory {} contains no transaction file; refusing it",
+                    path.display()
+                );
+            }
+            directories.push(path);
+        }
+    }
+    directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    directories.dedup();
     let mut receipt = TransactionReceipt {
+        rollback_directories: directories
+            .iter()
+            .map(|path| EncodedPath::from_path(path))
+            .collect(),
         version: RECEIPT_VERSION,
         phase: TransactionPhase::Prepared,
         changes: changes.iter().map(ReceiptChange::from).collect(),
@@ -608,6 +653,28 @@ fn rollback_prepared(receipt: &TransactionReceipt) -> Result<usize> {
         }
     }
     if conflicts.is_empty() {
+        for directory in &receipt.rollback_directories {
+            let path = directory.to_path_buf()?;
+            // Never follow a replacement link, and never remove a directory containing user data.
+            match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                Ok(metadata) if metadata.is_dir() && !is_link_entry(&metadata) => {}
+                _ => continue,
+            }
+            match fs::remove_dir(&path) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::NotFound | ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("prune rolled-back copy directory {}", path.display())
+                    })
+                }
+            }
+        }
         Ok(restored)
     } else {
         bail!("{}", conflicts.join("; "))
@@ -884,6 +951,44 @@ mod tests {
     }
 
     #[test]
+    fn prepared_copy_recovery_prunes_only_empty_created_directories() {
+        for added_user_file in [false, true] {
+            let dir = tempdir().unwrap();
+            let root = dir.path().join("copy");
+            let child = root.join("references");
+            let file = child.join("guide.md");
+            let receipt_path = dir.path().join("receipt.json");
+            let created = change(&file, None, Some("installed bytes"));
+            let receipt = TransactionReceipt {
+                version: RECEIPT_VERSION,
+                phase: TransactionPhase::Prepared,
+                changes: vec![ReceiptChange::from(&created)],
+                symlink_changes: Vec::new(),
+                rollback_directories: vec![
+                    EncodedPath::from_path(&child),
+                    EncodedPath::from_path(&root),
+                ],
+            };
+            write_receipt(&receipt_path, &receipt, AtomicWriteMode::CreateNew).unwrap();
+            publish_text_change(&created).unwrap();
+            if added_user_file {
+                fs::write(child.join("personal.txt"), "preserved").unwrap();
+            }
+            recover_text_file_transaction(&receipt_path).unwrap();
+            assert!(!file.exists());
+            assert!(!receipt_path.exists());
+            if added_user_file {
+                assert_eq!(
+                    fs::read_to_string(child.join("personal.txt")).unwrap(),
+                    "preserved"
+                );
+            } else {
+                assert!(!root.exists());
+            }
+        }
+    }
+
+    #[test]
     fn successful_transaction_updates_all_paths_and_removes_receipt() {
         let dir = tempdir().unwrap();
         let first = dir.path().join("first.txt");
@@ -1022,6 +1127,7 @@ mod tests {
         fs::create_dir_all(link.parent().unwrap()).unwrap();
         create_directory_symlink(&canonical, &link).unwrap();
         let receipt = TransactionReceipt {
+            rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Prepared,
             changes: vec![ReceiptChange::from(&change(
@@ -1052,6 +1158,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
         fs::write(&text, "after").unwrap();
         let mut value = serde_json::to_value(TransactionReceipt {
+            rollback_directories: Vec::new(),
             version: 1,
             phase: TransactionPhase::Prepared,
             changes: vec![ReceiptChange::from(&change(
@@ -1080,6 +1187,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
         fs::write(&path, "before").unwrap();
         let receipt = TransactionReceipt {
+            rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Prepared,
             changes: vec![ReceiptChange::from(&change(
@@ -1394,6 +1502,7 @@ mod tests {
         fs::write(&first, "after").unwrap();
         fs::write(&second, "before-2").unwrap();
         let receipt = TransactionReceipt {
+            rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Prepared,
             changes: vec![
@@ -1420,6 +1529,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
         fs::write(&path, "external edit").unwrap();
         let receipt = TransactionReceipt {
+            rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Prepared,
             changes: vec![ReceiptChange::from(&change(
@@ -1445,6 +1555,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
         fs::write(&path, "after").unwrap();
         let receipt = TransactionReceipt {
+            rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Published,
             changes: vec![ReceiptChange::from(&change(

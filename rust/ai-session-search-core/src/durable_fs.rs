@@ -140,6 +140,7 @@ mod link_tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read_to_string(link.join("data")).unwrap(), "preserved");
         let expected = fs::read_link(&link).unwrap();
         remove_owned_link(&link, &expected).unwrap();
         assert!(fs::symlink_metadata(link).is_err());

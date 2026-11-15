@@ -186,16 +186,27 @@ Code CLI/Desktop), `~/.agents/skills/` (ChatGPT Codex desktop, Codex CLI/IDE, an
 `~/.gemini/config/skills/` (Antigravity App/IDE),
 `~/.gemini/antigravity-cli/skills/` (Antigravity CLI), `~/.pi/agent/skills/` (Pi), and
 `~/.prime/agent/skills/` (Prime Agent). Pi and Prime also read `~/.agents/skills/`, but their
-native links make explicit installs and lifecycle status independent of Codex detection.
+native entries make explicit installs and lifecycle status independent of Codex detection.
+
+On Windows without symbolic-link privilege, discovery uses real, manifest-owned copies at those
+same destinations, on local volumes and network drives. No junction is created. The manifest
+records each copy's canonical source in `discovery_copy_source`, its installed harness users,
+and every file's byte count and SHA-256. Copies refresh on upgrade, and status reports
+`owned copy: configured`, missing files, or modifications. Existing real directories without a
+copy record and links pointing elsewhere are preserved; inspect or move them before reinstalling.
+A recorded copy stays a copy when Developer Mode is later enabled, so reinstall never leaves a
+second skill root. To switch it to a symbolic link, uninstall the skill, enable Developer Mode,
+then run `aise integrations install`. Modified copies are preserved on uninstall; inspect or
+move them yourself before switching. macOS and Linux keep symbolic-link discovery.
 
 Gemini CLI has read `~/.agents/skills/` since [v0.28.0](https://github.com/google-gemini/gemini-cli/releases/tag/v0.28.0)
 ([upstream change](https://github.com/google-gemini/gemini-cli/commit/ad8796b02db3cbb34c8318b53b7b0fc5113e264b)).
 Its loader retains alias paths and warns when the same name appears at different paths, even
 when both links point to one package. Install and the post-upgrade refresh retire an untouched,
 aise-owned `~/.gemini/skills/ai-session-search` link or copy; foreign or modified entries stay
-in place and are reported. The shared link remains until its last installed harness is
-uninstalled. Older Gemini versions do not discover the shared skill; their MCP and `GEMINI.md`
-integrations remain available. Automatic skill installation targets Gemini CLI v0.28.0 and newer.
+in place and are reported. The shared discovery entry, whether a link or an owned Windows copy,
+remains until its last installed harness is uninstalled. Older Gemini versions do not discover the
+shared skill; their MCP and `GEMINI.md` integrations remain available. Automatic skill installation targets Gemini CLI v0.28.0 and newer.
 
 Pi's and Prime's own CLIs accept a repeatable `--skill PATH`, and their `--no-skills` only
 disables discovery, so an explicit path stays active. Selecting several harnesses keeps every
@@ -208,8 +219,9 @@ directory, or a retargeted link is preserved and reported. An explicit `aise int
 rewrites the named MCP entry, including customized launch arguments. Pass `--dry-run` to see every
 planned write and removal before anything changes.
 
-Reinstall replaces a prerelease copied harness package with a discovery
-link only when the old copy is provably app-managed and untouched. Uninstall removes a discovery
+When symbolic links are available, reinstall replaces a prerelease copied harness package with a
+discovery link only when the old copy is provably app-managed and untouched. Recorded Windows
+fallback copies retain their mechanism. Uninstall removes a discovery
 entry only while it is still the exact link created by `aise`, and retains the canonical package
 while another supported harness still links to it. Install, `aise skills update`, and normal
 uninstall retire the earlier sibling `corrections` package and its discovery links only when the
@@ -394,8 +406,9 @@ happened.
 
 The `aisearch` and `ai_session_search` links are relative, so moving an intact bin directory
 keeps them valid. Unix supports them directly. Windows requires symbolic-link permission (normally Developer Mode or an
-elevated process); if the operating system rejects link creation, the command reports the
-failed path and recommends `--no-aliases`. The installer never substitutes copied binaries,
+elevated process). Install probes that capability before persistent writes. Without it, the
+installer skips executable aliases with Developer Mode guidance, while MCP, instructions, and
+manifest-owned skill copies remain available. The installer never substitutes copied binaries,
 hard links, `.cmd` wrappers, or extra Python console scripts because those create divergent
 ownership and update behavior.
 

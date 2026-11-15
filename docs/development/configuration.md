@@ -315,8 +315,12 @@ is documented upstream; these references do not establish conformance for every 
 
 With `GEMINI_CLI_HOME` unset, Gemini uses the real home. Codex and Gemini share one discovery
 link when their resolved paths match; `discovery_clients` records both installed harnesses.
-Different paths get separate links, and uninstalling either harness preserves the other's link
-and canonical package. `skill_discovery_roots` in `[integrations.paths.gemini]` replaces Gemini's
+Different paths get separate entries, and uninstalling either harness preserves the other's
+entry and canonical package. Windows without symbolic-link privilege uses manifest-owned copies
+at the same discovery paths. Shared copies retain both harness users and refresh on upgrade;
+`discovery_copy_source` records the canonical package. Enabling Developer Mode later does not
+replace an existing copy; uninstall the skill and reinstall after enabling Developer Mode to
+switch to symbolic links. `skill_discovery_roots` in `[integrations.paths.gemini]` replaces Gemini's
 automatic discovery roots.
 
 Persistent endpoint overrides are optional, with these concrete surface names and accepted fields:
@@ -370,7 +374,8 @@ Exact custom skill destinations use repeatable `--skill-root DIR` (the directory
 inside it); uninstall preserves them with `--keep-skill`, refuses to remove a directory without
 the embedded ownership marker, and preserves the whole directory whenever any file in it differs
 from what install recorded. The automatic package lives under `~/.ai-session-search/skills/` and
-is exposed through separate harness-native discovery links.
+is exposed through separate harness-native discovery links, or manifest-owned copies on Windows
+without symbolic-link privilege.
 
 Instruction status is content-aware: `configured` means the current generated content is active;
 `outdated`, `instruction file missing`, `instruction file modified`, and `orphaned managed file`
