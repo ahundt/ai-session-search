@@ -397,6 +397,39 @@ mod tests {
     }
 
     #[test]
+    fn tail_parser_receives_at_most_the_overlap_plus_new_complete_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("synthetic.jsonl");
+        for old_bytes in [
+            OVERLAP_BYTES as usize - 1,
+            OVERLAP_BYTES as usize,
+            OVERLAP_BYTES as usize + 1,
+            2 * OVERLAP_BYTES as usize,
+        ] {
+            let mut bytes = vec![b'x'; old_bytes - 1];
+            bytes.push(b'\n');
+            bytes.extend_from_slice(b"new\n");
+            write(&path, &bytes);
+            let observed = std::cell::Cell::new(None);
+            let result = tail_parse_until(
+                &path,
+                old_bytes as i64,
+                None,
+                &|| false,
+                |cursor, _, context| {
+                    observed.set(Some((cursor.get_ref().len(), context.new_bytes_start)));
+                    anyhow::bail!("synthetic stop after observing the production tail buffer")
+                },
+            );
+            assert!(result.is_err());
+            let (retained, overlap) = observed.get().expect("tail parser called");
+            let expected_overlap = old_bytes.min(OVERLAP_BYTES as usize);
+            assert_eq!((retained, overlap), (expected_overlap + 4, expected_overlap),
+                "Tail parser retained {retained} bytes with {overlap} old bytes; internal overlap cap {} bytes plus 4 appended bytes. Reproduce: cargo test -p ai-session-search --lib tail_parser_receives_at_most --locked. Fix overlap_start/prefix_len in tail_parse_until; never read the whole old source to reconstruct short-range tool correlation.", OVERLAP_BYTES);
+        }
+    }
+
+    #[test]
     fn overlap_digest_rejects_rewrites_beyond_the_head() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("session.jsonl");

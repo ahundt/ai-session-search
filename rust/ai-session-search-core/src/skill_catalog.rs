@@ -852,6 +852,27 @@ mod tests {
     }
 
     #[test]
+    fn skill_name_and_description_limits_measure_the_parsed_frontmatter() {
+        for (field, cap) in [
+            ("name", MAX_NAME_CHARS),
+            ("description", MAX_DESCRIPTION_CHARS),
+        ] {
+            for length in [cap - 1, cap, cap + 1] {
+                let (name, description) = if field == "name" {
+                    ("a".repeat(length), "Synthetic skill".to_owned())
+                } else {
+                    ("synthetic-skill".to_owned(), "α".repeat(length))
+                };
+                let source = format!("---\nname: {name}\ndescription: {description}\n---\n");
+                let parsed = parse_skill_frontmatter(source.as_bytes());
+                assert_eq!(parsed.is_err(), length > cap,
+                    "SKILL.md {field} measured {length} Unicode scalar characters against {cap}, excess {} characters. Agent Skills metadata contract (https://agentskills.io/specification); configured overrides are not supported. Reproduce: cargo test -p ai-session-search --lib skill_name_and_description_limits --locked. Shorten the named metadata field; inspect the upstream name/description requirements before changing the owning MAX_* constant and its evidence.",
+                    length.saturating_sub(cap));
+            }
+        }
+    }
+
+    #[test]
     fn frontmatter_size_is_bounded_before_yaml_allocation() {
         let source = format!(
             "---\nname: my-skill\ndescription: {}\n---\n",

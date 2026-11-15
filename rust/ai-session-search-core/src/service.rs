@@ -4338,6 +4338,39 @@ mod message_search_service_tests {
     }
 
     #[test]
+    fn resolved_page_and_context_policy_ceilings_are_inclusive_not_clamps() {
+        let (_directory, db) = disposable_db();
+        let mut config = crate::config::Config::default();
+        config.search.budgets.max_hits_per_page = NonZeroUsize::new(4);
+        config.search.budgets.max_context_neighbors_per_hit = NonZeroUsize::new(4);
+        for requested in [3, 4, 5] {
+            let page = MessageService::new(&config, &db, SearchSurface::Mcp).plan(
+                literal_request()
+                    .extent(RequestedExtent::page(Some(requested), 0).unwrap())
+                    .context(ContextWindow::new(0, 0))
+                    .build()
+                    .unwrap(),
+            );
+            assert_eq!(page.is_err(), requested > 4,
+                "resolved page {requested} hits against search.budgets.max_hits_per_page=4 hits (excess {} hits): reject overflow, never clamp. Internal operator policy. Reproduce: cargo test -p ai-session-search --lib resolved_page_and_context_policy --locked. Repair MessageService::plan or lower the request / raise the explicitly configured policy.",
+                requested.saturating_sub(4));
+            if let Ok(page) = page {
+                assert_eq!(limit_of(&page), Some(requested));
+            }
+            let context = MessageService::new(&config, &db, SearchSurface::Mcp).plan(
+                literal_request()
+                    .extent(RequestedExtent::page(Some(1), 0).unwrap())
+                    .context(ContextWindow::new(1, requested - 1))
+                    .build()
+                    .unwrap(),
+            );
+            assert_eq!(context.is_err(), requested > 4,
+                "resolved context {requested} neighbors against search.budgets.max_context_neighbors_per_hit=4 neighbors (excess {} neighbors): reject overflow, never clamp. Internal operator policy. Reproduce: cargo test -p ai-session-search --lib resolved_page_and_context_policy --locked. Repair MessageService::plan or lower context_before/context_after.",
+                requested.saturating_sub(4));
+        }
+    }
+
+    #[test]
     fn planner_resolves_unique_session_prefix_and_rejects_ambiguous_prefix() {
         let (_directory, db) = disposable_db();
         insert_session(

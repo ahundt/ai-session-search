@@ -288,6 +288,25 @@ patterns = ['''\byou overwrote\b''']
     }
 
     #[test]
+    fn capability_byte_boundary_accepts_complete_documents_at_the_inclusive_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("synthetic-capability.toml");
+        for length in [
+            MAX_LOADED_CAPABILITY_BYTES - 1,
+            MAX_LOADED_CAPABILITY_BYTES,
+            MAX_LOADED_CAPABILITY_BYTES + 1,
+        ] {
+            let prefix = format!("{VALID}\n#");
+            let source = format!("{prefix}{}\n", "x".repeat(length - prefix.len() - 1));
+            std::fs::write(&path, source).unwrap();
+            let result = load_and_compile(&path, "synthetic".to_owned(), "1.0.0".to_owned());
+            assert_eq!(result.is_err(), length > MAX_LOADED_CAPABILITY_BYTES,
+                "Capability definition read measured {length} bytes against the internal aggregate parser budget {} bytes, excess {} bytes. Reproduce: cargo test -p ai-session-search --lib capability_byte_boundary --locked. Preserve inclusive bounded reading in load_and_compile_with_budget; reduce comments/rules or select fewer packages. This is definition input, not classification output.",
+                MAX_LOADED_CAPABILITY_BYTES, length.saturating_sub(MAX_LOADED_CAPABILITY_BYTES));
+        }
+    }
+
+    #[test]
     fn capability_file_read_is_bounded_before_toml_or_regex_allocation() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("aise-capability.toml");
