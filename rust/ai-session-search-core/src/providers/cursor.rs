@@ -663,33 +663,39 @@ struct WorkspaceResolution {
 
 /// Resolve a unique complete workspace by pruning against actual directory entries.
 /// For S slug bytes, V visited (directory, token-position) states and E bytes of entry
-/// names examined across states, time and memory are O(V * S + E).
+/// names examined across states, time is O(V * S * S + E * S), memory O(V * S + E).
+/// Filesystem identity probes run at most O(V * S + E) times.
 /// Each directory is listed once, at most V listings. V counts matching real
 /// prefixes, not slug partitions.
 /// A pathological-tree guard stops at 4096 states; its hit is published in metadata.
 /// Missing final directories return no workspace, never a partial ancestor.
 fn decode_cursor_project_dir(encoded: &str) -> WorkspaceResolution {
-    decode_cursor_project_dir_with(encoded, |directory| {
-        if !directory.is_absolute() {
-            return Ok(Vec::new());
-        }
-        std::fs::read_dir(directory)?
-            .map(|entry| {
-                let entry = entry?;
-                let kind = entry.file_type()?;
-                Ok(
-                    (kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
-                        .then(|| entry.file_name()),
-                )
-            })
-            .collect::<std::io::Result<Vec<_>>>()
-            .map(|entries| entries.into_iter().flatten().collect())
-    })
+    decode_cursor_project_dir_with(
+        encoded,
+        |directory| {
+            if !directory.is_absolute() {
+                return Ok(Vec::new());
+            }
+            std::fs::read_dir(directory)?
+                .map(|entry| {
+                    let entry = entry?;
+                    let kind = entry.file_type()?;
+                    Ok(
+                        (kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
+                            .then(|| entry.file_name()),
+                    )
+                })
+                .collect::<std::io::Result<Vec<_>>>()
+                .map(|entries| entries.into_iter().flatten().collect())
+        },
+        |path| file_id::get_file_id(path).ok(),
+    )
 }
 
 fn decode_cursor_project_dir_with(
     encoded: &str,
     mut read_directories: impl FnMut(&Path) -> std::io::Result<Vec<std::ffi::OsString>>,
+    mut entry_identity: impl FnMut(&Path) -> Option<file_id::FileId>,
 ) -> WorkspaceResolution {
     let (root, suffix) = if let Some(suffix) = encoded.strip_prefix("Users-") {
         (PathBuf::from("/").join("Users"), suffix)
@@ -731,14 +737,15 @@ fn decode_cursor_project_dir_with(
             entries_by_directory.insert(directory.clone(), entries);
         }
         let remaining = &suffix[index..];
+        let mut equivalent_prefixes = None;
         for name in &entries_by_directory[&directory] {
             let Some(name_text) = name.to_str() else {
                 continue;
             };
-            // Match literal underscores as well as sanitized spellings. Dots become
-            // hyphens, preserving empty slug tokens for leading-dot directories.
+            // Keep literal names alongside sanitized spellings, including hidden names.
             let dotted = name_text.replace('.', "-");
             let spellings = [
+                name_text.to_string(),
                 dotted.clone(),
                 dotted.replace('_', "-"),
                 dotted.replace('_', ""),
@@ -753,6 +760,40 @@ fn decode_cursor_project_dir_with(
                 };
                 if rest.is_empty() || rest.starts_with('-') {
                     matched_ends.push(index + spelling.len());
+                }
+            }
+            if matched_ends.is_empty() {
+                // Probe each slug-spelled prefix once per state, including failed
+                // lookups. Only filesystem identity can establish name equivalence.
+                let prefixes = equivalent_prefixes.get_or_insert_with(|| {
+                    remaining
+                        .char_indices()
+                        .filter_map(|(end, c)| (c == '-' && end > 0).then_some(end))
+                        .chain([remaining.len()])
+                        .filter_map(|end| {
+                            let spelling = &remaining[..end];
+                            // Exact directory names already matched above. Do not let
+                            // another symlink to that directory create false ambiguity.
+                            if entries_by_directory[&directory]
+                                .iter()
+                                .any(|entry| entry == spelling)
+                            {
+                                return None;
+                            }
+                            entry_identity(&directory.join(spelling)).map(|id| (end, id))
+                        })
+                        .collect::<Vec<_>>()
+                });
+                if !prefixes.is_empty() {
+                    if let Some(actual_id) = entry_identity(&directory.join(name)) {
+                        for &(end, spelled_id) in prefixes.iter() {
+                            if actual_id == spelled_id
+                                && name_text.to_lowercase() == remaining[..end].to_lowercase()
+                            {
+                                matched_ends.push(index + end);
+                            }
+                        }
+                    }
                 }
             }
             matched_ends.sort_unstable();
@@ -1926,12 +1967,16 @@ mod tests {
         } else {
             std::path::PathBuf::from(format!("{}:\\Users", &slug[..1]))
         };
-        super::decode_cursor_project_dir_with(slug, |directory| {
-            let path = root.join(directory.strip_prefix(&virtual_root).unwrap());
-            fs::read_dir(path)?
-                .map(|entry| Ok(entry?.file_name()))
-                .collect()
-        })
+        super::decode_cursor_project_dir_with(
+            slug,
+            |directory| {
+                let path = root.join(directory.strip_prefix(&virtual_root).unwrap());
+                fs::read_dir(path)?
+                    .map(|entry| Ok(entry?.file_name()))
+                    .collect()
+            },
+            |path| file_id::get_file_id(root.join(path.strip_prefix(&virtual_root).unwrap())).ok(),
+        )
     }
 
     #[test]
@@ -1977,6 +2022,130 @@ mod tests {
             assert_eq!(result.visited, 2);
             fs::create_dir_all(temp.path().join("person-project")).unwrap();
             assert!(workspace_in_temp(slug, temp.path()).path.is_none());
+        }
+    }
+
+    #[test]
+    fn workspace_literal_dots_and_hidden_components_resolve() {
+        let temp = tempdir().unwrap();
+        for leaf in ["my.project", ".claude"] {
+            fs::create_dir_all(temp.path().join("person").join(leaf)).unwrap();
+            let result = workspace_in_temp(&format!("Users-person-{leaf}"), temp.path());
+            assert_eq!(
+                result.path,
+                Some(std::path::Path::new("/Users/person").join(leaf))
+            );
+            assert_eq!(result.visited, 2);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_symlink_alias_does_not_hide_an_exact_directory() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("project")).unwrap();
+        std::os::unix::fs::symlink("project", temp.path().join("alias")).unwrap();
+        assert_eq!(
+            workspace_in_temp("Users-project", temp.path()).path,
+            Some(std::path::PathBuf::from("/Users/project"))
+        );
+        if !temp.path().join("Project").exists() {
+            std::os::unix::fs::symlink("project", temp.path().join("Project")).unwrap();
+            assert_eq!(
+                workspace_in_temp("Users-Project", temp.path()).path,
+                Some(std::path::PathBuf::from("/Users/Project"))
+            );
+        } else {
+            assert_eq!(
+                workspace_in_temp("Users-Project", temp.path()).path,
+                Some(std::path::PathBuf::from("/Users/project"))
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_case_equivalence_follows_the_filesystem() {
+        let temp = tempdir().unwrap();
+        fs::create_dir(temp.path().join("project")).unwrap();
+        let insensitive = temp.path().join("Project").exists();
+        eprintln!("workspace temp filesystem case-insensitive: {insensitive}");
+        let result = workspace_in_temp("Users-Project", temp.path());
+        let expected = insensitive.then(|| std::path::PathBuf::from("/Users/project"));
+        assert_eq!(result.path, expected);
+        if !insensitive {
+            fs::create_dir(temp.path().join("Project")).unwrap();
+            assert_eq!(
+                workspace_in_temp("Users-Project", temp.path()).path,
+                Some(std::path::PathBuf::from("/Users/Project"))
+            );
+        }
+        assert!(!result.limited);
+        assert_eq!(result.visited, 1);
+    }
+
+    // Enumerate the released candidate partitions only for short synthetic slugs.
+    fn released_workspace_candidates(
+        encoded: &str,
+        root: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        fn walk(
+            parts: &[&str],
+            index: usize,
+            current: &mut Vec<String>,
+            out: &mut Vec<Vec<String>>,
+        ) {
+            if index >= parts.len() {
+                out.push(current.clone());
+                return;
+            }
+            for end in index + 1..=parts.len() {
+                current.push(parts[index..end].join("-"));
+                walk(parts, end, current, out);
+                current.pop();
+            }
+        }
+        let parts: Vec<_> = encoded.split('-').collect();
+        if parts.first().copied() != Some("Users") || parts.len() < 3 {
+            return vec![];
+        }
+        assert!(parts.len() <= 7);
+        let mut suffixes = Vec::new();
+        walk(&parts[1..], 0, &mut Vec::new(), &mut suffixes);
+        suffixes
+            .into_iter()
+            .map(|suffix| {
+                let mut path = root.to_path_buf();
+                for component in suffix {
+                    path.push(component);
+                }
+                path
+            })
+            .filter(|path| path.exists())
+            .collect()
+    }
+
+    #[test]
+    fn workspace_decoder_preserves_unique_released_candidates() {
+        for components in [
+            vec!["p", "plain"],
+            vec!["p-q", "r-s"],
+            vec!["p", "my.project"],
+            vec!["p", "my_project"],
+            vec!["p", ".claude", "x"],
+        ] {
+            let temp = tempdir().unwrap();
+            let relative: std::path::PathBuf = components.iter().collect();
+            fs::create_dir_all(temp.path().join(&relative)).unwrap();
+            let slug = format!("Users-{}", components.join("-"));
+            let candidates = released_workspace_candidates(&slug, temp.path());
+            assert_eq!(candidates.len(), 1, "{slug}");
+            let expected = std::path::Path::new("/Users")
+                .join(candidates[0].strip_prefix(temp.path()).unwrap());
+            assert_eq!(
+                workspace_in_temp(&slug, temp.path()).path,
+                Some(expected),
+                "{slug}"
+            );
         }
     }
 
