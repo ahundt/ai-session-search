@@ -144,7 +144,7 @@ impl ServiceError {
         Self::SessionNotFound {
             id_or_prefix: id_or_prefix.to_string(),
             message: format!(
-                "no session matches '{id_or_prefix}' — run `aise list` to see recent session \
+                "no session matches '{id_or_prefix}'; run `aise list` to see recent session \
                  ids, or `aise search <keywords>` to find one"
             ),
         }
@@ -163,7 +163,7 @@ impl ServiceError {
             String::new()
         };
         let message = format!(
-            "session prefix '{prefix}' is ambiguous — {} sessions match: {}{}. \
+            "session prefix '{prefix}' is ambiguous: {} sessions match: {}{}. \
              Pass a longer prefix or the full id.",
             candidates.len(),
             shown.join(", "),
@@ -250,6 +250,14 @@ mod tests {
             .iter()
             .map(ServiceError::code)
             .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            errors[0].to_string(),
+            "no session matches 'x'; run `aise list` to see recent session ids, or `aise search <keywords>` to find one"
+        );
+        assert_eq!(
+            errors[1].to_string(),
+            "session prefix 'c' is ambiguous: 2 sessions match: c:1, c:2. Pass a longer prefix or the full id."
+        );
         assert_eq!(codes.len(), errors.len());
         assert_eq!(errors.len(), 8, "one sample per kind");
         assert_eq!(

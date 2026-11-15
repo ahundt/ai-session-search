@@ -2330,7 +2330,7 @@ pub fn resume_plan(session: &SessionRecord) -> Result<(Vec<String>, Option<Strin
         let id = &session.id;
         let provider = session.provider.as_str();
         return Err(anyhow!(
-            "resuming is not supported for {provider} sessions — read this one here with \
+            "resuming is not supported for {provider} sessions. Read this one here with \
              `aise show {id}` or `aise export {id}`"
         ));
     };
@@ -3141,7 +3141,13 @@ pub(crate) mod tests {
             "n/a".to_string(),
         );
         let err = resume_plan(&parsed.session).unwrap_err().to_string();
-        assert!(err.contains("not supported"), "{err}");
+        assert_eq!(
+            err,
+            format!(
+                "resuming is not supported for cursor sessions. Read this one here with `aise show {}` or `aise export {}`",
+                parsed.session.id, parsed.session.id
+            )
+        );
         assert!(err.contains("aise show"), "offers an alternative: {err}");
         assert!(
             err.contains(&parsed.session.id),

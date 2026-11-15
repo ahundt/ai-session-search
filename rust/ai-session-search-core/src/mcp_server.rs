@@ -4501,7 +4501,7 @@ fn replaced_parameter_hint(tool: &str, name: &str, accepted: &[&str]) -> Option<
         format!(" ({})", row.value_change)
     };
     Some(format!(
-        " — use {} instead{value_change}; accepted parameters are {}",
+        "; use {} instead{value_change}; accepted parameters are {}",
         replacements.join(" or "),
         quoted_sorted_names(accepted)
     ))
@@ -5916,7 +5916,7 @@ fn unknown_key_hint(key: &str, accepted: &[&str]) -> String {
     match nearest_name(key, accepted) {
         Some(candidate) => format!(" — did you mean {candidate:?}?"),
         None => format!(
-            " — accepted parameters are {}",
+            "; accepted parameters are {}",
             quoted_sorted_names(accepted)
         ),
     }
@@ -12266,7 +12266,7 @@ mod tests {
                     json!({"query": "hello", "response_format": "detailed"}),
                     &[
                         "unknown search_messages parameter at arguments: response_format",
-                        "use \"detail\" instead",
+                        "; use \"detail\" instead",
                         "\"compact\" or \"full\"",
                     ][..],
                 ),
@@ -15074,7 +15074,7 @@ mod tests {
         // the message is still actionable rather than merely a rejection.
         let unrelated = unknown_key_hint("completely_different", &accepted);
         assert!(
-            unrelated.starts_with(" — accepted parameters are "),
+            unrelated.starts_with("; accepted parameters are "),
             "{unrelated}"
         );
         for name in accepted {
@@ -15083,7 +15083,7 @@ mod tests {
 
         // A short key must not be dragged onto an unrelated short name by a loose threshold.
         assert_eq!(unknown_key_hint("zzz", &["role", "kind"]), {
-            " — accepted parameters are \"kind\", \"role\""
+            "; accepted parameters are \"kind\", \"role\""
         });
 
         // No schema properties means no hint text rather than a dangling separator.

@@ -1646,7 +1646,7 @@ fn execute(cli: Cli) -> Result<()> {
         Commands::Compact => {
             let before = db.storage_allocation()?.total_bytes;
             eprintln!(
-                "aise: compacting index ({}) — rebuild full-text indexes + vacuum + wal checkpoint…",
+                "aise: compacting index ({}): rebuild full-text indexes + vacuum + wal checkpoint…",
                 mib(before)
             );
             let outcome = app.maintenance().compact()?;

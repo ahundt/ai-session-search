@@ -18,6 +18,22 @@ mod support;
 use support::aise;
 
 #[test]
+fn compact_status_names_each_operation() {
+    let root = tempfile::tempdir().unwrap();
+    let output = aise(root.path()).args(["compact"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    let status = stderr
+        .lines()
+        .find(|line| line.starts_with("aise: compacting index ("))
+        .expect("compact prints its status");
+    assert!(
+        status.ends_with("): rebuild full-text indexes + vacuum + wal checkpoint…"),
+        "{status}"
+    );
+}
+
+#[test]
 fn upgrade_migrates_published_mcp_registrations_without_installing_skills() {
     for client in [
         "opencode",
