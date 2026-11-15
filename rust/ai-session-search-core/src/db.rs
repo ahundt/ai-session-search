@@ -7417,11 +7417,9 @@ fn store_parsed_messages(
     // previous source generation contained. Native correlation identity is authoritative when
     // present; role/content is the conservative fallback for older rows without an identity.
     // Text alone never merges two copies: every key is consumed once.
-    let mut stored_by_identity: HashMap<RowDigest, std::collections::VecDeque<usize>> =
-        HashMap::new();
-    let mut stored_by_role_and_content: HashMap<RowDigest, std::collections::VecDeque<usize>> =
-        HashMap::new();
-    let mut stored_by_timestamp = HashMap::<RowDigest, std::collections::VecDeque<usize>>::new();
+    let mut stored_by_identity = HashMap::<_, std::collections::VecDeque<usize>>::new();
+    let mut stored_by_role_and_content = HashMap::<_, std::collections::VecDeque<usize>>::new();
+    let mut stored_by_timestamp = HashMap::<_, std::collections::VecDeque<usize>>::new();
     let mut repeated_claude_uuid = false;
     for (position, (_, keys)) in stored.iter().enumerate() {
         if let Some(identity) = keys.correlation {
@@ -7432,15 +7430,16 @@ fn store_parsed_messages(
             // A text fallback may repair a legacy row that has no identity, but must never
             // merge two rows whose provider identities disagree.
             stored_by_timestamp
-                .entry(keys.role_content_timestamp)
+                .entry((keys.role_content_timestamp, claude && keys.mirror))
                 .or_default()
                 .push_back(position);
             stored_by_role_and_content
-                .entry(keys.role_and_content)
+                .entry((keys.role_and_content, claude && keys.mirror))
                 .or_default()
                 .push_back(position);
         }
     }
+    let reconcile_occurrences = has_claude_replay || repeated_claude_uuid;
     let mut matched = vec![false; stored.len()];
     // Upgrade-only relation matching repairs changed rendering without treating a call ID
     // as event identity. Ambiguous relations on either side remain separate archive rows.
@@ -7480,35 +7479,153 @@ fn store_parsed_messages(
             attachment_content.insert(id, content);
         }
     }
-    let claude_inputs = if has_claude_replay || repeated_claude_uuid {
-        claude_input_matches(parsed, &parsed_keys, &stored)
-    } else {
-        HashMap::new()
+    // One assignment owns consumption for native, legacy and replay matches. Reserve
+    // exact occurrences globally before any loose same-text fallback can take them.
+    // The ordinary path keeps its single source-order pass and builds no replay maps.
+    let mut by_time = HashMap::<_, std::collections::VecDeque<usize>>::new();
+    let mut by_content = HashMap::<_, std::collections::VecDeque<usize>>::new();
+    if reconcile_occurrences {
+        for (position, (_, keys)) in stored.iter().enumerate() {
+            #[cfg(test)]
+            CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
+            if let Some(identity) = keys.correlation {
+                by_time
+                    .entry((identity, keys.role_content_timestamp, keys.mirror))
+                    .or_default()
+                    .push_back(position);
+                by_content
+                    .entry((identity, keys.role_and_content, keys.mirror))
+                    .or_default()
+                    .push_back(position);
+            }
+        }
+    }
+    let take = |queue: Option<&mut std::collections::VecDeque<usize>>, matched: &mut [bool]| {
+        let queue = queue?;
+        while let Some(position) = queue.pop_front() {
+            if !matched[position] {
+                return Some(position);
+            }
+        }
+        None
     };
-    let mut unseen = Vec::new();
-    let mut source_sequences = Vec::new();
-    for (parsed_position, (message, keys)) in parsed.messages.iter().zip(&parsed_keys).enumerate() {
-        let position = if let Some(input_match) = claude_inputs.get(&parsed_position) {
-            input_match.stored_position
-        } else {
-            keys.correlation
+    let mut assignments = if reconcile_occurrences {
+        vec![None; parsed_keys.len()]
+    } else {
+        Vec::new()
+    };
+    let originals: std::collections::HashSet<_> = if reconcile_occurrences {
+        parsed_keys
+            .iter()
+            .filter(|keys| {
+                #[cfg(test)]
+                CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
+                !keys.mirror
+            })
+            .filter_map(|keys| keys.correlation.map(|id| (id, keys.role_and_content)))
+            .collect()
+    } else {
+        Default::default()
+    };
+    // Originals precede mirrors; only a separate same-identity stored occurrence
+    // can be demoted, and only when the source also contains its original.
+    #[derive(Clone, Copy, PartialEq)]
+    enum AssignmentPhase {
+        OriginalTime,
+        OriginalIdentity,
+        LegacyTime,
+        LegacyContent,
+        MirrorTime,
+        MirrorIdentity,
+        CopyTime,
+        CopyIdentity,
+        Ordinary,
+    }
+    use AssignmentPhase::*;
+    // Each queue entry is popped at most once. Planning takes O(stored + parsed)
+    // time and memory, with no additional source or database reads.
+    let mut assign = |message: &Message,
+                      keys: &MessageKeys,
+                      phase: AssignmentPhase,
+                      matched: &mut [bool]| {
+        let native = |queue: &mut std::collections::VecDeque<usize>| {
+            if crate::providers::claude::is_attachment_message(message) {
+                let index = queue.iter().position(|&position| {
+                    !matched[position]
+                        && attachment_content.get(&stored[position].0) == Some(&message.content)
+                })?;
+                queue.remove(index)
+            } else {
+                take(Some(queue), matched)
+            }
+        };
+        let input = phase == OriginalTime
+            && message.role == crate::models::Role::User
+            && message
+                .provenance
+                .correlation_identity
+                .as_ref()
+                .is_none_or(|id| {
+                    id.authority == crate::models::MessageCorrelationAuthority::Anthropic
+                });
+        match phase {
+            OriginalTime if !input => keys
+                .correlation
                 .and_then(|identity| stored_by_identity.get_mut(&identity))
-                .and_then(|queue| {
-                    if crate::providers::claude::is_attachment_message(message) {
-                        let index = queue.iter().position(|&position| {
-                            !matched[position]
-                                && attachment_content.get(&stored[position].0)
-                                    == Some(&message.content)
-                        })?;
-                        return queue.remove(index);
-                    }
-                    while let Some(position) = queue.pop_front() {
-                        if !matched[position] {
-                            return Some(position);
-                        }
-                    }
+                .and_then(native),
+            OriginalTime | MirrorTime | CopyTime => keys.correlation.and_then(|id| {
+                let mirror = phase == MirrorTime;
+                if phase == CopyTime && !originals.contains(&(id, keys.role_and_content)) {
+                    return None;
+                }
+                take(
+                    by_time.get_mut(&(id, keys.role_content_timestamp, mirror)),
+                    matched,
+                )
+            }),
+            OriginalIdentity | MirrorIdentity | CopyIdentity => keys.correlation.and_then(|id| {
+                let mirror = phase == MirrorIdentity;
+                if phase == CopyIdentity && !originals.contains(&(id, keys.role_and_content)) {
+                    return None;
+                }
+                take(
+                    by_content.get_mut(&(id, keys.role_and_content, mirror)),
+                    matched,
+                )
+            }),
+            LegacyTime => keys
+                .tool_result_relation
+                .and_then(|key| legacy_tool_results.get(&key))
+                .and_then(|(_, position)| *position)
+                .filter(|position| !matched[*position])
+                .or_else(|| {
+                    take(
+                        stored_by_timestamp.get_mut(&(keys.role_content_timestamp, false)),
+                        matched,
+                    )
+                }),
+            LegacyContent => {
+                if message
+                    .provenance
+                    .correlation_identity
+                    .as_ref()
+                    .is_some_and(|id| {
+                        id.authority == crate::models::MessageCorrelationAuthority::SourceLocal
+                            && id.scope.starts_with("claude_queue:")
+                    })
+                {
                     None
-                })
+                } else {
+                    take(
+                        stored_by_role_and_content.get_mut(&(keys.role_and_content, false)),
+                        matched,
+                    )
+                }
+            }
+            Ordinary => keys
+                .correlation
+                .and_then(|identity| stored_by_identity.get_mut(&identity))
+                .and_then(native)
                 .or_else(|| {
                     keys.tool_result_relation
                         .and_then(|key| legacy_tool_results.get(&key))
@@ -7524,21 +7641,46 @@ fn store_parsed_messages(
                             id.authority == crate::models::MessageCorrelationAuthority::SourceLocal
                                 && id.scope.starts_with("claude_queue:")
                         }) {
-                        // A removal record may contain the same notice at another timestamp. It is
-                        // not the enqueue's old rendering, and may belong only to the archive.
-                        stored_by_timestamp.get_mut(&keys.role_content_timestamp)
+                        stored_by_timestamp.get_mut(&(keys.role_content_timestamp, false))
                     } else {
-                        stored_by_role_and_content.get_mut(&keys.role_and_content)
+                        stored_by_role_and_content.get_mut(&(keys.role_and_content, false))
                     };
-                    legacy.and_then(|queue| {
-                        while let Some(position) = queue.pop_front() {
-                            if !matched[position] {
-                                return Some(position);
-                            }
-                        }
-                        None
-                    })
-                })
+                    take(legacy, matched)
+                }),
+        }
+    };
+    if reconcile_occurrences {
+        for phase in [
+            OriginalTime,
+            OriginalIdentity,
+            LegacyTime,
+            LegacyContent,
+            MirrorTime,
+            MirrorIdentity,
+            CopyTime,
+            CopyIdentity,
+        ] {
+            for (position, (message, keys)) in parsed.messages.iter().zip(&parsed_keys).enumerate()
+            {
+                #[cfg(test)]
+                CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
+                let mirror = matches!(phase, MirrorTime | MirrorIdentity | CopyTime | CopyIdentity);
+                if assignments[position].is_none() && keys.mirror == mirror {
+                    assignments[position] = assign(message, keys, phase, &mut matched);
+                    if let Some(stored_position) = assignments[position] {
+                        matched[stored_position] = true;
+                    }
+                }
+            }
+        }
+    }
+    let mut unseen = Vec::new();
+    let mut source_sequences = Vec::new();
+    for (parsed_position, (message, keys)) in parsed.messages.iter().zip(&parsed_keys).enumerate() {
+        let position = if reconcile_occurrences {
+            assignments[parsed_position]
+        } else {
+            assign(message, keys, Ordinary, &mut matched)
         };
         if let Some(position) = position {
             matched[position] = true;
@@ -7605,143 +7747,6 @@ fn store_parsed_messages(
         }),
     )?;
     Ok(has_archive)
-}
-
-struct ClaudeInputMatch {
-    stored_position: Option<usize>,
-}
-
-/// Match Claude occurrences without treating a replay-only timestamp match as proof
-/// that an archived typed row was a copy.
-///
-/// Decision table for each (UUID, content), with stored rows N=none, O=one original,
-/// OM=original plus known mirror, S=several originals (known mirrors remain mirrors):
-///
-/// stored | original only | replay only | both                  | neither
-/// N      | append O      | append M    | append O,M            | retain
-/// O      | retain O      | retain O,+M | retain O,+M           | retain O
-/// OM     | retain O,M    | retain O,M  | retain O,M            | retain O,M
-/// S      | retain all    | retain,+M   | match O, demote one R | retain all
-/// A legacy O+copy pair whose replay marker was not stored is S with two typed
-/// rows: typed counts are 2, 2, 1, 2 across the four columns. For S with n typed
-/// rows they are n, n, n-1, n. Known OM has one typed row in every column;
-/// O has one throughout; N has 1, 0, 1, 0. Each parsed replay matches at most
-/// one copy, so additional unmatched occurrences retain their typed classification.
-///
-/// Exact timestamps select occurrences first. Equal or missing timestamps use stored
-/// order, reserving the original before the replay. Demotion requires BOTH parsed
-/// occurrences and a separate stored row after reserving the original. Replay-only
-/// evidence can match a known mirror, never a typed row, even at a unique timestamp.
-/// Unmatched archived rows retain their classification. This matcher only assigns
-/// occurrences; it does not delete or renumber rows. A known mirror is never consumed
-/// as a typed original. Identity-less legacy originals are reserved only for originals.
-///
-/// The caller detects replay markers while building existing parsed keys and repeated
-/// stored UUIDs while building existing identity queues. Ordinary unique non-replay
-/// sessions skip this function: no extra maps or passes. Otherwise O(stored + parsed)
-/// time and fixed-size key memory; no source bytes are read and only new rows add disk.
-fn claude_input_matches(
-    parsed: &ParsedSession,
-    parsed_keys: &[MessageKeys],
-    stored: &[(i64, MessageKeys)],
-) -> HashMap<usize, ClaudeInputMatch> {
-    use crate::models::{MessageCorrelationAuthority, MessageRecordRelation, Role};
-    let mut result = HashMap::new();
-    let mut by_time = HashMap::<_, std::collections::VecDeque<usize>>::new();
-    let mut by_content = HashMap::<_, std::collections::VecDeque<usize>>::new();
-    for (position, (_, keys)) in stored.iter().enumerate() {
-        #[cfg(test)]
-        CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
-        by_time
-            .entry((keys.correlation, keys.role_content_timestamp, keys.mirror))
-            .or_default()
-            .push_back(position);
-        by_content
-            .entry((keys.correlation, keys.role_and_content, keys.mirror))
-            .or_default()
-            .push_back(position);
-    }
-    let mut consumed = vec![false; stored.len()];
-    let mut originals = std::collections::HashSet::new();
-    for relation in [
-        MessageRecordRelation::Original,
-        MessageRecordRelation::Mirror,
-    ] {
-        for (position, (message, keys)) in parsed.messages.iter().zip(parsed_keys).enumerate() {
-            #[cfg(test)]
-            CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
-            if message.role != Role::User
-                || message.provenance.record_relation != relation
-                || !message
-                    .provenance
-                    .correlation_identity
-                    .as_ref()
-                    .is_some_and(|id| id.authority == MessageCorrelationAuthority::Anthropic)
-            {
-                continue;
-            }
-            let Some(identity) = keys.correlation else {
-                continue;
-            };
-            let group = (identity, keys.role_and_content);
-            let replay = relation == MessageRecordRelation::Mirror;
-            let take = |queue: Option<&mut std::collections::VecDeque<usize>>,
-                        consumed: &mut [bool]| {
-                let queue = queue?;
-                while let Some(p) = queue.pop_front() {
-                    if !consumed[p] {
-                        consumed[p] = true;
-                        return Some(p);
-                    }
-                }
-                None
-            };
-            let mut matched = take(
-                by_time.get_mut(&(Some(identity), keys.role_content_timestamp, replay)),
-                &mut consumed,
-            )
-            .or_else(|| {
-                take(
-                    by_content.get_mut(&(Some(identity), keys.role_and_content, replay)),
-                    &mut consumed,
-                )
-            });
-            if !replay && matched.is_none() {
-                matched = take(
-                    by_time.get_mut(&(None, keys.role_content_timestamp, false)),
-                    &mut consumed,
-                )
-                .or_else(|| {
-                    take(
-                        by_content.get_mut(&(None, keys.role_and_content, false)),
-                        &mut consumed,
-                    )
-                });
-            }
-            if replay && matched.is_none() && originals.contains(&group) {
-                matched = take(
-                    by_time.get_mut(&(Some(identity), keys.role_content_timestamp, false)),
-                    &mut consumed,
-                )
-                .or_else(|| {
-                    take(
-                        by_content.get_mut(&(Some(identity), keys.role_and_content, false)),
-                        &mut consumed,
-                    )
-                });
-            }
-            if !replay {
-                originals.insert(group);
-            }
-            result.insert(
-                position,
-                ClaudeInputMatch {
-                    stored_position: matched,
-                },
-            );
-        }
-    }
-    result
 }
 
 #[cfg(test)]

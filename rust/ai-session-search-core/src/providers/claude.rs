@@ -5149,6 +5149,159 @@ mod tests {
     #[test]
     fn replay_reconciliation_occurrence_matrix() {
         use crate::models::{MessageFilters, MessageRecordRelation, Role};
+        // Reserve every exact occurrence before assigning loose same-text matches.
+        for (stored_times, parsed_ids) in [
+            (vec![1], vec![Some("input-u"), Some("input-v")]),
+            (vec![0], vec![None, Some("input-v")]),
+            (
+                vec![1, 2],
+                vec![Some("input-u"), Some("input-v"), Some("input-w")],
+            ),
+        ] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("synthetic.jsonl");
+            let record = |time: usize, id: Option<&str>, replay: bool| {
+                let mut value = json!({"type":"user","sessionId":"synthetic",
+                    "timestamp":format!("2026-01-01T00:00:0{time}Z"),
+                    "message":{"role":"user","content":"synthetic request"}});
+                if let Some(id) = id {
+                    value["uuid"] = json!(id);
+                }
+                if replay {
+                    value["isReplay"] = json!(true);
+                }
+                value
+            };
+            let parse = |records: Vec<Value>| {
+                ClaudeAdapter::new(vec![])
+                    .parse_reader(
+                        std::io::Cursor::new(
+                            records
+                                .iter()
+                                .map(Value::to_string)
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                        ),
+                        &path,
+                    )
+                    .unwrap()
+            };
+            let mut old = parse(
+                stored_times
+                    .iter()
+                    .map(|&t| record(t, None, false))
+                    .collect(),
+            );
+            old.session.parse_version = "claude-legacy".into();
+            let mut records = parsed_ids
+                .iter()
+                .enumerate()
+                .map(|(t, &id)| record(t, id, false))
+                .collect::<Vec<_>>();
+            records.push(record(parsed_ids.len(), *parsed_ids.last().unwrap(), true));
+            let current = parse(records);
+            let db_path = temp.path().join("index.db");
+            let db = crate::db::Db::open(&db_path).unwrap();
+            db.upsert_session(&old, 1, 1).unwrap();
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let rows = |conn: &rusqlite::Connection| {
+                conn.prepare(
+                    "select id, seq, ts, case when correlation_id is not null then json_array(correlation_authority, correlation_scope, correlation_id) end, record_relation from messages order by id",
+                )
+                .unwrap()
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                        r.get::<_, String>(4)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+            };
+            let before = rows(&conn);
+            let fresh_path = temp.path().join("fresh.db");
+            let fresh = crate::db::Db::open(&fresh_path).unwrap();
+            fresh.upsert_session(&current, 1, 1).unwrap();
+            let fresh_conn = rusqlite::Connection::open(&fresh_path).unwrap();
+            let projection = |conn: &rusqlite::Connection| {
+                let mut values = rows(conn)
+                    .into_iter()
+                    .map(|(_, _, ts, id, relation)| (ts, id, relation))
+                    .collect::<Vec<_>>();
+                values.sort();
+                values
+            };
+            let fresh_rows = rows(&fresh_conn);
+            let mut expected = before
+                .iter()
+                .zip(&stored_times)
+                .map(|(row, &time)| {
+                    let source = &fresh_rows[time];
+                    (
+                        row.0,
+                        row.1,
+                        source.2.clone(),
+                        source.3.clone(),
+                        source.4.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (time, source) in fresh_rows.iter().enumerate() {
+                if !stored_times.contains(&time) {
+                    let next = expected.len() as i64;
+                    expected.push((
+                        next + 1,
+                        next,
+                        source.2.clone(),
+                        source.3.clone(),
+                        source.4.clone(),
+                    ));
+                }
+            }
+            let mut previous = None;
+            for generation in [2, 3] {
+                db.upsert_session(&current, generation, generation).unwrap();
+                let after = rows(&conn);
+                assert_eq!(
+                    after.len(),
+                    parsed_ids.len() + 1,
+                    "stored times={stored_times:?}"
+                );
+                assert_eq!(
+                    db.search_messages(
+                        "",
+                        &MessageFilters {
+                            role: Some(Role::User),
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap()
+                    .len(),
+                    parsed_ids.len()
+                );
+                assert_eq!(after.iter().filter(|r| r.4 == "mirror").count(), 1);
+                for (row, &time) in before.iter().zip(&stored_times) {
+                    let expected = (
+                        row.0,
+                        row.1,
+                        row.2.clone(),
+                        fresh_rows[time].3.clone(),
+                        "original".to_owned(),
+                    );
+                    assert_eq!(after.iter().find(|r| r.0 == row.0), Some(&expected));
+                }
+                assert_eq!(after, expected);
+                assert_eq!(projection(&conn), projection(&fresh_conn));
+                if let Some(previous) = &previous {
+                    assert_eq!(&after, previous);
+                }
+                previous = Some(after);
+            }
+        }
         // Stored: none, one typed original, typed original plus known mirror,
         // two or three legacy typed occurrences, an identity-less original, and a distinct
         // native original. Parsed: neither, original, replay, both.
@@ -5357,7 +5510,9 @@ mod tests {
                 crate::models::MessageRecordRelation::Mirror;
             crate::db::CLAUDE_INPUT_WORK.with(|work| work.set(0));
             db.upsert_session(&replayed, 3, 3).unwrap();
-            crate::db::CLAUDE_INPUT_WORK.with(|work| assert_eq!(work.get(), 3 * count));
+            // One stored pass, one parsed original inventory and eight reservation passes.
+            // Ordinary unique inputs above still perform no occurrence-planning visits.
+            crate::db::CLAUDE_INPUT_WORK.with(|work| assert_eq!(work.get(), 10 * count));
         }
     }
 
