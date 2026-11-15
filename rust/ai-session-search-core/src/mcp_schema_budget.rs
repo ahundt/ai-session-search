@@ -724,7 +724,7 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     ("run_skill_capability", 4_733, 9),
     // Explicit range kinds include harness notices without changing the default class set.
     // Canonical detail compact/full retains the deprecated response_format spelling.
-    ("get_session", 4_417, 10),
+    ("get_session", 4_743, 10),
     // Session dates state the UTC default and the explicit [Area/City] calendar opt-in.
     ("search_sessions", 4_457, 8),
     ("list_sessions", 3_909, 8),

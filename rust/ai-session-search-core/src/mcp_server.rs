@@ -1672,13 +1672,6 @@ fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
     } else {
         arguments
     };
-    if tool_name == "get_session" {
-        for name in ["since", "until", "when"] {
-            if let Some(given) = arguments.get(name) {
-                return Err(format!("unknown get_session parameter {name}={given}; accepted date filters belong to search_messages with session_id. Pass search_messages(session_id=..., {name}=...) without query for this session's messages in a date window, or omit {name} to read get_session without a date filter"));
-            }
-        }
-    }
     let schema = &tool["inputSchema"];
     validate_schema_value(arguments, schema, schema, tool_name, "arguments")
 }
@@ -4819,15 +4812,18 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "message_seq": { "type": "integer", "minimum": 0, "description": "Deprecated: use seq; conflicts fail." },
                             "seq_from": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Lower inclusive session-local sequence bound. Pair with seq_to for chunks (0..499, then 500..999); advance last seq + 1 to avoid re-reading. Conflicts with summary, transcript_lines and seq. Omit to start at the first message."
+                                "description": "Inclusive session-local sequence start; omit for first. For chunks, advance last seq + 1. Conflicts with summary, transcript_lines and seq."
                             },
                             "seq_to": {
                                 "type": "integer", "minimum": 0,
-                                "description": "Upper inclusive message-sequence bound for an absolute range read. See seq_from for non-overlapping chunked reads. Must be >= seq_from when both are given."
+                                "description": "Inclusive session-local sequence end, >= seq_from; omit for last. See seq_from for chunks."
                             },
                             "kinds": { "type": "array", "items": { "type": "string", "enum": message_kind_values() }, "description": "Range message classes; omit for all except harness_notice. Focused seq includes every class." },
                             "role": { "type": "string", "enum": ["user", "assistant", "tool", "slash", "compaction"], "description": "Range role; user selects recorded input. Omit for all." },
                             "limit": { "type": "integer", "minimum": 0, "description": "Range message count; omit for 0 (all)." },
+                            "since": { "type": "string", "description": "Inclusive event timestamp start: RFC 3339 or period (7d, 2026-01), UTC unless zoned; omit for no bound. Range only; conflicts with when." },
+                            "until": { "type": "string", "description": "Inclusive event timestamp end: same forms/UTC as since; omit for no bound. Range only; conflicts with when." },
+                            "when": { "type": "string", "description": "Event timestamp period: same forms/UTC as since; omit for no bound. Range only; conflicts with since/until." },
                             "offset": { "type": "integer", "minimum": 0, "description": "Range messages to skip; omit for 0." },
                             "order": { "type": "string", "enum": ["oldest", "newest"], "description": "Range selection edge; omit for oldest. Newest selects last N; both return oldest-first." },
                             "context_before": { "type": "integer", "minimum": 0, "description": "With seq: sequence-number radius before anchor, 0..9223372036854775807; all rows tied at each sequence included. Omit for context (default 0)." },
@@ -5213,9 +5209,16 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     // numbers are session-local, which this per-session tool already scopes.
     let seq_from = args.get("seq_from").and_then(Value::as_i64);
     let seq_to = args.get("seq_to").and_then(Value::as_i64);
-    let has_range = ["seq_from", "seq_to", "role", "limit", "offset", "order"]
-        .iter()
-        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
+    for name in ["since", "until", "when"] {
+        if summary || message_seq.is_some() || transcript_lines.is_some() {
+            reject_present(args, name, &format!("{name} conflicts with summary, seq/message_seq, and transcript_lines; omit those selectors for a range read"))?;
+        }
+    }
+    let has_range = [
+        "seq_from", "seq_to", "role", "limit", "offset", "order", "since", "until", "when",
+    ]
+    .iter()
+    .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
 
     if message_seq.is_none() {
         for name in ["context_before", "context_after"] {
@@ -5302,7 +5305,10 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             .resolve_session(session_id)
             .map_err(|e| format!("{e:#}"))?;
         let presentation = MessagePresentation::from_args(args, config)?;
+        let (since, until) = parse_date_bounds(args, chrono::Utc::now())?;
         let filters = MessageFilters {
+            since,
+            until,
             session_id: Some(session.id.clone()),
             seq_from,
             seq_to,
@@ -9778,7 +9784,7 @@ mod tests {
             properties["seq_from"]["description"]
                 .as_str()
                 .unwrap()
-                .contains("last seq + 1 to avoid re-reading"),
+                .contains("For chunks, advance last seq + 1"),
             "seq_from doc explains non-overlapping chunk reads"
         );
 
