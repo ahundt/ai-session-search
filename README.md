@@ -425,7 +425,9 @@ Installing the package never touches your configuration: no aliases, no MCP clie
 instruction files or skills, and not one transcript read. `aise integrations install` is the
 second step that does all of that, adds the `aisearch` and `ai_session_search` aliases, and
 starts building the index in the background. Run `aise doctor` afterward for readiness and
-recovery guidance.
+recovery guidance. On Windows without symbolic-link privilege, skills use manifest-owned copies
+that refresh on upgrade; executable aliases are skipped. Enable Developer Mode before installing
+if you want symbolic links instead.
 
 After an upgrade, the first ordinary `aise` command refreshes the skill and instructions it
 installed and migrates recognized MCP registrations even without a skill install, preserving

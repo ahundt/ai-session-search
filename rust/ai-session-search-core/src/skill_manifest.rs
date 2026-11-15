@@ -68,9 +68,12 @@ pub(crate) struct SkillInstallation {
     /// `aise` version that performed the install, for diagnostics.
     pub(crate) installed_by_version: String,
     pub(crate) files: Vec<InstalledSkillFile>,
-    /// Harness users of discovery links to this package, including shared destinations.
+    /// Harness users of discovery entries for this package, including shared copies or links.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) discovery_clients: Vec<String>,
+    /// Canonical package for a privilege-free discovery copy; absent for ordinary roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) discovery_copy_source: Option<EncodedPath>,
     #[serde(flatten)]
     extras: BTreeMap<String, serde_json::Value>,
 }
@@ -220,6 +223,9 @@ impl SkillInstallManifest {
                         .unwrap_or_default(),
                 })
                 .collect(),
+            discovery_copy_source: self
+                .installation(root)
+                .and_then(|installation| installation.discovery_copy_source.clone()),
             discovery_clients: self
                 .installation(root)
                 .map(|installation| installation.discovery_clients.clone())

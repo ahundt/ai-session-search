@@ -17,6 +17,12 @@ App/IDE/CLI share `antigravity`. Cloud-only account history is outside this loca
 
 ## 1. Start
 
+On Windows without symbolic-link privilege, `aise integrations install` installs manifest-owned
+skill copies that refresh on upgrade and skips executable aliases. `aise integrations status`
+reports each copy's contents; uninstall preserves modified copies. Copies remain copies if
+Developer Mode is later enabled. To switch to links, uninstall the skill, enable Developer Mode,
+then reinstall. Codex and Gemini still share one discovery entry.
+
 For “my earlier messages/corrections”, use `role="user"` on `search_messages`
 or CLI `--role user`: answers can have tool role. It finds
 recorded prompts, queued submissions and linked answers. For content queries, matching stays in
