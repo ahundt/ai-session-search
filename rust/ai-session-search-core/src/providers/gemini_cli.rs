@@ -689,8 +689,47 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
         .iter()
         .map(|e| e.ts)
         .collect::<Vec<_>>();
-    let (order, ambiguous_from) =
-        migration_order(&successor_order, &predecessor_order, &timestamps)?;
+    let (order, _) = migration_order(&successor_order, &predecessor_order, &timestamps)?;
+    // Shared calls close both branches, even when the anchor touches another file.
+    // Within each interval, only competing mutations of the same path can invalidate bytes.
+    // Each edit enters one path group: O(N) additional time and space.
+    let shared = successor_order.iter().copied().collect::<HashSet<_>>();
+    let anchors = predecessor_order
+        .iter()
+        .copied()
+        .filter(|index| shared.contains(index))
+        .collect::<HashSet<_>>();
+    let mut groups = HashMap::<(usize, &str), [Vec<usize>; 2]>::new();
+    for (side, source) in [&successor_order, &predecessor_order]
+        .into_iter()
+        .enumerate()
+    {
+        let mut interval = 0;
+        for &index in source {
+            if anchors.contains(&index) {
+                interval += 1;
+            } else {
+                groups
+                    .entry((interval, &successor.file_edits[index].file_path))
+                    .or_default()[side]
+                    .push(index);
+            }
+        }
+    }
+    let mut uncertain = HashSet::new();
+    for sources in groups.values() {
+        let indices = sources.iter().flatten().copied().collect::<Vec<_>>();
+        let times = indices
+            .iter()
+            .map(|&index| timestamps[index])
+            .collect::<Vec<_>>();
+        let first = (0..sources[0].len()).collect::<Vec<_>>();
+        let second = (sources[0].len()..indices.len()).collect::<Vec<_>>();
+        let (local_order, ambiguous) = migration_order(&first, &second, &times)?;
+        if let Some(start) = ambiguous {
+            uncertain.extend(local_order[start..].iter().map(|&index| indices[index]));
+        }
+    }
     let mut edits = std::mem::take(&mut successor.file_edits)
         .into_iter()
         .map(Some)
@@ -699,9 +738,8 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
     for (seq, index) in order.into_iter().enumerate() {
         let mut edit = edits[index].take().expect("unique merged edit");
         edit.seq = seq as i64;
-        // No snapshot after an unresolved branch can establish which write was latest.
-        // Retain each version as path-only; the original payload remains in its tool row.
-        if ambiguous_from.is_some_and(|first| seq >= first) {
+        // Retain uncertain versions as path-only; a later shared snapshot restores bytes.
+        if uncertain.contains(&index) {
             edit.new_content = None;
             edit.edits.clear();
         }
@@ -2305,6 +2343,69 @@ mod tests {
                     assert_eq!(merged.file_edits.len(), 3);
                     assert_eq!(crate::files::reconstruct(&merged.file_edits, 2), None);
                     assert_eq!(crate::files::reconstruct(&merged.file_edits, 3), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn migration_ambiguity_preserves_shared_snapshots_and_unrelated_files() {
+        let adapter = GeminiCliAdapter::new(Vec::new());
+        let record = |id: &str, path: &str| {
+            json!({
+                "id":id,"type":"gemini","content":[],"toolCalls":[{
+                    "id":id,"name":"write_file","args":{"file_path":path,"content":id},
+                    "result":[{"functionResponse":{"id":id,"name":"write_file","response":{"output":"written"}}}]
+                }]
+            })
+        };
+        for same_file in [false, true] {
+            for timestamp in [Value::Null, json!("2026-01-01T00:00:00Z")] {
+                let mut a = record("a", "/tmp/example.txt");
+                let mut b = record(
+                    "b",
+                    if same_file {
+                        "/tmp/example.txt"
+                    } else {
+                        "/tmp/other.txt"
+                    },
+                );
+                let mut c = record("final", "/tmp/example.txt");
+                for row in [&mut a, &mut b, &mut c] {
+                    row["timestamp"] = timestamp.clone();
+                }
+                let parse = |messages| {
+                    adapter
+                        .parse_raw(
+                            Path::new("session-causal.json"),
+                            json!({"sessionId":"causal","messages":messages}).to_string(),
+                        )
+                        .unwrap()
+                };
+                let merged =
+                    merge_migration_family(parse(vec![a, c.clone()]), parse(vec![b, c])).unwrap();
+                assert_eq!(merged.file_edits.len(), 3);
+                let edits = merged
+                    .file_edits
+                    .iter()
+                    .filter(|e| e.file_path == "/tmp/example.txt")
+                    .cloned()
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    crate::files::reconstruct(&edits, edits.len()).as_deref(),
+                    Some("final")
+                );
+                if !same_file {
+                    assert_eq!(edits[0].new_content.as_deref(), Some("a"));
+                    let other = merged
+                        .file_edits
+                        .iter()
+                        .find(|e| e.file_path == "/tmp/other.txt")
+                        .unwrap();
+                    assert_eq!(other.new_content.as_deref(), Some("b"));
+                } else {
+                    assert_eq!(crate::files::reconstruct(&edits, 1), None);
+                    assert_eq!(crate::files::reconstruct(&edits, 2), None);
                 }
             }
         }
