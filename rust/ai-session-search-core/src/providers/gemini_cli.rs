@@ -746,10 +746,8 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
             .collect::<Vec<_>>();
         let first = (0..sources[0].len()).collect::<Vec<_>>();
         let second = (sources[0].len()..indices.len()).collect::<Vec<_>>();
-        let (local_order, ambiguous) = migration_order(&first, &second, &times)?;
-        if let Some(start) = ambiguous {
-            uncertain.extend(local_order[start..].iter().map(|&index| indices[index]));
-        }
+        let (_, ambiguous) = migration_order(&first, &second, &times)?;
+        uncertain.extend(ambiguous.into_iter().map(|index| indices[index]));
     }
     let mut edits = std::mem::take(&mut successor.file_edits)
         .into_iter()
@@ -760,7 +758,7 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
     for (seq, index) in order.into_iter().enumerate() {
         let mut edit = edits[index].take().expect("unique merged edit");
         edit.seq = seq as i64;
-        // Retain uncertain versions as path-only; a later shared snapshot restores bytes.
+        // Retain uncertain versions as path-only; a later proven snapshot restores bytes.
         if uncertain.contains(&index) {
             edit.new_content = None;
             edit.edits.clear();
@@ -793,16 +791,22 @@ fn merge_file_mutations(successor: &mut ParsedSession, predecessor: &ParsedSessi
 
 /// Union two source orders using shared native identities as anchors. Only strictly ordered
 /// timestamps disambiguate independent branch heads; ties/missing timestamps retain a stable
-/// archive order, but identify the first unprovable position for reconstruction to refuse.
+/// archive order, but identify unprovable mutations for reconstruction to refuse.
+/// Retain each branch's latest emitted frontier until a shared anchor or a strictly later
+/// opposite head proves it precedes that head. Source order covers earlier frontier members.
 /// Each node has at most two outgoing edges and at most two heads are ready: O(N) time/space.
 fn migration_order(
     successor: &[usize],
     predecessor: &[usize],
     timestamps: &[Option<DateTime<Utc>>],
-) -> Result<(Vec<usize>, Option<usize>)> {
+) -> Result<(Vec<usize>, Vec<usize>)> {
     let mut edges = vec![Vec::new(); timestamps.len()];
     let mut incoming = vec![0usize; timestamps.len()];
-    for source in [successor, predecessor] {
+    let mut membership = vec![0u8; timestamps.len()];
+    for (side, source) in [successor, predecessor].into_iter().enumerate() {
+        for &index in source {
+            membership[index] |= 1 << side;
+        }
         for pair in source.windows(2) {
             if !edges[pair[0]].contains(&pair[1]) {
                 edges[pair[0]].push(pair[1]);
@@ -816,18 +820,32 @@ fn migration_order(
         .filter_map(|(i, &n)| (n == 0).then_some(i))
         .collect::<Vec<_>>();
     let mut order = Vec::new();
-    let mut ambiguous = None;
+    let mut ambiguous = vec![false; timestamps.len()];
+    let mut frontier: [Option<usize>; 2] = [None, None];
     while !ready.is_empty() {
         let mut selected = 0;
         if ready.len() > 1 {
             match (timestamps[ready[0]], timestamps[ready[1]]) {
                 (Some(a), Some(b)) if a != b => selected = usize::from(b < a),
                 _ => {
-                    ambiguous.get_or_insert(order.len());
+                    ambiguous[ready[0]] = true;
                 }
             }
         }
         let index = ready.swap_remove(selected);
+        if membership[index] == 3 {
+            frontier = [None, None];
+        } else {
+            let side = usize::from(membership[index] == 2);
+            if let Some(other) = frontier[1 - side] {
+                if matches!((timestamps[other], timestamps[index]), (Some(a), Some(b)) if a < b) {
+                    frontier[1 - side] = None;
+                } else {
+                    ambiguous[index] = true;
+                }
+            }
+            frontier[side] = Some(index);
+        }
         order.push(index);
         for &next in &edges[index] {
             incoming[next] -= 1;
@@ -840,7 +858,14 @@ fn migration_order(
         order.len() == timestamps.len(),
         "Gemini migration family has contradictory native order"
     );
-    Ok((order, ambiguous))
+    Ok((
+        order,
+        ambiguous
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, uncertain)| uncertain.then_some(index))
+            .collect(),
+    ))
 }
 
 fn message_payload_equal(left: &Message, right: &Message) -> bool {
@@ -2451,6 +2476,50 @@ mod tests {
                     assert_eq!(crate::files::reconstruct(&edits, 1), None);
                     assert_eq!(crate::files::reconstruct(&edits, 2), None);
                 }
+            }
+        }
+        for final_timestamp in [
+            json!("2026-01-01T00:00:01Z"),
+            json!("2026-01-01T00:00:00Z"),
+            Value::Null,
+        ] {
+            let mut a = record("a", "/tmp/example.txt");
+            let mut b = record("b", "/tmp/example.txt");
+            let mut d = record("final", "/tmp/example.txt");
+            a["timestamp"] = json!("2026-01-01T00:00:00Z");
+            b["timestamp"] = a["timestamp"].clone();
+            d["timestamp"] = final_timestamp.clone();
+            let parse = |messages| {
+                adapter
+                    .parse_raw(
+                        Path::new("session-causal.json"),
+                        json!({"sessionId":"causal","messages":messages}).to_string(),
+                    )
+                    .unwrap()
+            };
+            for reverse in [false, true] {
+                let first = parse(vec![a.clone(), d.clone()]);
+                let second = parse(vec![b.clone()]);
+                let merged = if reverse {
+                    merge_migration_family(second, first)
+                } else {
+                    merge_migration_family(first, second)
+                }
+                .unwrap();
+                let edits = &merged.file_edits;
+                assert_eq!(edits.len(), 3);
+                assert_eq!(crate::files::reconstruct(edits, 1), None);
+                assert_eq!(crate::files::reconstruct(edits, 2), None);
+                let expected = if final_timestamp == json!("2026-01-01T00:00:01Z") {
+                    Some("final")
+                } else {
+                    None
+                };
+                assert_eq!(
+                    crate::files::reconstruct(edits, 3).as_deref(),
+                    expected,
+                    "final timestamp={final_timestamp}, reverse={reverse}"
+                );
             }
         }
     }
