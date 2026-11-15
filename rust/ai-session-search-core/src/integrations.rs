@@ -7784,6 +7784,105 @@ mod tests {
         assert!(!receipt.exists());
     }
 
+    fn create_layout_test_link(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        create_directory_symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            if crate::durable_fs::symlinks_available().unwrap() {
+                create_directory_symlink(target, link).unwrap();
+            } else {
+                let output = std::process::Command::new("cmd.exe")
+                    .args(["/D", "/C", "mklink", "/J"])
+                    .arg(link)
+                    .arg(target)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+            }
+        }
+    }
+
+    fn linked_layout_install_status_reinstall_uninstall(base: &Path, link_harness: bool) {
+        let home = base.join("home");
+        fs::create_dir(&home).unwrap();
+        if link_harness {
+            let dotfiles = base.join("dotfiles");
+            fs::create_dir(&dotfiles).unwrap();
+            create_layout_test_link(&dotfiles, &home.join(".claude"));
+        } else {
+            fs::create_dir(home.join(".claude")).unwrap();
+        }
+        fs::write(home.join(".claude/personal.txt"), "keep me").unwrap();
+        let layout = ClientLayout::new(home.clone(), base.join("native"), ClientPlatform::Linux);
+        let receipt = base.join("app/receipt.json");
+        let arguments = vec![
+            "--client".into(),
+            "claude".into(),
+            "--no-aliases".into(),
+            "--binary".into(),
+            std::env::current_exe().unwrap().into_os_string(),
+        ];
+        install_for_layout(parse_integration_args(arguments.clone()), &receipt, &layout).unwrap();
+        let manifest_path = crate::skill_manifest::manifest_path(&receipt);
+        let manifest = fs::read(&manifest_path).unwrap();
+        let target = targets_for_layout(McpClient::Claude, &layout).remove(0);
+        assert_eq!(status_target(&target).unwrap(), "configured");
+        status_for_layout(
+            parse_integration_args(vec![
+                "--client".into(),
+                "claude".into(),
+                "--no-aliases".into(),
+            ]),
+            &receipt,
+            &layout,
+        )
+        .unwrap();
+        assert!(home
+            .join(".claude/skills/ai-session-search/SKILL.md")
+            .is_file());
+        install_for_layout(parse_integration_args(arguments), &receipt, &layout).unwrap();
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
+        uninstall_for_layout(
+            parse_integration_args(vec![
+                "--client".into(),
+                "claude".into(),
+                "--keep-aliases".into(),
+            ]),
+            &receipt,
+            &layout,
+        )
+        .unwrap();
+        assert_ne!(status_target(&target).unwrap(), "configured");
+        assert!(!home.join(".claude/skills/ai-session-search").exists());
+        assert_eq!(
+            fs::read_to_string(home.join(".claude/personal.txt")).unwrap(),
+            "keep me"
+        );
+        if link_harness {
+            assert!(crate::durable_fs::is_link_entry(
+                &fs::symlink_metadata(home.join(".claude")).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn preexisting_linked_harness_directory_supports_full_integration_lifecycle() {
+        let dir = tempdir().unwrap();
+        linked_layout_install_status_reinstall_uninstall(dir.path(), true);
+    }
+
+    #[test]
+    fn preexisting_linked_temp_root_supports_full_integration_lifecycle() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real-temp");
+        let linked = dir.path().join("linked-temp");
+        fs::create_dir(&real).unwrap();
+        create_layout_test_link(&real, &linked);
+        let nested = tempfile::Builder::new().tempdir_in(&linked).unwrap();
+        linked_layout_install_status_reinstall_uninstall(nested.path(), false);
+    }
+
     fn copy_test_install(
         receipt: &Path,
         layout: &ClientLayout,
@@ -7891,7 +7990,14 @@ mod tests {
         copy_test_install(&receipt, &layout, &["codex"], false).unwrap();
         let changed = root.join("SKILL.md");
         fs::write(&changed, "personal changes").unwrap();
-        assert!(copy_test_install(&receipt, &layout, &["codex"], true).is_err());
+        let error = copy_test_install(&receipt, &layout, &["codex"], true).unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("refusing to overwrite")
+                && diagnostic.contains("differs from what install recorded")
+                && diagnostic.contains(&changed.display().to_string()),
+            "{diagnostic}"
+        );
         copy_test_uninstall(&receipt, &layout, "codex");
         assert_eq!(fs::read_to_string(&changed).unwrap(), "personal changes");
         let manifest =
@@ -8049,7 +8155,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn native_junction_status_and_uninstall_preserve_canonical_contents() {
+    fn native_junction_status_and_discovery_link_removal_preserve_canonical_contents() {
         let dir = tempdir().unwrap();
         let canonical = dir.path().join("canonical");
         let link = dir.path().join("junction");

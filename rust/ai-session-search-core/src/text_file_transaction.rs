@@ -173,10 +173,20 @@ struct TransactionReceipt {
     /// Absent copy directories to prune after restoring file preimages, deepest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     rollback_directories: Vec<EncodedPath>,
+    /// Resolved directory locations at planning time. Empty only for older receipts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parent_locations: Vec<ParentLocation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ParentLocation {
+    path: EncodedPath,
+    resolved: EncodedPath,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ReceiptChange {
+    /// Absolute native mutation path, retaining the user's linked layout.
     path: EncodedPath,
     before: Option<TextFileImage>,
     after: Option<TextFileImage>,
@@ -333,7 +343,7 @@ where
     )
 }
 
-/// Directory evidence is optional so ordinary link transactions keep their existing receipt.
+/// Record parent locations for every transaction; copy-directory pruning evidence is optional.
 pub(crate) fn execute_transaction_with_directories<F, G>(
     receipt_path: &Path,
     changes: &[TextFileChange],
@@ -361,6 +371,12 @@ where
     }
     validate_changes(&changes, &symlink_changes)?;
     validate_control_paths(receipt_path, &changes, &symlink_changes)?;
+    let parent_locations = record_parent_locations(
+        receipt_path,
+        &changes,
+        &symlink_changes,
+        rollback_directories,
+    )?;
     let lock_path = lock_path(receipt_path);
     let mut lock = open_file_lock(&lock_path).with_context(|| {
         format!(
@@ -401,6 +417,7 @@ where
     directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     directories.dedup();
     let mut receipt = TransactionReceipt {
+        parent_locations,
         rollback_directories: directories
             .iter()
             .map(|path| EncodedPath::from_path(path))
@@ -414,18 +431,22 @@ where
             .collect(),
     };
     write_receipt(receipt_path, &receipt, AtomicWriteMode::CreateNew)?;
+    verify_receipt_ancestors(&receipt)?;
 
     for (index, change) in changes.iter().enumerate() {
+        verify_target_parent(&receipt, &change.path)?;
         if let Err(publish_error) = publish_text(index, change) {
             return rollback_after_failure(receipt_path, &receipt, publish_error);
         }
     }
     for (index, change) in symlink_changes.iter().enumerate() {
+        verify_target_parent(&receipt, &change.path)?;
         if let Err(publish_error) = publish_symlink(index, change) {
             return rollback_after_failure(receipt_path, &receipt, publish_error);
         }
     }
 
+    verify_receipt_ancestors(&receipt)?;
     receipt.phase = TransactionPhase::Published;
     if let Err(phase_error) = write_receipt(receipt_path, &receipt, AtomicWriteMode::Replace) {
         return match load_receipt(receipt_path) {
@@ -481,6 +502,7 @@ pub(crate) fn recover_text_file_transaction(receipt_path: &Path) -> Result<Recov
             receipt_path.display()
         );
     }
+    verify_receipt_ancestors(&load_receipt(receipt_path)?)?;
     let lock_path = lock_path(receipt_path);
     let mut lock = open_file_lock(&lock_path).with_context(|| {
         format!(
@@ -492,6 +514,7 @@ pub(crate) fn recover_text_file_transaction(receipt_path: &Path) -> Result<Recov
         .try_write()
         .map_err(|error| integration_lock_error(error, &lock_path))?;
     let receipt = load_receipt(receipt_path)?;
+    verify_receipt_ancestors(&receipt)?;
     let outcome = match receipt.phase {
         TransactionPhase::Prepared => RecoveryOutcome::RolledBack {
             paths: rollback_prepared(&receipt)?,
@@ -609,7 +632,124 @@ fn absolutize_symlink_change(mut change: SymlinkChange) -> Result<SymlinkChange>
     Ok(change)
 }
 
+/// Canonicalize the deepest existing directory and retain any not-yet-created components.
+/// The same resolver is used for planning and validation, including Windows verbatim paths.
+fn resolve_directory_location_with(
+    path: &Path,
+    mut canonicalize: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+) -> Result<PathBuf> {
+    let mut existing = absolutize_transaction_path(path)?;
+    let mut missing = Vec::new();
+    loop {
+        match canonicalize(&existing) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(crate::util::normalize_absolute_path(&resolved));
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let component = existing
+                    .components()
+                    .next_back()
+                    .ok_or_else(|| anyhow!("cannot resolve directory location {}", path.display()))?
+                    .as_os_str()
+                    .to_os_string();
+                if !existing.pop() {
+                    return Err(error)
+                        .with_context(|| format!("resolve directory location {}", path.display()));
+                }
+                missing.push(component);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("resolve directory location {}", path.display()))
+            }
+        }
+    }
+}
+
+fn resolve_directory_location(path: &Path) -> Result<PathBuf> {
+    resolve_directory_location_with(path, |path| fs::canonicalize(path))
+}
+
+fn record_parent_locations(
+    receipt: &Path,
+    changes: &[TextFileChange],
+    links: &[SymlinkChange],
+    rollback_directories: &[PathBuf],
+) -> Result<Vec<ParentLocation>> {
+    let mut directories = std::collections::BTreeSet::new();
+    for path in std::iter::once(receipt)
+        .chain(changes.iter().map(|change| change.path.as_path()))
+        .chain(links.iter().map(|change| change.path.as_path()))
+    {
+        let absolute = absolutize_transaction_path(path)?;
+        if let Some(parent) = absolute.parent() {
+            directories.insert(parent.to_path_buf());
+        }
+    }
+    for path in rollback_directories {
+        directories.insert(absolutize_transaction_path(path)?);
+    }
+    directories
+        .into_iter()
+        .map(|path| {
+            Ok(ParentLocation {
+                resolved: EncodedPath::from_path(&resolve_directory_location(&path)?),
+                path: EncodedPath::from_path(&path),
+            })
+        })
+        .collect()
+}
+
+fn verify_parent_location(receipt: &TransactionReceipt, location: &ParentLocation) -> Result<()> {
+    let path = location.path.to_path_buf()?;
+    // A receipt-authorized legacy copy migration is reversed before its files are restored.
+    if receipt.symlink_changes.iter().any(|change| {
+        matches!(change.before, SymlinkImage::Directory)
+            && matches!(change.after, SymlinkImage::Link { .. })
+            && change
+                .path
+                .to_path_buf()
+                .is_ok_and(|link| path.starts_with(link))
+            && change.path.to_path_buf().is_ok_and(|link| {
+                snapshot_symlink_image(&link).is_ok_and(|current| current == change.after)
+            })
+    }) {
+        return Ok(());
+    }
+    let expected = location.resolved.to_path_buf()?;
+    let current = resolve_directory_location(&path)
+        .with_context(|| format!("cannot verify recorded parent {}; restore the original directory or link target; if a receipt exists, run `aise integrations recover` with the same --transaction-receipt, otherwise retry the original command", path.display()))?;
+    if current != expected {
+        bail!("transaction parent {} changed location: recorded {}, now {}. Stopped before further file changes; kept any existing receipt. Restore the original directory or link target; if a receipt exists, run `aise integrations recover` with the same --transaction-receipt, otherwise retry the original command", path.display(), expected.display(), current.display());
+    }
+    Ok(())
+}
+
+fn verify_receipt_ancestors(receipt: &TransactionReceipt) -> Result<()> {
+    // Older receipts lack location evidence and retain their original image-only recovery.
+    for location in &receipt.parent_locations {
+        verify_parent_location(receipt, location)?;
+    }
+    Ok(())
+}
+
+fn verify_target_parent(receipt: &TransactionReceipt, path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        for location in &receipt.parent_locations {
+            if location.path.to_path_buf()? == parent {
+                verify_parent_location(receipt, location)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rollback_prepared(receipt: &TransactionReceipt) -> Result<usize> {
+    // Validate the entire plan before restoring even one unrelated file or link.
+    verify_receipt_ancestors(receipt)?;
     let mut restored = 0;
     let mut conflicts = Vec::new();
     for change in receipt.symlink_changes.iter().rev() {
@@ -621,6 +761,7 @@ fn rollback_prepared(receipt: &TransactionReceipt) -> Result<usize> {
         let removed_directory_before_link =
             matches!(&change.before, SymlinkImage::Directory) && current == SymlinkImage::Absent;
         if current == change.after || removed_directory_before_link {
+            verify_target_parent(receipt, &path)?;
             if let Err(error) = apply_symlink_image(&path, &change.before, &current) {
                 conflicts.push(format!("{}: {error:#}", path.display()));
             } else {
@@ -640,6 +781,7 @@ fn rollback_prepared(receipt: &TransactionReceipt) -> Result<usize> {
             continue;
         }
         if current == change.after {
+            verify_target_parent(receipt, &path)?;
             if let Err(error) = apply_image(&path, &change.before) {
                 conflicts.push(format!("{}: {error:#}", path.display()));
             } else {
@@ -655,6 +797,14 @@ fn rollback_prepared(receipt: &TransactionReceipt) -> Result<usize> {
     if conflicts.is_empty() {
         for directory in &receipt.rollback_directories {
             let path = directory.to_path_buf()?;
+            if let Some(location) = receipt.parent_locations.iter().find(|location| {
+                location
+                    .path
+                    .to_path_buf()
+                    .is_ok_and(|recorded| recorded == path)
+            }) {
+                verify_parent_location(receipt, location)?;
+            }
             // Never follow a replacement link, and never remove a directory containing user data.
             match fs::symlink_metadata(&path) {
                 Err(error) if error.kind() == ErrorKind::NotFound => continue,
@@ -842,6 +992,7 @@ fn apply_image(path: &Path, image: &Option<TextFileImage>) -> Result<()> {
 }
 
 fn write_receipt(path: &Path, receipt: &TransactionReceipt, mode: AtomicWriteMode) -> Result<()> {
+    verify_receipt_ancestors(receipt)?;
     let content = serde_json::to_vec_pretty(receipt)?;
     atomic_write_file(path, &content, mode).with_context(|| {
         format!(
@@ -950,6 +1101,399 @@ mod tests {
         }
     }
 
+    const COPY_REPLACEMENT_ROOT: &str = "AI_SESSION_SEARCH_COPY_REPLACEMENT_TEST_ROOT";
+
+    fn copy_replacement_fixture(
+        root: &Path,
+        existing: bool,
+        nested: bool,
+    ) -> (Vec<TextFileChange>, PathBuf) {
+        let copy = root.join("copy");
+        let replaced = if nested {
+            copy.join("references")
+        } else {
+            copy
+        };
+        fs::create_dir(root.join("external")).unwrap();
+        fs::write(root.join("external/SKILL.md"), "installed bytes").unwrap();
+        fs::write(root.join("other.txt"), "before").unwrap();
+        if existing {
+            fs::create_dir_all(&replaced).unwrap();
+        }
+        (
+            vec![
+                change(&root.join("other.txt"), Some("before"), Some("after")),
+                change(&replaced.join("SKILL.md"), None, Some("installed bytes")),
+            ],
+            replaced,
+        )
+    }
+
+    fn create_fixture_directory_link(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).unwrap();
+        #[cfg(windows)]
+        {
+            let output = Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        }
+    }
+
+    fn replace_copy_ancestor(root: &Path, replaced: &Path) {
+        fs::rename(replaced, root.join("moved-copy")).unwrap();
+        create_fixture_directory_link(&root.join("external"), replaced);
+    }
+
+    fn assert_copy_replacement_preserved(root: &Path, error: &anyhow::Error, replaced: &Path) {
+        assert_eq!(
+            fs::read_to_string(root.join("external/SKILL.md")).unwrap(),
+            "installed bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("moved-copy/SKILL.md")).unwrap(),
+            "installed bytes"
+        );
+        assert_eq!(fs::read_to_string(root.join("other.txt")).unwrap(), "after");
+        assert!(root.join("receipt.json").is_file());
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains(&replaced.display().to_string()),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("changed location") && diagnostic.contains("recover"),
+            "{diagnostic}"
+        );
+        // Follow the diagnostic: restore the original directory, then recover the same receipt.
+        crate::durable_fs::remove_owned_link(replaced, &fs::read_link(replaced).unwrap()).unwrap();
+        fs::rename(root.join("moved-copy"), replaced).unwrap();
+        assert_eq!(
+            recover_text_file_transaction(&root.join("receipt.json")).unwrap(),
+            RecoveryOutcome::RolledBack { paths: 2 }
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("external/SKILL.md")).unwrap(),
+            "installed bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("other.txt")).unwrap(),
+            "before"
+        );
+        assert!(!replaced.join("SKILL.md").exists());
+        assert!(!root.join("receipt.json").exists());
+    }
+
+    #[test]
+    fn copy_ancestor_replacement_failure_preserves_foreign_files_and_receipt() {
+        for existing in [false, true] {
+            for nested in [false, true] {
+                let dir = tempdir().unwrap();
+                let (changes, replaced) = copy_replacement_fixture(dir.path(), existing, nested);
+                let mut prepared = Vec::new();
+                let error = execute_transaction_with_directories(
+                    &dir.path().join("receipt.json"),
+                    &changes,
+                    &[],
+                    &[dir.path().join("copy"), replaced.clone()],
+                    |index, change| {
+                        publish_text_change(change)?;
+                        if index == 1 {
+                            prepared = fs::read(dir.path().join("receipt.json")).unwrap();
+                            replace_copy_ancestor(dir.path(), &replaced);
+                            bail!("injected publication failure after ancestor replacement");
+                        }
+                        Ok(())
+                    },
+                    |_, _| unreachable!(),
+                )
+                .unwrap_err();
+                assert_eq!(fs::read(dir.path().join("receipt.json")).unwrap(), prepared);
+                assert_copy_replacement_preserved(dir.path(), &error, &replaced);
+            }
+        }
+    }
+
+    #[test]
+    fn copy_ancestor_replacement_process_exit_recovery_preserves_foreign_files_and_receipt() {
+        for existing in [false, true] {
+            for nested in [false, true] {
+                let dir = tempdir().unwrap();
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "text_file_transaction::tests::copy_ancestor_replacement_crash_helper",
+                        "--ignored",
+                    ])
+                    .env(COPY_REPLACEMENT_ROOT, dir.path())
+                    .env(
+                        "AI_SESSION_SEARCH_COPY_TEST_EXISTING",
+                        if existing { "1" } else { "0" },
+                    )
+                    .env(
+                        "AI_SESSION_SEARCH_COPY_TEST_NESTED",
+                        if nested { "1" } else { "0" },
+                    )
+                    .output()
+                    .unwrap();
+                assert_eq!(output.status.code(), Some(73), "{output:?}");
+                let replaced = if nested {
+                    dir.path().join("copy/references")
+                } else {
+                    dir.path().join("copy")
+                };
+                let prepared = fs::read(dir.path().join("receipt.json")).unwrap();
+                let error =
+                    recover_text_file_transaction(&dir.path().join("receipt.json")).unwrap_err();
+                assert_eq!(fs::read(dir.path().join("receipt.json")).unwrap(), prepared);
+                assert_copy_replacement_preserved(dir.path(), &error, &replaced);
+            }
+        }
+    }
+
+    #[test]
+    fn retargeted_preexisting_link_preserves_foreign_files_and_receipt() {
+        let dir = tempdir().unwrap();
+        let (changes, copy) = copy_replacement_fixture(dir.path(), true, false);
+        fs::rename(&copy, dir.path().join("owned")).unwrap();
+        create_fixture_directory_link(&dir.path().join("owned"), &copy);
+        let error = execute_text_file_transaction_with(
+            &dir.path().join("receipt.json"),
+            &changes,
+            |index, change| {
+                publish_text_change(change)?;
+                if index == 1 {
+                    replace_copy_ancestor(dir.path(), &copy);
+                    bail!("injected failure after retargeting an existing link");
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_copy_replacement_preserved(dir.path(), &error, &copy);
+    }
+
+    #[test]
+    fn existing_linked_parent_supports_rollback_and_new_and_legacy_receipt_recovery() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("real");
+        let linked = dir.path().join("linked");
+        fs::create_dir(&real).unwrap();
+        create_fixture_directory_link(&real, &linked);
+        let target = linked.join("config.json");
+        let receipt_path = dir.path().join("receipt.json");
+        fs::write(&target, "before").unwrap();
+        let planned = change(&target, Some("before"), Some("after"));
+        let error = execute_text_file_transaction_with(
+            &receipt_path,
+            std::slice::from_ref(&planned),
+            |_, change| {
+                publish_text_change(change)?;
+                bail!("injected failure with unchanged linked layout");
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("restored 1 changed path"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+        assert!(!receipt_path.exists());
+        for (version, record_locations) in [
+            (1, false),
+            (RECEIPT_VERSION, false),
+            (RECEIPT_VERSION, true),
+        ] {
+            let receipt = TransactionReceipt {
+                version,
+                phase: TransactionPhase::Prepared,
+                changes: vec![ReceiptChange::from(&planned)],
+                symlink_changes: Vec::new(),
+                rollback_directories: Vec::new(),
+                parent_locations: if record_locations {
+                    record_parent_locations(&receipt_path, std::slice::from_ref(&planned), &[], &[])
+                        .unwrap()
+                } else {
+                    Vec::new()
+                },
+            };
+            write_receipt(&receipt_path, &receipt, AtomicWriteMode::CreateNew).unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&fs::read(&receipt_path).unwrap()).unwrap();
+            assert_eq!(json.get("parent_locations").is_some(), record_locations);
+            publish_text_change(&planned).unwrap();
+            recover_text_file_transaction(&receipt_path).unwrap();
+            assert_eq!(fs::read_to_string(&target).unwrap(), "before");
+            assert!(is_link_entry(&fs::symlink_metadata(&linked).unwrap()));
+            assert!(!receipt_path.exists());
+        }
+    }
+
+    #[test]
+    fn directory_location_resolution_uses_the_same_canonical_reading_before_and_after_creation() {
+        let dir = tempdir().unwrap();
+        let short = dir.path().join("SHORTN~1");
+        let long = dir.path().join("Long Name");
+        let canonical = dir.path().join("canonical");
+        let planned = resolve_directory_location_with(&short.join("new/child"), |path| {
+            if path == short {
+                Ok(canonical.clone())
+            } else {
+                Err(std::io::Error::from(ErrorKind::NotFound))
+            }
+        })
+        .unwrap();
+        let current = resolve_directory_location_with(&long.join("new/child"), |_| {
+            Ok(canonical.join("new/child"))
+        })
+        .unwrap();
+        assert_eq!(planned, current);
+        let retargeted = resolve_directory_location_with(&short.join("new/child"), |_| {
+            Ok(dir.path().join("foreign/new/child"))
+        })
+        .unwrap();
+        assert_ne!(planned, retargeted);
+    }
+
+    #[test]
+    fn prepared_legacy_directory_to_link_migration_restores_real_directory_before_files() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        fs::create_dir(&legacy).unwrap();
+        fs::create_dir(dir.path().join("external")).unwrap();
+        fs::write(dir.path().join("external/SKILL.md"), "canonical bytes").unwrap();
+        let parent_locations = vec![ParentLocation {
+            path: EncodedPath::from_path(&legacy),
+            resolved: EncodedPath::from_path(&fs::canonicalize(&legacy).unwrap()),
+        }];
+        replace_copy_ancestor(dir.path(), &legacy);
+        let receipt = TransactionReceipt {
+            parent_locations,
+            version: RECEIPT_VERSION,
+            phase: TransactionPhase::Prepared,
+            changes: vec![ReceiptChange::from(&change(
+                &legacy.join("SKILL.md"),
+                Some("legacy bytes"),
+                None,
+            ))],
+            symlink_changes: vec![ReceiptSymlinkChange {
+                path: EncodedPath::from_path(&legacy),
+                before: SymlinkImage::Directory,
+                after: snapshot_symlink_image(&legacy).unwrap(),
+            }],
+            rollback_directories: Vec::new(),
+        };
+        let path = dir.path().join("receipt.json");
+        write_receipt(&path, &receipt, AtomicWriteMode::CreateNew).unwrap();
+        recover_text_file_transaction(&path).unwrap();
+        assert!(!is_link_entry(&fs::symlink_metadata(&legacy).unwrap()));
+        assert_eq!(
+            fs::read_to_string(legacy.join("SKILL.md")).unwrap(),
+            "legacy bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("external/SKILL.md")).unwrap(),
+            "canonical bytes"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn publication_stops_before_entering_a_replaced_ancestor() {
+        let dir = tempdir().unwrap();
+        let (changes, replaced) = copy_replacement_fixture(dir.path(), true, true);
+        let mut calls = 0;
+        let error = execute_text_file_transaction_with(
+            &dir.path().join("receipt.json"),
+            &changes,
+            |index, change| {
+                calls += 1;
+                publish_text_change(change)?;
+                if index == 0 {
+                    replace_copy_ancestor(dir.path(), &replaced);
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("external/SKILL.md")).unwrap(),
+            "installed bytes"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("other.txt")).unwrap(),
+            "after"
+        );
+        assert!(dir.path().join("receipt.json").is_file());
+        assert!(format!("{error:#}").contains("changed location"));
+    }
+
+    #[test]
+    fn ordinary_text_transaction_rollback_rejects_replaced_package_config_and_instruction_parents()
+    {
+        for name in ["SKILL.md", "config.json", "AGENTS.md"] {
+            let dir = tempdir().unwrap();
+            let managed = dir.path().join("managed");
+            let external = dir.path().join("external");
+            fs::create_dir(&managed).unwrap();
+            fs::create_dir(&external).unwrap();
+            fs::write(external.join(name), "installed bytes").unwrap();
+            let planned = change(&managed.join(name), None, Some("installed bytes"));
+            let error = execute_text_file_transaction_with(
+                &dir.path().join("receipt.json"),
+                &[planned],
+                |_, change| {
+                    publish_text_change(change)?;
+                    replace_copy_ancestor(dir.path(), &managed);
+                    bail!("injected ordinary-file publication failure");
+                },
+            )
+            .unwrap_err();
+            assert_eq!(
+                fs::read_to_string(external.join(name)).unwrap(),
+                "installed bytes"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.path().join("moved-copy").join(name)).unwrap(),
+                "installed bytes"
+            );
+            assert!(dir.path().join("receipt.json").exists());
+            assert!(format!("{error:#}").contains("changed location"));
+        }
+    }
+
+    #[test]
+    #[ignore = "subprocess helper that exits after replacing a published file ancestor"]
+    fn copy_ancestor_replacement_crash_helper() {
+        let Some(root) = std::env::var_os(COPY_REPLACEMENT_ROOT).map(PathBuf::from) else {
+            return;
+        };
+        let (changes, replaced) = copy_replacement_fixture(
+            &root,
+            std::env::var("AI_SESSION_SEARCH_COPY_TEST_EXISTING").unwrap() == "1",
+            std::env::var("AI_SESSION_SEARCH_COPY_TEST_NESTED").unwrap() == "1",
+        );
+        execute_transaction_with_directories(
+            &root.join("receipt.json"),
+            &changes,
+            &[],
+            &[root.join("copy"), replaced.clone()],
+            |index, change| {
+                publish_text_change(change)?;
+                if index == 1 {
+                    replace_copy_ancestor(&root, &replaced);
+                    std::process::exit(73);
+                }
+                Ok(())
+            },
+            |_, _| unreachable!(),
+        )
+        .unwrap();
+        panic!("copy replacement helper did not exit after publication");
+    }
+
     #[test]
     fn prepared_copy_recovery_prunes_only_empty_created_directories() {
         for added_user_file in [false, true] {
@@ -960,6 +1504,7 @@ mod tests {
             let receipt_path = dir.path().join("receipt.json");
             let created = change(&file, None, Some("installed bytes"));
             let receipt = TransactionReceipt {
+                parent_locations: Vec::new(),
                 version: RECEIPT_VERSION,
                 phase: TransactionPhase::Prepared,
                 changes: vec![ReceiptChange::from(&created)],
@@ -1127,6 +1672,7 @@ mod tests {
         fs::create_dir_all(link.parent().unwrap()).unwrap();
         create_directory_symlink(&canonical, &link).unwrap();
         let receipt = TransactionReceipt {
+            parent_locations: Vec::new(),
             rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Prepared,
@@ -1158,6 +1704,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
         fs::write(&text, "after").unwrap();
         let mut value = serde_json::to_value(TransactionReceipt {
+            parent_locations: Vec::new(),
             rollback_directories: Vec::new(),
             version: 1,
             phase: TransactionPhase::Prepared,
@@ -1187,6 +1734,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
         fs::write(&path, "before").unwrap();
         let receipt = TransactionReceipt {
+            parent_locations: Vec::new(),
             rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Prepared,
@@ -1502,6 +2050,7 @@ mod tests {
         fs::write(&first, "after").unwrap();
         fs::write(&second, "before-2").unwrap();
         let receipt = TransactionReceipt {
+            parent_locations: Vec::new(),
             rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Prepared,
@@ -1529,6 +2078,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
         fs::write(&path, "external edit").unwrap();
         let receipt = TransactionReceipt {
+            parent_locations: Vec::new(),
             rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Prepared,
@@ -1555,6 +2105,7 @@ mod tests {
         let receipt_path = dir.path().join("receipt.json");
         fs::write(&path, "after").unwrap();
         let receipt = TransactionReceipt {
+            parent_locations: Vec::new(),
             rollback_directories: Vec::new(),
             version: RECEIPT_VERSION,
             phase: TransactionPhase::Published,
