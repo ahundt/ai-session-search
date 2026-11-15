@@ -112,7 +112,11 @@ fn optional_value_fields<'py>(
 
 fn value_json<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
     if let Ok(cursor) = value.cast::<NativeAnalysisCursor>() {
-        return Ok(cursor.borrow().to_token().into_pyobject(value.py())?.into_any());
+        return Ok(cursor
+            .borrow()
+            .to_token()
+            .into_pyobject(value.py())?
+            .into_any());
     }
     if value.hasattr("to_dict")? {
         return value.call_method0("to_dict");
@@ -4866,6 +4870,7 @@ impl SessionSearch {
     /// but still counts it. context accepts integers 0..2**63-1, default 0, and sets only the
     /// sequence-number radius in example follow-up commands, not retrieved rows.
     /// Invalid values raise InvalidArgumentError; wrong argument types raise TypeError.
+    /// Integers outside the signed 64-bit range raise OverflowError.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (query=None, *, scope=None, role=None, query_mode="literal", max_candidates=0, include_unattributed_input=false, max_groups=None, max_examples_per_group=None, min_matches=None, phrase_min_words=None, phrase_max_words=None, context=0))]
     fn repeats<'py>(
@@ -4885,7 +4890,7 @@ impl SessionSearch {
         context: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
         if context < 0 {
-            return Err(invalid_argument_error(format!("context must be 0 or greater; got {context}; pass the number of neighboring messages per example")));
+            return Err(invalid_argument_error(format!("context must be 0 or greater; got {context}; pass a sequence-number radius for example follow-up commands, or 0 for the focused sequence only")));
         }
         let count = |name: &str, value: Option<i64>| {
             value
@@ -5841,7 +5846,7 @@ impl NativeAnalysisCursor {
     }
 
     fn __eq__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
-        if !slf.get_type().is(&other.get_type()) {
+        if !slf.get_type().is(other.get_type()) {
             return Ok(false);
         }
         Ok(slf.borrow().inner.as_str() == other.extract::<PyRef<'_, Self>>()?.inner.as_str())
