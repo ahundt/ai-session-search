@@ -713,7 +713,7 @@ pub const EMITTED_ARTIFACT_CEILINGS: [(&str, usize, usize); 8] = [
     // Re-measured with hit timestamps: input bytes and output depth are unchanged.
     // Published purpose controls remain present even without configured bundles.
     // Session-class and direct-parent selectors retain descriptions under the 5,000-byte cap.
-    ("search_messages", 4_990, 10),
+    ("search_messages", 4_748, 10),
     // 4_747 -> 4_721: `field_view` states its omission value as the JSON a caller sends, `limit`
     // and `all_results` say "omit for" like every other property so the tool description's
     // omitted-values sentence can read them back. Codex deletes parameter descriptions beyond

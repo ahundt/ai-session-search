@@ -1320,31 +1320,31 @@ impl MessageSearchParameterRegistry {
         let parameters = vec![
             parameter(
                 MessageSearchParameter::Query,
-                "Text to match.",
+                "Text.",
                 MessageSearchParameterDomain::Text { non_empty: false },
                 MessageSearchOmission::QuerylessSearch,
             ),
             parameter(
                 MessageSearchParameter::QueryMode,
-                "How query is matched.",
+                "Matching.",
                 enum_domain(serialized_variants::<MessageSearchMode>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::Field,
-                "Which field to match.",
+                "Field to match.",
                 enum_domain(serialized_variants::<SearchField>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::ArgumentPath,
-                "RFC 6901 pointer into tool arguments; needs field=tool_argument",
+                "RFC 6901 pointer; requires field=tool_argument",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::Role,
-                "user selects recorded input across roles; others select stored roles.",
+                "user: recorded input across roles; others: stored roles.",
                 enum_domain(serialized_variants::<Role>()),
                 MessageSearchOmission::AllEligible,
             ),
@@ -1367,37 +1367,37 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::SessionKinds,
-                "Classes; [] matches none; with parent, nonempty needs subagent.",
+                "Classes; []=none; with parent, nonempty needs subagent.",
                 set_domain(serialized_variants::<crate::models::SessionKind>()),
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::ParentSessionId,
-                "Direct children of session ID/prefix.",
+                "ID/prefix's direct children.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::SessionId,
-                "One session by ID or prefix.",
+                "Session ID/prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::WorkspacePathPrefix,
-                "Match cwd or repo-root prefix.",
+                "cwd/repo-root prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::TranscriptPathPrefix,
-                "Match transcript-path prefix.",
+                "Transcript-path prefix.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::AllEligible,
             ),
             parameter(
                 MessageSearchParameter::ExcludeWorkspacePathPrefixes,
-                "Excluded cwd/repo-root prefixes.",
+                "Exclude cwd/repo-root prefixes.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
@@ -1433,25 +1433,25 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::ToolNameContains,
-                "Substring in the tool name.",
+                "Tool-name substring.",
                 MessageSearchParameterDomain::Text { non_empty: true },
                 MessageSearchOmission::NoAdditionalFilter,
             ),
             parameter(
                 MessageSearchParameter::IncludeCompaction,
-                "Keep compaction summaries.",
+                "Compaction summaries.",
                 MessageSearchParameterDomain::Boolean,
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::MatchWindow,
-                "First N matches in session order, or last N of one session.",
+                "First N in session order, or last N of one session.",
                 enum_domain(serialized_variants::<MatchWindow>()),
                 MessageSearchOmission::TypedDefault,
             ),
             parameter(
                 MessageSearchParameter::Context,
-                "Neighbours each side per hit.",
+                "Sequence radius/side.",
                 MessageSearchParameterDomain::ContextWindow,
                 MessageSearchOmission::TypedDefault,
             ),
@@ -1463,19 +1463,19 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::Detail,
-                "Presentation preset.",
+                "View preset.",
                 enum_domain(serialized_variants::<DetailLevel>()),
                 MessageSearchOmission::SurfacePolicy,
             ),
             parameter(
                 MessageSearchParameter::LinesPerMessage,
-                "Line window.",
+                "Lines.",
                 MessageSearchParameterDomain::SignedEdgeCount,
                 MessageSearchOmission::SurfacePolicy,
             ),
             parameter(
                 MessageSearchParameter::FieldView,
-                "Character budget for the field.",
+                "Field character budget.",
                 MessageSearchParameterDomain::FieldView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1495,7 +1495,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::MatchView,
-                "Character budget around the match.",
+                "Match character budget.",
                 MessageSearchParameterDomain::MatchView {
                     discriminator: "kind",
                     accepted_variants: vec![
@@ -1527,7 +1527,7 @@ impl MessageSearchParameterRegistry {
             ),
             parameter(
                 MessageSearchParameter::Include,
-                "Payload groups; a supplied set replaces the default",
+                "Payloads replace defaults",
                 set_domain(serialized_variants::<MessageSearchInclude>()),
                 MessageSearchOmission::TypedDefault,
             ),
