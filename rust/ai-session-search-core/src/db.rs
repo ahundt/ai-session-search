@@ -7357,7 +7357,18 @@ fn store_parsed_messages(
         }
     }
     let stored = stored_message_keys(tx, &session.id, StoredMessageSelection::All)?;
-    let parsed_keys: Vec<MessageKeys> = parsed.messages.iter().map(parsed_message_keys).collect();
+    let claude = matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop);
+    let mut has_claude_replay = false;
+    let parsed_keys: Vec<MessageKeys> = parsed
+        .messages
+        .iter()
+        .map(|message| {
+            has_claude_replay |= claude
+                && message.provenance.record_relation
+                    == crate::models::MessageRecordRelation::Mirror;
+            parsed_message_keys(message)
+        })
+        .collect();
     // A first parse has no archive rows to reconcile. Keep the parser's published sequence
     // numbers verbatim: they may be sparse or tied, and replacing them with insertion offsets
     // loses the provider's stable coordinates before any later search or recovery can use them.
@@ -7385,6 +7396,7 @@ fn store_parsed_messages(
     if same_parser
         && !has_attachments
         && !preserve_family_sequences
+        && !has_claude_replay
         && covers_every_stored_key(
             stored
                 .iter()
@@ -7410,12 +7422,12 @@ fn store_parsed_messages(
     let mut stored_by_role_and_content: HashMap<RowDigest, std::collections::VecDeque<usize>> =
         HashMap::new();
     let mut stored_by_timestamp = HashMap::<RowDigest, std::collections::VecDeque<usize>>::new();
+    let mut repeated_claude_uuid = false;
     for (position, (_, keys)) in stored.iter().enumerate() {
         if let Some(identity) = keys.correlation {
-            stored_by_identity
-                .entry(identity)
-                .or_default()
-                .push_back(position);
+            let queue = stored_by_identity.entry(identity).or_default();
+            repeated_claude_uuid |= claude && !queue.is_empty();
+            queue.push_back(position);
         } else {
             // A text fallback may repair a legacy row that has no identity, but must never
             // merge two rows whose provider identities disagree.
@@ -7468,7 +7480,11 @@ fn store_parsed_messages(
             attachment_content.insert(id, content);
         }
     }
-    let claude_inputs = claude_input_matches(parsed, &parsed_keys, &stored);
+    let claude_inputs = if has_claude_replay || repeated_claude_uuid {
+        claude_input_matches(parsed, &parsed_keys, &stored)
+    } else {
+        HashMap::new()
+    };
     let mut unseen = Vec::new();
     let mut source_sequences = Vec::new();
     for (parsed_position, (message, keys)) in parsed.messages.iter().zip(&parsed_keys).enumerate() {
@@ -7544,46 +7560,14 @@ fn store_parsed_messages(
                     continue;
                 }
             }
-            // A legacy row has no raw isReplay flag or record digest. Without a unique
-            // timestamp match, a lone replay cannot identify which equal stored copy to
-            // demote. Claim the row but leave its previous classification intact.
-            let ambiguous_replay = claude_inputs
-                .get(&parsed_position)
-                .is_some_and(|input_match| input_match.preserve_classification);
-            if !ambiguous_replay
-                && (!same_parser
-                    || stored[position].1.columns_without_seq != keys.columns_without_seq
-                    || !message_parts_match(tx, stored[position].0, message)?)
+            if !same_parser
+                || stored[position].1.columns_without_seq != keys.columns_without_seq
+                || !message_parts_match(tx, stored[position].0, message)?
             {
                 update_message_row(tx, stored[position].0, session, message)?;
             }
         } else {
             unseen.push(message);
-        }
-    }
-    // A surviving original proves that other archived renderings of the same native
-    // input are copies, even if their isReplay records have left the file. Different
-    // UUIDs (including identical-text submissions) never share this evidence.
-    let original_inputs: std::collections::HashSet<_> = claude_inputs
-        .keys()
-        .filter_map(|&position| {
-            let message = &parsed.messages[position];
-            (message.provenance.record_relation == crate::models::MessageRecordRelation::Original)
-                .then_some((
-                    parsed_keys[position].correlation,
-                    parsed_keys[position].role_and_content,
-                ))
-        })
-        .collect();
-    for (position, (id, keys)) in stored.iter().enumerate() {
-        if !matched[position]
-            && !keys.mirror
-            && original_inputs.contains(&(keys.correlation, keys.role_and_content))
-        {
-            tx.execute(
-                "update messages set record_relation = 'mirror' where id = ?1",
-                params![id],
-            )?;
         }
     }
     let mut delete = tx.prepare("delete from messages where id = ?1")?;
@@ -7597,7 +7581,8 @@ fn store_parsed_messages(
         delete.execute(params![id])?;
     }
     let has_archive = matched.iter().any(|matched| !matched);
-    let restore_source_order = !has_archive && !preserve_family_sequences;
+    let restore_source_order =
+        !has_archive && !preserve_family_sequences && !has_claude_replay && !repeated_claude_uuid;
     if restore_source_order {
         // With no archive-only rows, the parser owns the complete source order.
         let mut renumber = tx.prepare("update messages set seq = ?1 where id = ?2")?;
@@ -7624,14 +7609,36 @@ fn store_parsed_messages(
 
 struct ClaudeInputMatch {
     stored_position: Option<usize>,
-    preserve_classification: bool,
 }
 
-/// Match Claude user occurrences by native identity, content and retained timestamp, not
-/// just UUID: SDK replays reuse the original UUID. Raw metadata and record digests were
-/// never stored per row. Reserve originals first when timestamps are indistinguishable;
-/// callers must not demote ambiguous legacy rows on replay-only evidence.
-/// O(stored + parsed) time and fixed-size key memory.
+/// Match Claude occurrences without treating a replay-only timestamp match as proof
+/// that an archived typed row was a copy.
+///
+/// Decision table for each (UUID, content), with stored rows N=none, O=one original,
+/// OM=original plus known mirror, S=several originals (known mirrors remain mirrors):
+///
+/// stored | original only | replay only | both                  | neither
+/// N      | append O      | append M    | append O,M            | retain
+/// O      | retain O      | retain O,+M | retain O,+M           | retain O
+/// OM     | retain O,M    | retain O,M  | retain O,M            | retain O,M
+/// S      | retain all    | retain,+M   | match O, demote one R | retain all
+/// A legacy O+copy pair whose replay marker was not stored is S with two typed
+/// rows: typed counts are 2, 2, 1, 2 across the four columns. For S with n typed
+/// rows they are n, n, n-1, n. Known OM has one typed row in every column;
+/// O has one throughout; N has 1, 0, 1, 0. Each parsed replay matches at most
+/// one copy, so additional unmatched occurrences retain their typed classification.
+///
+/// Exact timestamps select occurrences first. Equal or missing timestamps use stored
+/// order, reserving the original before the replay. Demotion requires BOTH parsed
+/// occurrences and a separate stored row after reserving the original. Replay-only
+/// evidence can match a known mirror, never a typed row, even at a unique timestamp.
+/// Unmatched archived rows retain their classification. New rows append; no existing
+/// row is deleted or renumbered. A known mirror is never consumed as a typed original.
+///
+/// The caller detects replay markers while building existing parsed keys and repeated
+/// stored UUIDs while building existing identity queues. Ordinary unique non-replay
+/// sessions skip this function: no extra maps or passes. Otherwise O(stored + parsed)
+/// time and fixed-size key memory; no source bytes are read and only new rows add disk.
 fn claude_input_matches(
     parsed: &ParsedSession,
     parsed_keys: &[MessageKeys],
@@ -7639,56 +7646,32 @@ fn claude_input_matches(
 ) -> HashMap<usize, ClaudeInputMatch> {
     use crate::models::{MessageCorrelationAuthority, MessageRecordRelation, Role};
     let mut result = HashMap::new();
-    if !matches!(
-        parsed.session.provider,
-        Provider::Claude | Provider::ClaudeDesktop
-    ) {
-        return result;
-    }
     let mut by_time = HashMap::<_, std::collections::VecDeque<usize>>::new();
-    let mut native_content = HashMap::<_, usize>::new();
-    for (_, keys) in stored {
-        if let Some(identity) = keys.correlation {
-            *native_content
-                .entry((identity, keys.role_and_content))
-                .or_default() += 1;
-        }
-    }
+    let mut by_content = HashMap::<_, std::collections::VecDeque<usize>>::new();
     for (position, (_, keys)) in stored.iter().enumerate() {
+        #[cfg(test)]
+        CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
         if let Some(identity) = keys.correlation {
             by_time
-                .entry((identity, keys.role_content_timestamp))
+                .entry((identity, keys.role_content_timestamp, keys.mirror))
+                .or_default()
+                .push_back(position);
+            by_content
+                .entry((identity, keys.role_and_content, keys.mirror))
                 .or_default()
                 .push_back(position);
         }
     }
-    let counts: HashMap<_, _> = by_time
-        .iter()
-        .map(|(key, queue)| (*key, queue.len()))
-        .collect();
-    let originals: std::collections::HashSet<_> = parsed
-        .messages
-        .iter()
-        .zip(parsed_keys)
-        .filter(|(message, _)| {
-            message.role == Role::User
-                && message.provenance.record_relation == MessageRecordRelation::Original
-        })
-        .map(|(_, keys)| (keys.correlation, keys.role_and_content))
-        .collect();
+    let mut consumed = vec![false; stored.len()];
+    let mut originals = std::collections::HashSet::new();
     for relation in [
         MessageRecordRelation::Original,
         MessageRecordRelation::Mirror,
     ] {
         for (position, (message, keys)) in parsed.messages.iter().zip(parsed_keys).enumerate() {
+            #[cfg(test)]
+            CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
             if message.role != Role::User
-                || !keys.correlation.is_some_and(|identity| {
-                    native_content
-                        .get(&(identity, keys.role_and_content))
-                        .is_some_and(|&count| {
-                            count > 1 || relation == MessageRecordRelation::Mirror
-                        })
-                })
                 || message.provenance.record_relation != relation
                 || !message
                     .provenance
@@ -7698,28 +7681,61 @@ fn claude_input_matches(
             {
                 continue;
             }
-            let matched = keys
-                .correlation
-                .and_then(|identity| by_time.get_mut(&(identity, keys.role_content_timestamp)))
-                .and_then(|queue| queue.pop_front());
-            let preserve_classification = relation == MessageRecordRelation::Mirror
-                && matched.is_some_and(|p| !stored[p].1.mirror)
-                && keys.correlation.is_some_and(|identity| {
-                    counts
-                        .get(&(identity, keys.role_content_timestamp))
-                        .is_some_and(|&count| count > 1)
-                })
-                && !originals.contains(&(keys.correlation, keys.role_and_content));
+            let Some(identity) = keys.correlation else {
+                continue;
+            };
+            let group = (identity, keys.role_and_content);
+            let replay = relation == MessageRecordRelation::Mirror;
+            let take = |queue: Option<&mut std::collections::VecDeque<usize>>,
+                        consumed: &mut [bool]| {
+                let queue = queue?;
+                while let Some(p) = queue.pop_front() {
+                    if !consumed[p] {
+                        consumed[p] = true;
+                        return Some(p);
+                    }
+                }
+                None
+            };
+            let mut matched = take(
+                by_time.get_mut(&(identity, keys.role_content_timestamp, replay)),
+                &mut consumed,
+            )
+            .or_else(|| {
+                take(
+                    by_content.get_mut(&(identity, keys.role_and_content, replay)),
+                    &mut consumed,
+                )
+            });
+            if replay && matched.is_none() && originals.contains(&group) {
+                matched = take(
+                    by_time.get_mut(&(identity, keys.role_content_timestamp, false)),
+                    &mut consumed,
+                )
+                .or_else(|| {
+                    take(
+                        by_content.get_mut(&(identity, keys.role_and_content, false)),
+                        &mut consumed,
+                    )
+                });
+            }
+            if !replay {
+                originals.insert(group);
+            }
             result.insert(
                 position,
                 ClaudeInputMatch {
                     stored_position: matched,
-                    preserve_classification,
                 },
             );
         }
     }
     result
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static CLAUDE_INPUT_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Row ids of stored messages derived from records the parse declines (`RetractedRows`), each
