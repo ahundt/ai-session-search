@@ -2228,8 +2228,8 @@ fn fallback_event_time(session: &SessionRecord, mtime_ns: i64) -> Option<DateTim
 }
 
 /// Backfill per-message / file-edit dates when a provider lacks
-/// per-event timestamps. Cursor leaves unknown event dates unset so appends cannot
-/// change them. For other providers, parser-provided timestamps win and missing values
+/// per-event timestamps. Cursor supplies inherited or anchored dates in its parser.
+/// For other providers, parser-provided timestamps win and missing values
 /// fall back to the session/file timestamp. This is O(messages + file_edits), in
 /// place, and runs once per parsed session or appended tail.
 pub fn backfill_event_dates(
@@ -2238,11 +2238,6 @@ pub fn backfill_event_dates(
     file_edits: &mut [FileEdit],
     mtime_ns: i64,
 ) {
-    // Cursor has native clocks on some turns only. Unknown event dates must stay
-    // unknown: borrowing a changing session endpoint makes full and tail parses disagree.
-    if session.provider == Provider::Cursor {
-        return;
-    }
     let fallback = fallback_event_time(session, mtime_ns);
     for message in messages {
         if message.ts.is_none() {
