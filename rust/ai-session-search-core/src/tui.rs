@@ -4567,40 +4567,24 @@ mod tests {
     }
 
     #[test]
-    fn oversized_real_transcript_scoring_observes_mid_scan_cancellation() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut db = Db::open(&dir.path().join("index.db")).unwrap();
-        let mut parsed = session("claude:oversized");
-        parsed.transcript_text = "x".repeat(16 * 1024 * 1024);
-        db.upsert_session(&parsed, 0, 0).unwrap();
-        let cancellation = Arc::new(QueryCancellation::new());
-        db.install_query_cancellation(&cancellation).unwrap();
-        let cancel_from_thread = Arc::clone(&cancellation);
-        let canceller = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(5));
-            cancel_from_thread.cancel();
+    fn oversized_transcript_scoring_cancellation_uses_work_counts_not_a_deadline() {
+        // CatalogService's already-cancelled integration case is tested above. Here the shared
+        // scanner is cancelled on its fourth poll, independent of CPU speed or thread scheduling.
+        let transcript = "x".repeat(16 * 1024 * 1024);
+        let needle = crate::util::UnicodeLowerNeedle::from_lowered("not-present-anywhere");
+        let cancellation = QueryCancellation::new();
+        let mut polls = 0;
+        let result = needle.contains_while(&transcript, || {
+            polls += 1;
+            if polls == 4 {
+                cancellation.cancel();
+            }
+            !cancellation.is_cancelled()
         });
-        let started = std::time::Instant::now();
-        let error = CatalogService::new(&db)
-            .search_sessions_cancellable(
-                "not-present-anywhere",
-                &SearchFilters {
-                    limit: 10,
-                    ..Default::default()
-                },
-                None,
-                &Config::default().search.scoring,
-                &cancellation,
-            )
-            .unwrap_err();
-        canceller.join().unwrap();
-        assert!(
-            is_expected_interruption(&error),
-            "unexpected error: {error:#}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "oversized-record cancellation exceeded the bounded scan deadline"
+        assert_eq!(result, None, "oversized transcript scan ignored cancellation; reproduce: cargo test -p ai-session-search --lib oversized_transcript_scoring_cancellation --locked. Restore the shared scanner's bounded cancellation polling; elapsed time is not a portable correctness assertion.");
+        assert_eq!(
+            polls, 4,
+            "the scan must stop at the first cancelled poll, not finish the source"
         );
     }
 
