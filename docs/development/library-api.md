@@ -82,6 +82,11 @@ Choose the version you need from `history`. Reconstruction returns content in me
 `restore()` explicitly writes a collision-safe copy. Selecting a source session disambiguates a
 file edited in several sessions. `publish_file_versions(file, destination, request=source)`
 writes an immutable bundle of reconstructable versions to a new directory.
+Codex `apply_patch` Add File reconstruction appends LF after every added line, including an
+empty final line; CRLF patch input is normalized to LF. An addition with no lines is empty.
+The `codex-v15` parser reparses older indexed sources on refresh and replaces the matching
+older reconstruction without retaining a second file version; archived edits absent from the
+source remain available.
 
 ### Analyse corrections and repeated phrases
 

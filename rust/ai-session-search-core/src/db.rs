@@ -8335,10 +8335,24 @@ fn store_parsed_file_edits(
     }
     let matched: Vec<Option<usize>> = parsed_keys
         .iter()
-        .map(|keys| {
-            positions
+        .zip(&file_edits)
+        .map(|(keys, edit)| {
+            let exact = positions
                 .get_mut(&keys.edit)
-                .and_then(|queue| queue.pop_front())
+                .and_then(|queue| queue.pop_front());
+            if exact.is_some()
+                || same_parser
+                || session.provider != Provider::Codex
+                || edit.tool != "apply_patch"
+            {
+                return exact;
+            }
+            // Older Codex additions omitted the final LF. Match that exact content identity
+            // only for an addition still present in this parse; absent archived edits survive.
+            // Adds O(added content bytes) hashing work and no additional retained body copy.
+            let legacy = edit.new_content.as_deref()?.strip_suffix('\n')?;
+            let key = file_edit_content_key(&edit.tool, &edit.file_path, Some(legacy), None);
+            positions.get_mut(&key).and_then(|queue| queue.pop_front())
         })
         .collect();
     let mut changed = false;

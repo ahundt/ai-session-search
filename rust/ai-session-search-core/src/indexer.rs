@@ -3152,7 +3152,7 @@ mod tests {
                 .unwrap()
                 .collect::<Vec<_>>();
                 assert_eq!(versions.len(), 1);
-                assert_eq!(versions[0].content, "synthetic fork-recovered content");
+                assert_eq!(versions[0].content, "synthetic fork-recovered content\n");
                 reindex(&config, &db, true, None).unwrap();
                 assert_eq!(rows(&db_path), rows(&fresh_path));
                 // Publishing an appended parent edit also reconciles an unchanged fork.
@@ -3529,7 +3529,7 @@ mod tests {
                     .unwrap()
                     .collect::<Vec<_>>();
             assert_eq!(versions.len(), 1);
-            assert_eq!(versions[0].content, "recoverable content");
+            assert_eq!(versions[0].content, "recoverable content\n");
             let fresh_path = dir.path().join(format!("fresh-{}.db", body.len()));
             let fresh = Db::open(&fresh_path).unwrap();
             reindex(&config, &fresh, true, None).unwrap();

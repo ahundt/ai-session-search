@@ -269,8 +269,8 @@ fn claude_desktop_v20_upgrade_retains_history() {
     );
 }
 #[test]
-fn codex_v14_upgrade_retains_history() {
-    upgrade_retains_history(Provider::Codex, "codex-v13", "codex-v14");
+fn codex_v15_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Codex, "codex-v14", "codex-v15");
 }
 #[test]
 fn cursor_v7_upgrade_retains_history() {

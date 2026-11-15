@@ -2138,14 +2138,14 @@ fn codex_event_tool_message(event_type: Option<&str>, payload: &Value) -> Option
 fn parse_apply_patch(patch: &str) -> Vec<(String, Option<String>)> {
     let mut out: Vec<(String, Option<String>)> = Vec::new();
     let mut add_path: Option<String> = None;
-    let mut add_lines: Vec<String> = Vec::new();
+    let mut add_lines = String::new();
     fn flush(
         add_path: &mut Option<String>,
-        add_lines: &mut Vec<String>,
+        add_lines: &mut String,
         out: &mut Vec<(String, Option<String>)>,
     ) {
         if let Some(path) = add_path.take() {
-            out.push((path, Some(std::mem::take(add_lines).join("\n"))));
+            out.push((path, Some(std::mem::take(add_lines))));
         }
     }
     for line in patch.lines() {
@@ -2162,7 +2162,10 @@ fn parse_apply_patch(patch: &str) -> Vec<(String, Option<String>)> {
             flush(&mut add_path, &mut add_lines, &mut out);
         } else if add_path.is_some() {
             if let Some(content) = line.strip_prefix('+') {
-                add_lines.push(content.to_string());
+                // Codex writes one LF after each added line, including an empty last line.
+                // lines() also normalizes CRLF patch input, as the upstream parser does.
+                add_lines.push_str(content);
+                add_lines.push('\n');
             }
         }
     }
@@ -4077,7 +4080,7 @@ mod tests {
             assert_eq!(parsed.file_edits.len(), 2, "{name}");
             assert_eq!(
                 parsed.file_edits[0].new_content.as_deref(),
-                Some("synthetic text")
+                Some("synthetic text\n")
             );
             assert_eq!(parsed.file_edits[1].file_path, "/synthetic/old.txt");
         }
@@ -4088,6 +4091,24 @@ mod tests {
             &json!({"name":"exec_command","arguments":json!({"cmd":early_end}).to_string()})
         )
         .is_none());
+    }
+
+    #[test]
+    fn added_file_bytes_match_patch_lines() {
+        for (body, expected) in [
+            ("", ""),
+            ("+hello\n", "hello\n"),
+            ("+\n", "\n"),
+            ("+hello\n+\n", "hello\n\n"),
+            ("+hello\r\n+world\r\n", "hello\nworld\n"),
+        ] {
+            let patch =
+                format!("*** Begin Patch\n*** Add File: /synthetic/new.txt\n{body}*** End Patch");
+            assert_eq!(
+                super::parse_apply_patch(&patch),
+                vec![("/synthetic/new.txt".into(), Some(expected.into()))]
+            );
+        }
     }
 
     #[test]
@@ -4142,7 +4163,38 @@ mod tests {
             .find(|e| e.file_name == "b.rs")
             .unwrap();
         assert_eq!(added.tool, "apply_patch");
-        assert_eq!(added.new_content.as_deref(), Some("line1\nline2"));
+        assert_eq!(added.new_content.as_deref(), Some("line1\nline2\n"));
+        let db = crate::db::Db::open(&temp.path().join("upgrade.db")).unwrap();
+        let mut old = parsed.clone();
+        old.session.parse_version = "codex-v14".into();
+        old.retracted.file_edits.clear();
+        for edit in &mut old.file_edits {
+            if let Some(content) = &mut edit.new_content {
+                content.pop();
+            }
+        }
+        let mut archived = old
+            .file_edits
+            .iter()
+            .find(|edit| edit.file_name == "b.rs")
+            .unwrap()
+            .clone();
+        archived.file_path = "/p/archived.rs".into();
+        archived.file_name = "archived.rs".into();
+        old.file_edits.push(archived);
+        db.upsert_session(&old, 1, 1).unwrap();
+        db.upsert_session(&parsed, 2, 1).unwrap();
+        db.upsert_session(&parsed, 3, 1).unwrap();
+        let retained = db
+            .file_edits_for_session_id("archived.rs", &parsed.session.id)
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].2.new_content.as_deref(), Some("line1\nline2"));
+        let stored = db
+            .file_edits_for_session_id("b.rs", &parsed.session.id)
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].2.new_content.as_deref(), Some("line1\nline2\n"));
         let updated = parsed
             .file_edits
             .iter()
