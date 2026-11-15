@@ -718,6 +718,11 @@ impl PiParentCopy {
     /// Active parses own Arc snapshots independently. Oversized parents still classify
     /// correctly but rescan on every call, including both parser calls of one refresh.
     /// Misses are serialized while scanning; no negative or deleted-parent entry is retained.
+    ///
+    /// Identity, length and mtime validation cannot detect an in-place rewrite that restores
+    /// length and mtime. Unix ctime is not exposed by the existing Windows metadata/identity
+    /// calls, so there is no shared change-time signal here. In that case
+    /// `aise reindex --full` in a new process re-reads the parent.
     fn read(child: &Path, parent: &str) -> Option<Self> {
         #[cfg(test)]
         {
@@ -1561,6 +1566,50 @@ mod tests {
         fs::create_dir(dir.path().join("unreadable.jsonl")).unwrap();
         assert!(PiParentCopy::read(&child, "unreadable.jsonl").is_none());
         super::PI_PARENT_CACHE.with(|cache| assert!(cache.borrow().is_none()));
+    }
+
+    #[test]
+    fn parent_cache_same_stamp_in_place_rewrite_uses_retained_evidence() {
+        use super::PiParentCopy;
+        use serde_json::json;
+        let dir = tempdir().unwrap();
+        let child = dir.path().join("child.jsonl");
+        let parent = dir.path().join("parent.jsonl");
+        fs::write(&child, "").unwrap();
+        let record =
+            json!({"type":"message","id":"entry","message":{"role":"user","content":"same"}});
+        let body = format!("{}\n{record}\n", json!({"type":"session","id":"parent"}));
+        fs::write(&parent, &body).unwrap();
+        super::PI_PARENT_READS.with(|reads| reads.set((0, 0)));
+        assert!(PiParentCopy::read(&child, "parent.jsonl")
+            .unwrap()
+            .take_copy(&record));
+        let modified = fs::metadata(&parent).unwrap().modified().unwrap();
+        fs::write(&parent, body.replace("same", "else")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&parent)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(PiParentCopy::read(&child, "parent.jsonl")
+            .unwrap()
+            .take_copy(&record));
+        assert_eq!(
+            super::PI_PARENT_READS.with(|reads| reads.get()),
+            (1, body.len() as u64)
+        );
+        // An empty cache models a new process and reads the changed parent bytes.
+        let mut fresh_cache = None;
+        assert!(
+            !PiParentCopy::read_cached(&child, "parent.jsonl", &mut fresh_cache)
+                .unwrap()
+                .take_copy(&record)
+        );
+        assert_eq!(
+            super::PI_PARENT_READS.with(|reads| reads.get()),
+            (2, 2 * body.len() as u64)
+        );
     }
 
     #[test]
