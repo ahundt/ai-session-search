@@ -233,8 +233,9 @@ and those iterators retain their own close obligations.
 
 Long native operations release the GIL, so a refresh or a large search does not
 block other Python threads. Reconstruction iterators own their selected rows
-without holding the database lock, so a slow consumer does not block database work. Publication is explicit: no library call writes a bundle to disk as a side
-effect.
+without holding the database lock, so a slow consumer does not block database work.
+`export_sessions()`, `publish_file_versions()`, and `AnalysisPublicationPlan.publish()` write
+to explicit destinations. Render and reconstruction-iterator calls do not publish files.
 
 Request and result values compare by value, have readable `repr()` output, and expose
 `to_dict()` for a detached JSON-ready dictionary. Dictionaries use CLI field names, including
