@@ -66,6 +66,10 @@ fn rows(dir: &tempfile::TempDir, args: &[&str]) -> Value {
 
 #[test]
 fn message_context_preserves_tied_row_identity_and_evidence_in_every_format() {
+    let help = output(&fixture(), &["messages", "get", "--help"]);
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("sequence-number radius"), "{help}");
+    assert!(help.contains("tied"), "{help}");
     let dir = tempfile::tempdir().unwrap();
     let db = Db::open(&dir.path().join("index.db")).unwrap();
     let record = SessionRecord::new(
