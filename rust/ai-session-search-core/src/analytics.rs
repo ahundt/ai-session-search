@@ -10,9 +10,7 @@
 //! (empty = all). `vocab` and `repeats` use config-backed defaults for their public scan/output
 //! controls.
 
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{self, Write};
 
 use anyhow::{anyhow, bail, Result};
@@ -1163,13 +1161,27 @@ fn repeat_phrase_groups(
         .collect()
 }
 
+#[cfg(test)]
+thread_local! {
+    static PHRASE_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Preserve input order while testing containment only among equal supports.
+/// For G candidates, I support incidences, and group sizes g, expected work is
+/// O(I + sum(g²) * T), where T bounds token-containment work per phrase pair.
+/// Additional memory is O(G + I); phrase text is moved, not copied.
 fn remove_equal_support_contained_phrases(candidates: &mut Vec<(String, BTreeSet<usize>)>) {
+    let mut groups: HashMap<BTreeSet<usize>, Vec<usize>> = HashMap::new();
     let mut kept: Vec<(String, BTreeSet<usize>)> = Vec::with_capacity(candidates.len());
     for (phrase, indices) in candidates.drain(..) {
-        let is_duplicate = kept.iter().any(|(kept_phrase, kept_indices)| {
-            kept_indices == &indices && phrase_is_contiguous_subphrase_of(&phrase, kept_phrase)
+        let group = groups.entry(indices.clone()).or_default();
+        let is_duplicate = group.iter().any(|&index| {
+            #[cfg(test)]
+            PHRASE_COMPARISONS.with(|n| n.set(n.get() + 1));
+            phrase_is_contiguous_subphrase_of(&phrase, &kept[index].0)
         });
         if !is_duplicate {
+            group.push(kept.len());
             kept.push((phrase, indices));
         }
     }
@@ -1388,6 +1400,65 @@ mod tests {
         assert!(!informative_phrase(&toks("run ci")));
         // The empty phrase is never informative.
         assert!(!informative_phrase(&[]));
+    }
+
+    fn reference_phrase_minimization(candidates: &mut Vec<(String, BTreeSet<usize>)>) {
+        let mut kept: Vec<(String, BTreeSet<usize>)> = Vec::new();
+        for (phrase, indices) in candidates.drain(..) {
+            if !kept
+                .iter()
+                .any(|(p, s)| s == &indices && phrase_is_contiguous_subphrase_of(&phrase, p))
+            {
+                kept.push((phrase, indices));
+            }
+        }
+        *candidates = kept;
+    }
+
+    #[test]
+    fn phrase_minimization_work_growth() {
+        for size in [16, 32, 64] {
+            let mut candidates = (0..size)
+                .map(|i| {
+                    (
+                        format!("synthetic phrase {i}"),
+                        BTreeSet::from([i * 2, i * 2 + 1]),
+                    )
+                })
+                .collect();
+            PHRASE_COMPARISONS.with(|n| n.set(0));
+            remove_equal_support_contained_phrases(&mut candidates);
+            let comparisons = PHRASE_COMPARISONS.with(|n| n.get());
+            println!("phrases={size} comparisons={comparisons}");
+            assert_eq!(candidates.len(), size);
+            assert_eq!(comparisons, 0);
+        }
+    }
+
+    #[test]
+    fn phrase_minimization_matches_reference() {
+        let mut seed = 17_u64;
+        for _ in 0..512 {
+            let mut candidates = Vec::new();
+            for _ in 0..32 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let phrase = [
+                    "deploy",
+                    "deploy service",
+                    "service",
+                    "check tests",
+                    "tests",
+                    "check",
+                    "check  tests",
+                ][(seed >> 32) as usize % 7];
+                let support = BTreeSet::from([(seed as usize >> 8) % 5, (seed as usize >> 16) % 5]);
+                candidates.push((phrase.to_string(), support));
+            }
+            let mut expected = candidates.clone();
+            reference_phrase_minimization(&mut expected);
+            remove_equal_support_contained_phrases(&mut candidates);
+            assert_eq!(candidates, expected);
+        }
     }
 
     #[test]
