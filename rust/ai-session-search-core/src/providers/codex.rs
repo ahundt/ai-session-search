@@ -4362,6 +4362,92 @@ mod tests {
         }
     }
 
+    fn assert_reordered_file_refresh_matches_each_occurrence_once(parser_changed: bool) {
+        for with_archive in [false, true] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("rollout-synthetic.jsonl");
+            let source =
+                json!({"type":"session_meta","payload":{"id":"synthetic-reorder","cwd":"/p"}})
+                    .to_string()
+                    + "\n";
+            let mut stored = CodexAdapter::new(vec![])
+                .parse_reader(std::io::Cursor::new(source), &path)
+                .unwrap();
+            for (seq, content) in ["A", "B"].iter().enumerate() {
+                stored.file_edits.push(crate::models::FileEdit {
+                    seq: seq as i64,
+                    ts: None,
+                    tool: "write_file".into(),
+                    file_path: "/p/f.txt".into(),
+                    file_name: "f.txt".into(),
+                    new_content: Some((*content).into()),
+                    edits: vec![],
+                });
+            }
+            let mut parsed = stored.clone();
+            parsed.file_edits.swap(0, 1);
+            for (seq, edit) in parsed.file_edits.iter_mut().enumerate() {
+                edit.seq = seq as i64;
+            }
+            if parser_changed {
+                stored.session.parse_version = "codex-v14".into();
+            }
+            if with_archive {
+                let mut archive = stored.file_edits[0].clone();
+                archive.file_path = "/p/archive.txt".into();
+                archive.file_name = "archive.txt".into();
+                archive.seq = 2;
+                stored.file_edits.push(archive);
+            }
+            let db = crate::db::Db::open(&temp.path().join("reordered.db")).unwrap();
+            let fresh = crate::db::Db::open(&temp.path().join("fresh.db")).unwrap();
+            db.upsert_session(&stored, 1, 1).unwrap();
+            fresh.upsert_session(&parsed, 1, 1).unwrap();
+            let fresh_contents = fresh
+                .file_edits_for_session_id("f.txt", &parsed.session.id)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.2.new_content.unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(fresh_contents, ["B", "A"]);
+            let archive_before = db
+                .file_edits_for_session_id("archive.txt", &parsed.session.id)
+                .unwrap();
+            for refresh in [2, 3] {
+                db.upsert_session(&parsed, refresh, 1).unwrap();
+                let contents = db
+                    .file_edits_for_session_id("f.txt", &parsed.session.id)
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.2.new_content.unwrap())
+                    .collect::<Vec<_>>();
+                println!("parser_changed={parser_changed} archive={with_archive} refresh={refresh} stored={contents:?} fresh={fresh_contents:?}");
+                // Complete parses follow source order; archive reconciliation keeps stored order.
+                let expected = if with_archive {
+                    vec!["A", "B"]
+                } else {
+                    vec!["B", "A"]
+                };
+                assert_eq!(contents, expected);
+                assert_eq!(
+                    db.file_edits_for_session_id("archive.txt", &parsed.session.id)
+                        .unwrap(),
+                    archive_before
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reordered_file_refresh_matches_each_occurrence_once_same_parser() {
+        assert_reordered_file_refresh_matches_each_occurrence_once(false);
+    }
+
+    #[test]
+    fn reordered_file_refresh_matches_each_occurrence_once_changed_parser() {
+        assert_reordered_file_refresh_matches_each_occurrence_once(true);
+    }
+
     #[test]
     fn extracts_file_edits_from_apply_patch() {
         let temp = tempdir().unwrap();
