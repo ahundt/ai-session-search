@@ -123,7 +123,11 @@ impl CursorAdapter {
                 .unwrap_or("unknown")
                 .to_string(),
         };
-        let cwd = infer_cursor_workspace(path);
+        let workspace = infer_cursor_workspace(path);
+        let cwd = workspace
+            .path
+            .as_ref()
+            .map(|path| path.to_string_lossy().into_owned());
         let mut created_at: Option<DateTime<Utc>> = None;
         let mut updated_at: Option<DateTime<Utc>> = None;
         let mut messages = Vec::new();
@@ -283,6 +287,9 @@ impl CursorAdapter {
         }
         if requires_full_parse_for_tail {
             raw_metadata["requires_full_parse_for_tail"] = json!(true);
+        }
+        if workspace.limited {
+            raw_metadata["workspace_resolution_guard_hits"] = json!(1);
         }
         unrecognized.publish(&mut raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
@@ -524,80 +531,140 @@ fn cursor_timestamp_prefix(text: &str) -> Option<(DateTime<Utc>, usize)> {
     ))
 }
 
-fn infer_cursor_workspace(path: &Path) -> Option<String> {
+fn infer_cursor_workspace(path: &Path) -> WorkspaceResolution {
     let mut previous: Option<String> = None;
     for component in path.components() {
         if component.as_os_str() == "agent-transcripts" {
             return previous
                 .as_deref()
-                .and_then(decode_cursor_project_dir)
-                .map(|path| path.to_string_lossy().to_string());
+                .map(decode_cursor_project_dir)
+                .unwrap_or_default();
         }
         previous = component.as_os_str().to_str().map(ToOwned::to_owned);
     }
-    None
+    WorkspaceResolution::default()
 }
 
-/// Resolve only a unique existing directory. At most 256 candidates are examined;
-/// slugs needing more partitions return no workspace. For S slug bytes, time is
-/// O(256 * S), memory O(S), and filesystem probes are at most 256.
-fn decode_cursor_project_dir(encoded: &str) -> Option<PathBuf> {
-    decode_cursor_project_dir_with(encoded, |candidate| {
-        candidate.is_absolute() && candidate.is_dir()
+const WORKSPACE_DIRECTORY_LIMIT: usize = 4096;
+
+#[derive(Default)]
+struct WorkspaceResolution {
+    path: Option<PathBuf>,
+    visited: usize,
+    limited: bool,
+}
+
+/// Resolve a unique complete workspace by pruning against actual directory entries.
+/// For S slug bytes, V visited (directory, token-position) states and E bytes of entry
+/// names examined across states, time and memory are O(V * S + E).
+/// Each directory is listed once, at most V listings. V counts matching real
+/// prefixes, not slug partitions.
+/// A pathological-tree guard stops at 4096 states; its hit is published in metadata.
+/// Missing final directories return no workspace, never a partial ancestor.
+fn decode_cursor_project_dir(encoded: &str) -> WorkspaceResolution {
+    decode_cursor_project_dir_with(encoded, |directory| {
+        if !directory.is_absolute() {
+            return Ok(Vec::new());
+        }
+        std::fs::read_dir(directory)?
+            .map(|entry| {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                Ok(
+                    (kind.is_dir() || (kind.is_symlink() && entry.path().is_dir()))
+                        .then(|| entry.file_name()),
+                )
+            })
+            .collect::<std::io::Result<Vec<_>>>()
+            .map(|entries| entries.into_iter().flatten().collect())
     })
-}
-
-#[cfg(test)]
-thread_local! {
-    static WORKSPACE_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn decode_cursor_project_dir_with(
     encoded: &str,
-    mut is_dir: impl FnMut(&Path) -> bool,
-) -> Option<PathBuf> {
-    let parts: Vec<&str> = encoded.split('-').collect();
-    let (root, suffix, separator) = match parts.as_slice() {
-        [root @ ("Users" | "home"), suffix @ ..] if suffix.len() >= 2 => {
-            (format!("/{root}"), suffix, "/")
-        }
-        [drive, "Users", suffix @ ..]
-            if drive.len() == 1
-                && drive.as_bytes()[0].is_ascii_alphabetic()
-                && suffix.len() >= 2 =>
-        {
-            (format!("{drive}:\\Users"), suffix, "\\")
-        }
-        _ => return None,
+    mut read_directories: impl FnMut(&Path) -> std::io::Result<Vec<std::ffi::OsString>>,
+) -> WorkspaceResolution {
+    let (root, suffix) = if let Some(suffix) = encoded.strip_prefix("Users-") {
+        (PathBuf::from("/").join("Users"), suffix)
+    } else if let Some(suffix) = encoded.strip_prefix("home-") {
+        (PathBuf::from("/").join("home"), suffix)
+    } else if encoded
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        && encoded.get(1..8) == Some("-Users-")
+    {
+        (
+            PathBuf::from(format!("{}:\\Users", &encoded[..1])),
+            &encoded[8..],
+        )
+    } else {
+        return WorkspaceResolution::default();
     };
-    // Refuse before shifting or allocating candidate partitions.
-    if suffix.len() > 9 || suffix.iter().any(|part| part.is_empty()) {
-        return None;
-    }
-    let mut found = None;
-    for mask in 0..(1usize << (suffix.len() - 1)) {
-        let mut candidate = root.clone();
-        candidate.push_str(separator);
-        candidate.push_str(suffix[0]);
-        for (index, part) in suffix.iter().enumerate().skip(1) {
-            candidate.push_str(if mask & (1 << (index - 1)) != 0 {
-                separator
-            } else {
-                "-"
-            });
-            candidate.push_str(part);
+    let mut result = WorkspaceResolution::default();
+    let mut pending = vec![(root, 0usize)];
+    let mut visited = std::collections::HashSet::new();
+    let mut entries_by_directory = HashMap::new();
+    while let Some((directory, index)) = pending.pop() {
+        if !visited.insert((directory.clone(), index)) {
+            continue;
         }
-        let candidate = PathBuf::from(candidate);
-        #[cfg(test)]
-        WORKSPACE_CANDIDATES.with(|count| count.set(count.get() + 1));
-        if is_dir(&candidate) {
-            if found.is_some() {
-                return None;
+        if result.visited == WORKSPACE_DIRECTORY_LIMIT {
+            result.path = None;
+            result.limited = true;
+            return result;
+        }
+        result.visited += 1;
+        if !entries_by_directory.contains_key(&directory) {
+            let Ok(entries) = read_directories(&directory) else {
+                // An unreadable matching subtree cannot prove uniqueness.
+                result.path = None;
+                return result;
+            };
+            entries_by_directory.insert(directory.clone(), entries);
+        }
+        let remaining = &suffix[index..];
+        for name in &entries_by_directory[&directory] {
+            let Some(name_text) = name.to_str() else {
+                continue;
+            };
+            // Match literal underscores as well as sanitized spellings. Dots become
+            // hyphens, preserving empty slug tokens for leading-dot directories.
+            let dotted = name_text.replace('.', "-");
+            let spellings = [
+                dotted.clone(),
+                dotted.replace('_', "-"),
+                dotted.replace('_', ""),
+            ];
+            let mut matched_ends = Vec::new();
+            for spelling in spellings {
+                if spelling.is_empty() {
+                    continue;
+                }
+                let Some(rest) = remaining.strip_prefix(&spelling) else {
+                    continue;
+                };
+                if rest.is_empty() || rest.starts_with('-') {
+                    matched_ends.push(index + spelling.len());
+                }
             }
-            found = Some(candidate);
+            matched_ends.sort_unstable();
+            matched_ends.dedup();
+            for end in matched_ends {
+                let candidate = directory.join(name);
+                if end == suffix.len() {
+                    if result.path.as_ref().is_some_and(|path| path != &candidate) {
+                        result.path = None;
+                        return result;
+                    }
+                    result.path = Some(candidate);
+                } else {
+                    pending.push((candidate, end + 1));
+                }
+            }
         }
     }
-    found
+    result
 }
 
 #[cfg(test)]
@@ -1409,41 +1476,126 @@ mod tests {
             .is_empty());
     }
 
+    fn workspace_in_temp(slug: &str, root: &std::path::Path) -> super::WorkspaceResolution {
+        let virtual_root = if slug.starts_with("home-") {
+            std::path::PathBuf::from("/").join("home")
+        } else if slug.starts_with("Users-") {
+            std::path::PathBuf::from("/").join("Users")
+        } else {
+            std::path::PathBuf::from(format!("{}:\\Users", &slug[..1]))
+        };
+        super::decode_cursor_project_dir_with(slug, |directory| {
+            let path = root.join(directory.strip_prefix(&virtual_root).unwrap());
+            fs::read_dir(path)?
+                .map(|entry| Ok(entry?.file_name()))
+                .collect()
+        })
+    }
+
     #[test]
-    fn workspace_candidates_have_a_fixed_bound() {
-        for (length, expected) in [(4, 8), (8, 128), (9, 256), (12, 0), (25, 0), (50, 0)] {
-            super::WORKSPACE_CANDIDATES.with(|count| count.set(0));
-            let slug = format!("Users-{}", vec!["aisemissing"; length].join("-"));
-            assert!(super::decode_cursor_project_dir_with(&slug, |_| false).is_none());
-            let count = super::WORKSPACE_CANDIDATES.with(|count| count.get());
-            assert_eq!(count, expected);
-            assert!(
-                count <= 256,
-                "{length} components examined {count} candidates, maximum 256"
+    fn long_workspace_slugs_resolve_existing_dashed_directories() {
+        for (count, depth) in [(12, 4), (25, 9), (50, 17)] {
+            let temp = tempdir().unwrap();
+            let tokens: Vec<String> = (0..count).map(|n| format!("part{n}")).collect();
+            let mut relative = std::path::PathBuf::new();
+            for chunk in tokens.chunks(3) {
+                relative.push(chunk.join("-"));
+            }
+            fs::create_dir_all(temp.path().join(&relative)).unwrap();
+            let resolved = workspace_in_temp(&format!("home-{}", tokens.join("-")), temp.path());
+            assert_eq!(
+                resolved.path,
+                Some(std::path::Path::new("/").join("home").join(relative))
             );
+            assert_eq!(resolved.visited, depth);
+            assert!(!resolved.limited);
         }
     }
 
     #[test]
     fn workspace_roots_and_ambiguity_are_host_independent() {
-        for (slug, expected) in [
-            ("Users-person-project", "/Users/person/project"),
-            ("home-person-project", "/home/person/project"),
-            ("C-Users-person-project", "C:\\Users\\person\\project"),
+        for slug in [
+            "Users-person-project",
+            "home-person-project",
+            "C-Users-person-project",
         ] {
-            let expected = std::path::PathBuf::from(expected);
-            assert_eq!(
-                super::decode_cursor_project_dir_with(slug, |path| path == expected),
-                Some(expected)
-            );
-            assert!(super::decode_cursor_project_dir_with(slug, |_| false).is_none());
-            assert!(super::decode_cursor_project_dir_with(slug, |_| true).is_none());
+            let temp = tempdir().unwrap();
+            fs::create_dir_all(temp.path().join("person").join("project")).unwrap();
+            let result = workspace_in_temp(slug, temp.path());
+            let root = if slug.starts_with("C-") {
+                std::path::PathBuf::from("C:\\Users")
+            } else {
+                std::path::PathBuf::from("/").join(if slug.starts_with("home-") {
+                    "home"
+                } else {
+                    "Users"
+                })
+            };
+            assert_eq!(result.path, Some(root.join("person").join("project")));
+            assert_eq!(result.visited, 2);
+            fs::create_dir_all(temp.path().join("person-project")).unwrap();
+            assert!(workspace_in_temp(slug, temp.path()).path.is_none());
         }
     }
 
     #[test]
+    fn workspace_dot_underscore_and_missing_leaf_use_existing_entries_only() {
+        let temp = tempdir().unwrap();
+        fs::create_dir_all(
+            temp.path()
+                .join("person")
+                .join(".claude")
+                .join("my_project"),
+        )
+        .unwrap();
+        for slug in [
+            "home-person--claude-my_project",
+            "home-person--claude-my-project",
+            "home-person--claude-myproject",
+        ] {
+            let result = workspace_in_temp(slug, temp.path());
+            assert_eq!(
+                result.path,
+                Some(
+                    std::path::Path::new("/")
+                        .join("home")
+                        .join("person")
+                        .join(".claude")
+                        .join("my_project")
+                )
+            );
+            assert!(!result.limited);
+        }
+        assert!(
+            workspace_in_temp("home-person--claude-missing", temp.path())
+                .path
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn workspace_pathological_tree_counts_its_directory_guard() {
+        let temp = tempdir().unwrap();
+        for mask in 0..4096 {
+            let mut name = "a".to_string();
+            for bit in 0..12 {
+                name.push(if mask & (1 << bit) == 0 { '-' } else { '_' });
+                name.push('a');
+            }
+            fs::create_dir(temp.path().join(name)).unwrap();
+        }
+        let result = workspace_in_temp(
+            &format!("home-{}-missing", vec!["a"; 13].join("-")),
+            temp.path(),
+        );
+        assert!(result.path.is_none());
+        assert_eq!(result.visited, super::WORKSPACE_DIRECTORY_LIMIT);
+        assert!(result.limited);
+    }
+
+    #[test]
     fn skips_empty_window_workspace() {
-        assert!(decode_cursor_project_dir("empty-window").is_none());
+        assert!(decode_cursor_project_dir("empty-window").path.is_none());
     }
 
     /// Differential guard for the streaming-parse refactor (task #241): identical output
