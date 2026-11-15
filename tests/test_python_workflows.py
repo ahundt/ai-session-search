@@ -306,9 +306,18 @@ def test_query_filters_accept_flat_and_scope_shapes(corpus):
     scope = aise.QueryScope(provider="claude", path_prefix="/synthetic")
     assert corpus.list_sessions(aise.SessionQuery(scope=scope)) == corpus.list_sessions(aise.SessionQuery(provider="claude", path_prefix="/synthetic"))
     assert corpus.search_files("*.py", aise.FileQuery(scope=scope)) == corpus.search_files("*.py", aise.FileQuery(provider="claude", path_prefix="/synthetic"))
-    flat = corpus.search_messages("forgot", aise.MessageSearchRequest(provider="claude", path_prefix="/synthetic"))
+    flat = corpus.search_messages("forgot", aise.MessageSearchRequest(provider="claude", workspace_path_prefix="/synthetic"))
     grouped = corpus.search_messages("forgot", aise.MessageSearchRequest(scope=scope))
     assert flat == grouped
+    assert len(flat.results) == 9
+    transcript_prefix = str(Path(corpus.db_path).parent)
+    assert corpus.list_sessions(aise.SessionQuery(path_prefix=transcript_prefix))
+    assert not corpus.search_messages("forgot", aise.MessageSearchRequest(workspace_path_prefix=transcript_prefix)).results
+    assert not corpus.search_messages("forgot", aise.MessageSearchRequest(scope=aise.QueryScope(path_prefix=transcript_prefix))).results
+    with pytest.raises(TypeError, match="path_prefix"):
+        aise.MessageSearchRequest(**{"path_prefix": "/synthetic"})
+    with pytest.raises(aise.InvalidArgumentError, match="workspace_path_prefix"):
+        aise.MessageSearchRequest(scope=scope, workspace_path_prefix="/synthetic")
     with pytest.raises(aise.InvalidArgumentError, match="scope"):
         aise.FileQuery(scope=scope, path_prefix="/different")
     with pytest.raises(aise.InvalidArgumentError, match="scope"):
@@ -379,7 +388,7 @@ def test_standard_dates_and_paths_are_native_inputs(corpus):
     instant = datetime(2026, 1, 15, 12, tzinfo=UTC)
     assert aise.DateRange(since=instant) == aise.DateRange(since=instant.isoformat())
     assert corpus.list_sessions(aise.SessionQuery(path_prefix=PurePosixPath("/synthetic")))
-    assert corpus.search_messages("forgot", aise.MessageSearchRequest(path_prefix=PurePosixPath("/synthetic"), dates=aise.DateRange(when=date(2026, 1, 15)))).results
+    assert corpus.search_messages("forgot", aise.MessageSearchRequest(workspace_path_prefix=PurePosixPath("/synthetic"), dates=aise.DateRange(when=date(2026, 1, 15)))).results
     assert aise.QueryScope(path_prefix=PurePosixPath("/synthetic")) == aise.QueryScope(path_prefix="/synthetic")
     assert aise.MessageScope(workspace_path_prefix=PurePosixPath("/synthetic")) == aise.MessageScope(workspace_path_prefix="/synthetic")
     assert aise.QueryExclusions(path_prefixes=[PurePosixPath("/excluded")]).path_prefixes == ["/excluded"]

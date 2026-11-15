@@ -2762,6 +2762,9 @@ impl NativeAnalysisRequest {
 
 #[derive(Clone, Default)]
 /// Shared provider, session, path, exclusion, and date scope for typed queries.
+/// path_prefix accepts a str or os.PathLike[str] filesystem prefix on component boundaries.
+/// None (default) adds no path constraint. Non-path values raise TypeError.
+/// In message search it selects workspace paths only, never transcript locations.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct QueryScope {
     provider: Option<Provider>,
@@ -3014,6 +3017,12 @@ python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","s
 /// applies, omitting `limit` returns all literal, regex, or no-text matches in Python. Fuzzy search
 /// requires a positive limit. `all_results=True` makes the complete-corpus request explicit and
 /// conflicts with `limit`.
+///
+/// workspace_path_prefix accepts a str or os.PathLike[str] filesystem prefix, matched on
+/// component boundaries against workspace paths only, never transcript paths. None (default)
+/// omits this constraint. A non-path value raises TypeError; combining it with scope raises
+/// InvalidArgumentError. A QueryScope.path_prefix passed through scope has the same workspace-only
+/// meaning; use MessageScope.transcript_path_prefix to select transcript locations.
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageSearchRequest {
@@ -3061,7 +3070,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None, query_mode=None, provider=None, session_id=None, path_prefix=None, dates=None, session_kinds=None, parent_session_id=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None, query_mode=None, provider=None, session_id=None, workspace_path_prefix=None, dates=None, session_kinds=None, parent_session_id=None))]
     fn new(
         scope: Option<MessageScopeInput>,
         role: Option<&str>,
@@ -3092,7 +3101,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
         provider: Option<String>,
         session_id: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
-        path_prefix: Option<String>,
+        workspace_path_prefix: Option<String>,
         dates: Option<DateRange>,
         session_kinds: Option<Vec<String>>,
         parent_session_id: Option<String>,
@@ -3100,13 +3109,13 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
         if query_mode.as_deref().is_some_and(|mode| !matches!(mode, "literal" | "regex" | "fuzzy")) {
             return Err(invalid_argument_error("query_mode must be literal, regex, or fuzzy"));
         }
-        if scope.is_some() && (provider.is_some() || session_id.is_some() || path_prefix.is_some() || dates.is_some() || session_kinds.is_some() || parent_session_id.is_some()) {
-            return Err(invalid_argument_error("scope cannot be combined with flat provider, session_id, path_prefix, dates, session_kinds, or parent_session_id filters"));
+        if scope.is_some() && (provider.is_some() || session_id.is_some() || workspace_path_prefix.is_some() || dates.is_some() || session_kinds.is_some() || parent_session_id.is_some()) {
+            return Err(invalid_argument_error("scope cannot be combined with flat provider, session_id, workspace_path_prefix, dates, session_kinds, or parent_session_id filters"));
         }
         let scope = match scope {
             Some(scope) => scope.into_scope(),
             None => {
-                let mut scope = MessageScopeInput::Shared(QueryScope::new(provider, session_id, path_prefix, None, dates)?).into_scope();
+                let mut scope = MessageScopeInput::Shared(QueryScope::new(provider, session_id, workspace_path_prefix, None, dates)?).into_scope();
                 scope.session_kinds = parse_session_kinds(session_kinds)?;
                 scope.parent_session_id = parent_session_id;
                 scope

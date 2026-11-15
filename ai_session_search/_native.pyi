@@ -1011,7 +1011,12 @@ class QueryExclusions:
 
 @final
 class QueryScope:
-    """Shared provider, session, path, exclusion, and date scope for typed queries."""
+    """Shared provider, session, path, exclusion, and date scope for typed queries.
+
+    path_prefix accepts a str or os.PathLike[str] filesystem prefix on component boundaries.
+    None (default) adds no path constraint. Non-path values raise TypeError.
+    In message search it selects workspace paths only, never transcript locations.
+    """
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached JSON-ready dictionary using structured-output field names."""
@@ -1195,6 +1200,12 @@ class MessageSearchRequest:
     default applies, omitting ``limit`` returns all literal, regex, or no-text Python matches;
     fuzzy search requires a positive limit. ``all_results=True`` states the complete-corpus
     request explicitly and conflicts with ``limit``. MCP separately uses a bounded default.
+
+    workspace_path_prefix accepts a str or os.PathLike[str] filesystem prefix, matched on
+    component boundaries against workspace paths only, never transcript paths. None (default)
+    omits this constraint. A non-path value raises TypeError; combining it with scope raises
+    InvalidArgumentError. A QueryScope.path_prefix passed through scope has the same workspace-only
+    meaning; use MessageScope.transcript_path_prefix to select transcript locations.
     """
 
     def to_dict(self) -> dict[str, Any]:
@@ -1260,7 +1271,7 @@ class MessageSearchRequest:
         query_mode: _MessageQueryMode | None = None,
         provider: _ProviderId | None = None,
         session_id: str | None = None,
-        path_prefix: _PathInput | None = None,
+        workspace_path_prefix: _PathInput | None = None,
         dates: DateRange | None = None,
         session_kinds: list[_SessionKind] | None = None,
         parent_session_id: str | None = None,

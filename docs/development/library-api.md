@@ -168,8 +168,12 @@ Set a positive limit and offset to page a large edit history.
 
 `SessionQuery` and `FileQuery` accept either flat `provider`, `path_prefix`, and `dates`
 filters or `scope=QueryScope(...)`. File queries also accept a flat `session_id`.
-`MessageSearchRequest` accepts the same flat filters or a `QueryScope`; its path filter means
-workspace path. Use `MessageScope` for multiple providers and independent transcript-path filters.
+`MessageSearchRequest` accepts flat `provider`, `session_id`, `workspace_path_prefix`, and
+`dates` filters or a `QueryScope`. `workspace_path_prefix=None` (the default) adds no path
+constraint; a string or `os.PathLike[str]` prefix matches workspace component boundaries only,
+never transcript locations. Other types raise `TypeError`. The released
+`QueryScope.path_prefix` adapter has the same workspace-only meaning in message search.
+Use `MessageScope` for multiple providers and independent transcript-path filters.
 Passing both a scope and flat filters raises `InvalidArgumentError`. Session lists do not accept
 `scope.session_id`; read a resolved session directly instead.
 `SessionQuery(limit=N, offset=M)` pages both lists and ranked search in their existing order.
