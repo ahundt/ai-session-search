@@ -3794,10 +3794,16 @@ fn render_message_search_field_description(
             format!("One value; conflicts with {plural}.")
         }
         McpFieldRole::ContextBefore => {
-            format!("Neighbours before; omit for {}.", context.messages_before())
+            format!(
+                "Sequence radius before; omit for {}.",
+                context.messages_before()
+            )
         }
         McpFieldRole::ContextAfter => {
-            format!("Neighbours after; omit for {}.", context.messages_after())
+            format!(
+                "Sequence radius after; omit for {}.",
+                context.messages_after()
+            )
         }
         // "fuzzy search does not support all_results" and "sequence bounds require one session"
         // are two of the nine validator rules, and `message_search_tool_description` renders all
@@ -3805,14 +3811,12 @@ fn render_message_search_field_description(
         // these three clauses were the copy that could be dropped without dropping the fact --
         // and, being hand-written here rather than read from `rule_descriptors()`, the copy free
         // to drift from the validator that enforces it.
-        McpFieldRole::AllResults => "Every match, not a page; conflicts with limit.".to_owned(),
+        McpFieldRole::AllResults => "All matches; excludes limit.".to_owned(),
         McpFieldRole::Offset => "Zero-based page offset.".to_owned(),
         McpFieldRole::SequenceFrom => "Lower sequence bound.".to_owned(),
         McpFieldRole::SequenceTo => "Upper sequence bound.".to_owned(),
-        McpFieldRole::TimePeriod => {
-            "One period, both bounds; conflicts with since and until.".to_owned()
-        }
-        McpFieldRole::PurposeVersion => "Required purpose version.".to_owned(),
+        McpFieldRole::TimePeriod => "Period; conflicts with since/until.".to_owned(),
+        McpFieldRole::PurposeVersion => "Purpose version.".to_owned(),
         McpFieldRole::Canonical => {
             // A handful of fields need a number the registry does not carry, because the value is
             // this surface's planner-resolved policy rather than the parameter's semantics. Read
@@ -3822,7 +3826,7 @@ fn render_message_search_field_description(
             let omission = match (field, parameter.omission()) {
                 ("limit", _) => match configured.extent() {
                     ResolvedRequestExtent::Page { limit, .. } => {
-                        format!("omit for the configured page of {limit}.")
+                        format!("omit for page of {limit}.")
                     }
                     ResolvedRequestExtent::AllResults { .. } => {
                         "omit to return every match.".to_owned()
@@ -3847,7 +3851,7 @@ fn render_message_search_field_description(
                 // parameter selects, not what the sign means, and "first lines, or last lines"
                 // leaves a caller to guess which sign selects which end.
                 ("lines_per_message", _) => format!(
-                    "positive keeps first N, negative last N, 0 none; omit for {}.",
+                    "positive=first N, negative=last N, 0=all; omit for {}.",
                     configured.presentation().lines_per_message()
                 ),
                 // Written as the value a caller would send, because a client that drops `oneOf`
@@ -3882,7 +3886,7 @@ fn render_message_search_field_description(
                 // A mode rather than a value, so it is worded without "omit for" and stays out
                 // of the tool description's omitted-values sentence, which lists values.
                 (_, MessageSearchOmission::QuerylessSearch) => {
-                    "without it all eligible messages.".to_owned()
+                    "omitted matches all eligible messages.".to_owned()
                 }
                 // A defaulted parameter must name its default value in the text, not just in the
                 // keyword. `default` is one of the six keywords both Codex and VS Code delete
@@ -7217,7 +7221,6 @@ mod tests {
             (json!({"role":"user", "limit":1, "order":"newest"}), vec![2]),
             (json!({"role":"user", "offset":1}), vec![2]),
             (json!({"role":"assistant"}), vec![1]),
-
         ] {
             let mut args = args;
             args["session_id"] = json!("claude:test1");
@@ -8435,7 +8438,7 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            query.contains("without it all eligible messages"),
+            query.contains("omitted matches all eligible messages"),
             "{query}"
         );
     }
@@ -9920,6 +9923,19 @@ mod tests {
         assert_eq!(filters.limit, 7);
         assert_eq!(filters.until, Some(now));
         assert!(filters.since.is_some_and(|since| since < now));
+    }
+
+    #[test]
+    fn message_search_schema_keeps_client_headroom() {
+        let tools = advertised_tools(&Config::default());
+        let tool = tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "search_messages")
+            .unwrap();
+        let bytes = crate::mcp_schema_budget::codex_measured_bytes(&tool["inputSchema"]);
+        assert!(bytes <= 4_750, "search_messages normalized inputSchema is {bytes} bytes; shorten descriptions to at most 4750 bytes without removing parameters or accepted values; reproduce with aise mcp schema-budget --ledger");
     }
 
     #[test]
@@ -14609,7 +14625,7 @@ mod tests {
                 .as_str()
                 .is_some_and(|description| description
                     .to_lowercase()
-                    .replace('_', " ")
+                    .replace(['_', '-'], " ")
                     .contains("tool name")),
             "{}",
             search_messages["inputSchema"]["properties"]["tool_name_contains"]["description"]
@@ -14877,7 +14893,7 @@ mod tests {
         );
         // A signed count states all four cases on the parameter itself, because the sign
         // convention is what a caller cannot guess from the type.
-        for required in ["positive keeps first N", "negative last N", "0 none"] {
+        for required in ["positive=first N", "negative=last N", "0=all"] {
             assert!(
                 message_window.contains(required),
                 "missing {required:?}: {message_window}"
@@ -15332,10 +15348,7 @@ mod tests {
         let limit_prose = search_messages["inputSchema"]["properties"]["limit"]["description"]
             .as_str()
             .unwrap();
-        assert!(
-            limit_prose.contains("omit for the configured page of 1"),
-            "{limit_prose}"
-        );
+        assert!(limit_prose.contains("omit for page of 1"), "{limit_prose}");
         assert!(search_messages["inputSchema"]["properties"]["limit"]["default"].is_null());
         let field_view_prose = search_messages["inputSchema"]["properties"]["field_view"]
             ["description"]
