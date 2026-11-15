@@ -105,6 +105,100 @@ impl Status {
     }
 }
 
+/// Offline provenance for the exact client transformation being modeled.
+/// Unknown source revisions remain explicit; a URL is a review target, not a network test.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[non_exhaustive]
+pub struct LimitEvidence {
+    pub client: &'static str,
+    pub revision: &'static str,
+    pub source_url: &'static str,
+    pub observed: &'static str,
+    pub checked: &'static str,
+    pub measurement: &'static str,
+}
+
+const CODEX_SCHEMA_EVIDENCE: LimitEvidence = LimitEvidence {
+    client: "Codex",
+    revision: "rust-v0.146.0; blob 7c9edd08e167626cc524962884baa3ad626247a0",
+    source_url: "https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/tools/src/json_schema.rs",
+    observed: "2026-08-04",
+    checked: "2026-11-14",
+    measurement: "MAX_COMPACT_TOOL_SCHEMA_BYTES; compact UTF-8 JSON after sanitize, inferred types and JsonSchema projection; first compaction pass strips all descriptions",
+};
+const CLAUDE_EVIDENCE: LimitEvidence = LimitEvidence {
+    client: "Claude Code",
+    revision: "2.1.220 (corroborated by 2.1.88 source)",
+    source_url: "https://www.npmjs.com/package/@anthropic-ai/claude-code/v/2.1.220",
+    observed: "2026-08-03",
+    checked: "2026-08-03",
+    measurement: "Recorded binary/source inspection: services/mcp/client.ts MAX_MCP_DESCRIPTION_LENGTH uses JS UTF-16 length; utils/mcpValidation.ts MAX_MCP_OUTPUT_TOKENS persists overflow. Reinspect that installed version; package page alone does not prove the constants.",
+};
+const VSCODE_EVIDENCE: LimitEvidence = LimitEvidence {
+    client: "VS Code / Copilot",
+    revision: "2026-08-02 source snapshot; immutable commit not recorded",
+    source_url: "https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/tools/common/toolSchemaNormalizer.ts",
+    observed: "2026-08-02",
+    checked: "2026-08-02",
+    measurement: "gpt4oMaxStringLength uses JS UTF-16 length for schema-internal descriptions on GPT-4 families; root combinators rejected for all families. Capture an immutable commit when rechecking.",
+};
+const MCP_EVIDENCE: LimitEvidence = LimitEvidence {
+    client: "MCP specification / repository policy",
+    revision: "MCP 2026-07-28; repository policy 1.1.0",
+    source_url: "https://modelcontextprotocol.io/specification/2026-07-28/server/tools",
+    observed: "2026-08-03",
+    checked: "2026-08-03",
+    measurement: "Schema depth and subschema count are repository choices, NOT numeric MCP requirements; count actual JSON containers/schema positions. Local refs and described reachable definitions are repository guards.",
+};
+const NAME_EVIDENCE: LimitEvidence = LimitEvidence {
+    client: "Anthropic Messages API",
+    revision: "API documentation snapshot; Claude Code SDK 2.1.220",
+    source_url: "https://platform.claude.com/docs/en/api/messages",
+    observed: "2026-08-03",
+    checked: "2026-08-03",
+    measurement: "Tool name pattern ^[a-zA-Z0-9_-]{1,64}$; compare Codex 64 and MCP SDK 128 (dots allowed). Recheck name pattern, not schema description bytes.",
+};
+const CODEX_RESULT_EVIDENCE: LimitEvidence = LimitEvidence {
+    client: "Codex",
+    revision: "0.146.0",
+    source_url: "https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/core/src/tools/context.rs",
+    observed: "2026-08-03",
+    checked: "2026-08-03",
+    measurement: "Recorded context.rs and models-manager/models.json inspection: about 12000 tokens at four characters/token, an ESTIMATE, not a universal character guarantee; middle truncation has no marker",
+};
+const GEMINI_EVIDENCE: LimitEvidence = LimitEvidence {
+    client: "Gemini CLI",
+    revision: "f47d6c6f",
+    source_url: "https://github.com/google-gemini/gemini-cli/blob/f47d6c6f/packages/core/src/config/config.ts",
+    observed: "2026-07-31",
+    checked: "2026-11-14",
+    measurement: "DEFAULT_TRUNCATE_TOOL_OUTPUT_THRESHOLD; announced head/tail truncation persists omitted output. Forks have different constants.",
+};
+
+/// Review monthly: the recorded Codex change (4000 to 5000 on 2026-07-08)
+/// preceded the 2026-08-04 observation by 27 days. This is a review policy, not a
+/// claim that all clients change monthly. Staleness never fails an offline test.
+pub const EVIDENCE_REVIEW_DAYS: i64 = 30;
+const EVIDENCE_DOC: &str = "docs/development/mcp-client-limits-and-measured-evidence.md";
+
+/// Return a non-failing maintenance notice with an injected clock; no network access.
+/// O(1) time and memory per fixed-size evidence record.
+pub fn evidence_notice(evidence: &LimitEvidence, today: chrono::NaiveDate) -> Option<String> {
+    // Evidence dates are ISO calendar dates owned by this module, not stored timestamps.
+    #[allow(clippy::disallowed_methods)]
+    let checked = chrono::NaiveDate::parse_from_str(evidence.checked, "%Y-%m-%d").ok();
+    let age = checked.map(|date| today.signed_duration_since(date).num_days());
+    if age.is_some_and(|days| days <= EVIDENCE_REVIEW_DAYS) {
+        return None;
+    }
+    Some(format!(
+        "NOTICE: {} cap evidence {} checked {}, age {} days; review interval {} days. This does not fail the gate. Recheck {} at {}; inspect {}. Record new revision, observed/checked dates and measurement in HarnessLimit.evidence and {EVIDENCE_DOC}; change the owning budget only with new evidence, then run aise mcp schema-budget --ledger.",
+        evidence.client, evidence.revision, evidence.checked,
+        age.map_or_else(|| "unknown (invalid checked date)".to_owned(), |days| days.to_string()),
+        EVIDENCE_REVIEW_DAYS, evidence.client, evidence.source_url, evidence.measurement,
+    ))
+}
+
 /// One (client, artifact, limit) triple, swept over every tool the catalogue advertises.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -112,6 +206,7 @@ pub struct HarnessLimit {
     pub name: &'static str,
     /// The external client, protocol, or repository policy that owns this rule.
     pub authority: &'static str,
+    pub evidence: LimitEvidence,
     pub artifact: &'static str,
     pub budget: usize,
     pub unit: &'static str,
@@ -138,10 +233,15 @@ pub struct HarnessLimit {
     pub lower_when: &'static str,
 }
 
-/// Client-enforced limits. Each is a real cap read from that client's own source or documentation.
+/// The measured Codex result estimate also owns the server delivery default.
+pub const CODEX_TOOL_RESULT_CHARS: usize = 48_000;
+
+/// Client contracts and related repository guards. Evidence distinguishes upstream constants,
+/// estimated result budgets and internal structural policies; they are not all MCP requirements.
 pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     HarnessLimit {
         name: "codex-input-schema-bytes",
+        evidence: CODEX_SCHEMA_EVIDENCE,
         authority: "Codex 0.146.0",
         artifact: "Codex-normalized inputSchema",
         budget: 5_000,
@@ -170,6 +270,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "codex-input-schema-margin",
+        evidence: CODEX_SCHEMA_EVIDENCE,
         authority: "Codex 0.146.0",
         artifact: "Codex-normalized inputSchema",
         budget: 4_750,
@@ -191,6 +292,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "claude-code-tool-description-chars",
+        evidence: CLAUDE_EVIDENCE,
         authority: "Claude Code 2.1.220",
         artifact: "tool.description",
         budget: 2_048,
@@ -216,6 +318,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "vscode-parameter-description-chars",
+        evidence: VSCODE_EVIDENCE,
         authority: "VS Code / Copilot, GPT-4o family",
         artifact: "schema-internal description",
         budget: 1_024,
@@ -236,6 +339,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "vscode-no-root-combinator",
+        evidence: VSCODE_EVIDENCE,
         authority: "VS Code / Copilot, all model families",
         artifact: "inputSchema root keywords",
         budget: 0,
@@ -258,6 +362,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "mcp-output-schema-depth",
+        evidence: MCP_EVIDENCE,
         authority: "MCP specification",
         artifact: "outputSchema nesting depth",
         budget: 10,
@@ -290,6 +395,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "mcp-output-schema-point-of-use-depth",
+        evidence: MCP_EVIDENCE,
         authority: "this repository's schema policy",
         artifact: "outputSchema depth along a use path, with $ref as a leaf and $defs excluded",
         budget: 6,
@@ -317,6 +423,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-named-definitions-are-described",
+        evidence: MCP_EVIDENCE,
         authority: "this repository's schema policy",
         artifact: "$defs entries without a description",
         budget: 0,
@@ -339,6 +446,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "mcp-output-schema-subschemas",
+        evidence: MCP_EVIDENCE,
         authority: "MCP specification",
         artifact: "outputSchema subschema count",
         budget: 250,
@@ -362,6 +470,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "anthropic-tool-name-charset",
+        evidence: NAME_EVIDENCE,
         authority: "Anthropic API and the MCP SDK",
         artifact: "tool name",
         budget: 64,
@@ -383,9 +492,10 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "codex-tool-result-chars",
+        evidence: CODEX_RESULT_EVIDENCE,
         authority: "Codex 0.146.0",
         artifact: "serialized CallToolResult",
-        budget: 48_000,
+        budget: CODEX_TOOL_RESULT_CHARS,
         unit: "characters",
         failure_mode: FailureMode::Silent,
         applies_to: AppliesTo::Response,
@@ -407,6 +517,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "claude-code-tool-result-tokens",
+        evidence: CLAUDE_EVIDENCE,
         authority: "Claude Code 2.1.220",
         artifact: "tool-result tokens",
         budget: 25_000,
@@ -429,6 +540,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "gemini-cli-tool-result-chars",
+        evidence: GEMINI_EVIDENCE,
         authority: "Gemini CLI (legacy registration)",
         artifact: "tool-result characters",
         budget: 40_000,
@@ -457,6 +569,7 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
 pub const SCHEMA_RULES: &[HarnessLimit] = &[
     HarnessLimit {
         name: "style-no-aise-vendor-keys",
+        evidence: MCP_EVIDENCE,
         authority: "this repository's schema policy: no project-only vendor keys",
         artifact: "x-aise-* keys anywhere in a tool",
         budget: 0,
@@ -479,6 +592,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-no-input-const",
+        evidence: CODEX_SCHEMA_EVIDENCE,
         authority: "this repository's schema policy: use model-visible constraints",
         artifact: "const in an inputSchema",
         budget: 0,
@@ -502,6 +616,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-no-fake-integer-maxima",
+        evidence: MCP_EVIDENCE,
         authority: "this repository's schema policy: every bound states its origin",
         artifact: "maximum equal to i64::MAX",
         budget: 0,
@@ -523,6 +638,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-local-refs-only",
+        evidence: MCP_EVIDENCE,
         authority: "this repository's schema policy: every reference is local",
         artifact: "$ref targets",
         budget: 0,
@@ -543,6 +659,7 @@ pub const SCHEMA_RULES: &[HarnessLimit] = &[
     },
     HarnessLimit {
         name: "style-reachable-definitions",
+        evidence: CODEX_SCHEMA_EVIDENCE,
         authority: "this repository's schema policy: extract only useful shapes",
         artifact: "unreachable $defs entries",
         budget: 0,
@@ -865,9 +982,9 @@ pub fn codex_strips_descriptions(value: &Value) -> bool {
 
 /// `MAX_COMPACT_TOOL_SCHEMA_BYTES`, `codex-rs/tools/src/json_schema.rs:222`.
 ///
-/// Held beside the sanitize model rather than read back out of the limit table, because the table
-/// is configurable per registration and this is the upstream constant the model is faithful to.
-const CODEX_COMPACT_TOOL_SCHEMA_BYTES: usize = 5_000;
+/// Read from the built-in row, never its operator override: the transformation model stays
+/// pinned to that upstream revision even when a registration tracks a newer client's budget.
+const CODEX_COMPACT_TOOL_SCHEMA_BYTES: usize = HARNESS_LIMITS[0].budget;
 
 /// Byte length of the compact serialization the client measures.
 pub fn compact_len(value: &Value) -> usize {
@@ -1492,32 +1609,23 @@ pub fn configured_catalogue_warnings(
         .flat_map(|limit| {
             let budget = resolved_budget(limit, overrides);
             tools.iter().filter_map(move |tool| {
-                let (measured, _) = measure(limit, tool, budget);
+                let (measured, evidence) = measure(limit, tool, budget);
                 if measured <= budget {
                     return None;
                 }
                 let name = tool["name"].as_str().unwrap_or("?");
-                // A structural rule must not advise the override that validation rejects and
-                // that could not make the schema acceptable anyway.
-                let remedy = if limit.overridable {
-                    format!(
-                        "Set [mcp.client_limits].{} to track a client that moved.",
-                        limit.name
-                    )
-                } else {
-                    "This is a structural rule rather than a client budget: fix the emitted \
-                     schema; no configured number admits it."
-                        .to_owned()
-                };
                 Some(format!(
-                    "warning: {name} breaches {}: {} measured {measured} {} against the {budget} \
-                     {} limit of {}. {} {remedy}",
-                    limit.name,
-                    limit.artifact,
-                    limit.unit,
-                    limit.unit,
-                    limit.authority,
-                    limit.rationale,
+                    "warning: {}",
+                    Finding {
+                        limit,
+                        budget,
+                        notice_at: resolved_notice_at(limit, overrides),
+                        tool: name.to_owned(),
+                        measured,
+                        status: Status::Warning,
+                        evidence,
+                    }
+                    .diagnostic()
                 ))
             })
         })
@@ -1556,14 +1664,13 @@ pub fn configured_ceiling_warnings(
             if max_tool_result_chars <= budget_chars {
                 return None;
             }
-            Some(format!(
-                "warning: mcp.max_tool_result_chars is {max_tool_result_chars}, above the \
-                 {budget_chars} characters {} keeps ({}). A result between those two sizes is \
-                 delivered by this server and then truncated from the middle by that client with \
-                 no marker. Lower the ceiling, or raise [mcp.client_limits].{} if that client \
-                 raised its own.",
-                limit.authority, limit.name, limit.name,
-            ))
+            let measured = if limit.unit == "tokens" {
+                max_tool_result_chars.div_ceil(4)
+            } else {
+                max_tool_result_chars
+            };
+            Some(format!("warning: mcp.max_tool_result_chars admits an oversized result. Lower that delivery ceiling first. {}",
+                describe_breach(limit, budget, measured)))
         })
         .collect()
 }
@@ -1574,7 +1681,7 @@ pub fn describe_breach(limit: &HarnessLimit, budget: usize, measured: usize) -> 
         "{} measured {measured} {} against the {budget} {} limit of {}",
         limit.artifact, limit.unit, limit.unit, limit.authority
     );
-    match limit.failure_mode {
+    let consequence = match limit.failure_mode {
         FailureMode::Silent => format!(
             "{head}. The breach is silent: the client neither errors nor marks the result, so \
              nothing downstream reports it. {}",
@@ -1587,13 +1694,55 @@ pub fn describe_breach(limit: &HarnessLimit, budget: usize, measured: usize) -> 
             )
         }
         FailureMode::Rejected => {
-            format!(
-                "{head}. The client rejects the artifact outright. {}",
-                limit.rationale
-            )
+            let effect = if limit.evidence.client == MCP_EVIDENCE.client {
+                "This structural policy is not satisfied; no measured client numeric ceiling is claimed."
+            } else {
+                "The client rejects the artifact outright."
+            };
+            format!("{head}. {effect} {}", limit.rationale)
         }
         FailureMode::NoClientEffect => format!("{head}. {}", limit.rationale),
+    };
+    let e = &limit.evidence;
+    let recovery = match limit.applies_to {
+        AppliesTo::Response => "1. Retry the same offset with a smaller finite page, fewer context neighbors or the presentation controls that this tool advertises. 2. Fetch the complete payload through CLI/Rust/Python if required; never discard matching records.",
+        AppliesTo::ToolName => "1. Rename the tool to the reported character set and length. 2. Keep schema, dispatcher and callers in agreement.",
+        _ => "1. Shorten or remove the named description text; inspect per-field costs in aise mcp schema-budget --ledger (tools[].input_field_costs). Name repeated output shapes with local $ref and describe them; nest root unions below a property. 2. Move usage guidance to server instructions or the skill, keeping accepted values and defaults visible. 3. Split the tool only when it represents distinct operations.",
+    };
+    let last_resort = if limit.overridable {
+        format!("Last resort: only if upstream changed, change the owning HarnessLimit.budget and evidence; track a deployment with [mcp.client_limits].{} or {}. Re-pin EMITTED_ARTIFACT_CEILINGS in the same schema commit, regenerate/check the evidence table and config.example.toml defaults; a higher measurement pin never raises a client cap.", limit.name, crate::config::client_limit_env_var(limit.name))
+    } else {
+        "This structural policy cannot be overridden: fix the named schema site. Re-pin EMITTED_ARTIFACT_CEILINGS only with an intentional artifact change; a pin never changes a client contract.".to_owned()
+    };
+    format!("{consequence} (excess {} {}). Evidence: {} {}, observed {}, checked {}; {}. Reproduce: aise mcp schema-budget --ledger; cargo test -p ai-session-search --lib mcp_schema_budget --locked. {recovery} {last_resort} Check whether the standard changed at {}; compare the constant and transformation described above with current upstream history. Record new values and evidence in HarnessLimit and {EVIDENCE_DOC}.",
+        measured.saturating_sub(budget), limit.unit, e.client, e.revision, e.observed,
+        e.checked, e.measurement, e.source_url)
+}
+
+/// One actionable report used by catalogue warnings, CLI gates and specification tests.
+/// O(1) formatting per finding, excluding the already measured artifact.
+impl Finding {
+    pub fn diagnostic(&self) -> String {
+        format!(
+            "{} [{}] at {}: {}",
+            self.limit.name,
+            self.tool,
+            self.evidence,
+            describe_breach(self.limit, self.budget, self.measured)
+        )
     }
+}
+
+/// Explain a changed per-tool measurement without confusing a repository pin with a client cap.
+pub fn describe_pin_change(
+    tool: &str,
+    artifact: &str,
+    measured: usize,
+    pinned: usize,
+    unit: &str,
+) -> String {
+    format!("{tool} {artifact}: measured {measured} {unit}, recorded {pinned} {unit}, difference {} {unit}. Repository artifact measurement (not an external cap). Reproduce: aise mcp schema-budget --ledger; cargo test -p ai-session-search --lib every_tool_stays_inside_the_limits_its_clients_enforce --locked. 1. Inspect the named field costs and restore unintended schema growth. 2. For an intentional schema change re-pin EMITTED_ARTIFACT_CEILINGS in the same commit in either direction; never raise a client cap to hide growth. Check actual client evidence and budget in {EVIDENCE_DOC} and HarnessLimit before accepting a larger artifact.",
+        measured.abs_diff(pinned))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1694,7 +1843,7 @@ pub(crate) fn stage_ledger(
         .sum();
     let input_normalized: usize = tools
         .iter()
-        .map(|tool| compact_len(&codex_visible_schema(&tool["inputSchema"])))
+        .map(|tool| codex_measured_bytes(&tool["inputSchema"]))
         .sum();
     let output_wire: usize = tools
         .iter()
@@ -1831,7 +1980,7 @@ pub(crate) fn stage_ledger(
                 json!({
                     "artifact": "inputSchema after current Codex normalization",
                     "bytes": normalized_bytes,
-                    "descriptions_retained": normalized_bytes <= 5_000,
+                    "descriptions_retained": normalized_bytes <= CODEX_COMPACT_TOOL_SCHEMA_BYTES,
                     "advertised_fields": input["properties"].as_object().map_or(0, Map::len),
                 }),
             );
@@ -1848,11 +1997,45 @@ pub(crate) fn stage_ledger(
             for stage in RESPONSE_LEDGER_STAGES {
                 tool_stages.insert(stage.to_owned(), fixture_required_stage(stage));
             }
-            json!({ "tool": tool["name"], "stages": Value::Object(tool_stages) })
+            let input_field_costs: Vec<Value> = input["properties"].as_object()
+                .into_iter().flat_map(|fields| fields.iter()).map(|(name, schema)| json!({
+                    "field": name,
+                    "normalized_value_bytes": codex_measured_bytes(schema),
+                    "interpretation": "value only; excludes property name, colon and map separators",
+                })).collect();
+            let pin = EMITTED_ARTIFACT_CEILINGS.iter().find(|(name, _, _)| tool["name"] == *name);
+            let mut pin_changes = Vec::new();
+            if let Some((name, bytes, depth)) = pin {
+                if normalized_bytes != *bytes {
+                    pin_changes.push(describe_pin_change(name, "inputSchema", normalized_bytes, *bytes, "bytes"));
+                }
+                let measured_depth = schema_depth(output);
+                if measured_depth != *depth {
+                    pin_changes.push(describe_pin_change(name, "outputSchema depth", measured_depth, *depth, "levels"));
+                }
+            }
+            json!({ "tool": tool["name"], "stages": Value::Object(tool_stages),
+                "input_field_costs": input_field_costs, "pin_changes": pin_changes })
         })
         .collect();
 
-    json!({ "stages": Value::Object(stages), "tools": per_tool })
+    let evidence: Vec<Value> = all_limits()
+        .map(|limit| {
+            json!({
+                "name": limit.name, "budget": limit.budget, "unit": limit.unit,
+                "authority": limit.authority, "evidence": limit.evidence,
+            })
+        })
+        .collect();
+    let notices: Vec<String> = all_limits()
+        .filter_map(|limit| evidence_notice(&limit.evidence, chrono::Utc::now().date_naive()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    json!({ "stages": Value::Object(stages), "tools": per_tool,
+        "limit_evidence": evidence, "evidence_notices": notices,
+        "cap_selection": "global configured policy; not selected by initialize clientInfo or protocolVersion",
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1916,7 +2099,11 @@ fn report(findings: &[Finding]) -> bool {
                 .map(|finding| finding.measured)
                 .max()
                 .unwrap_or(budget);
-            println!("        {}", describe_breach(limit, budget, worst));
+            let worst_finding = group
+                .iter()
+                .find(|finding| finding.measured == worst)
+                .expect("nonempty finding group");
+            println!("        {}", worst_finding.diagnostic());
         }
         let mut sorted = group.clone();
         sorted.sort_by_key(|finding| std::cmp::Reverse(finding.measured));
@@ -2036,6 +2223,12 @@ pub(crate) fn run(args: &SchemaBudgetArgs, config: &crate::config::Config) -> an
             serde_json::to_string_pretty(&stage_ledger(tools, measured.as_ref().ok()))?
         );
         return Ok(());
+    }
+    for notice in all_limits()
+        .filter_map(|limit| evidence_notice(&limit.evidence, chrono::Utc::now().date_naive()))
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        println!("{notice}");
     }
     // The same fixture the ledger measures, so the response rows are swept here too. A fixture
     // that cannot be built leaves those rows unmeasured and says so, rather than failing a
@@ -2196,6 +2389,12 @@ mod tests {
     fn every_limit_states_its_origin() {
         for limit in all_limits() {
             for (field, value) in [
+                ("client", limit.evidence.client),
+                ("revision", limit.evidence.revision),
+                ("source_url", limit.evidence.source_url),
+                ("observed", limit.evidence.observed),
+                ("checked", limit.evidence.checked),
+                ("measurement", limit.evidence.measurement),
                 ("rationale", limit.rationale),
                 ("platform", limit.platform),
                 ("raise_when", limit.raise_when),
@@ -2216,6 +2415,223 @@ mod tests {
                     limit.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn breach_reports_include_reproduction_evidence_delta_and_ordered_recovery() {
+        for limit in all_limits() {
+            let message = describe_breach(limit, limit.budget, limit.budget + 1);
+            for required in [
+                "excess 1",
+                "aise mcp schema-budget --ledger",
+                "1.",
+                "2.",
+                "docs/development/mcp-client-limits-and-measured-evidence.md",
+            ] {
+                assert!(
+                    message.contains(required),
+                    "{}: missing {required:?}: {message}",
+                    limit.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_staleness_is_non_failing_and_uses_an_injected_clock() {
+        let record = LimitEvidence {
+            checked: "2026-01-01",
+            ..CODEX_SCHEMA_EVIDENCE
+        };
+        for (day, stale) in [(1, false), (31, false)] {
+            let today = chrono::NaiveDate::from_ymd_opt(2026, 1, day).unwrap();
+            assert_eq!(evidence_notice(&record, today).is_some(), stale);
+        }
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 2, 1).unwrap();
+        let notice = evidence_notice(&record, today).expect("31 days requires review");
+        for required in [
+            "NOTICE",
+            "31 days",
+            "does not fail",
+            record.source_url,
+            EVIDENCE_DOC,
+        ] {
+            assert!(
+                notice.contains(required),
+                "staleness notice lacks {required}: {notice}"
+            );
+        }
+        let fresh = LimitEvidence {
+            checked: "2026-02-01",
+            ..record
+        };
+        assert!(evidence_notice(&fresh, today).is_none());
+    }
+
+    #[test]
+    fn evidence_document_and_config_defaults_match_the_owning_rows() {
+        let mut table = String::from("| Rule | Cap (inclusive) | Client | Revision | Observed | Checked | Source | Measurement |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n");
+        let mut defaults = String::from("# Built-in client cap defaults (not overrides):\n");
+        for limit in all_limits() {
+            let e = &limit.evidence;
+            table.push_str(&format!(
+                "| `{}` | {} {} | {} | {} | {} | {} | {} | {} |\n",
+                limit.name,
+                limit.budget,
+                limit.unit,
+                e.client,
+                e.revision,
+                e.observed,
+                e.checked,
+                e.source_url,
+                e.measurement
+            ));
+            if limit.overridable {
+                defaults.push_str(&format!("# {} = {}\n", limit.name, limit.budget));
+            }
+        }
+        let document =
+            include_str!("../../../docs/development/mcp-client-limits-and-measured-evidence.md");
+        assert!(document.contains(&table),
+            "Client cap evidence drifted. Keep the owning HarnessLimit row authoritative; replace the generated evidence table in {EVIDENCE_DOC} with:\n{table}\nThen run aise mcp schema-budget --ledger and re-pin intentional artifact changes in the same commit.");
+        assert!(crate::config::CONFIG_EXAMPLE_TOML.contains(&defaults),
+            "config.example.toml lists stale client defaults. Replace its defaults comment block with:\n{defaults}\nDo not turn these comments into active overrides.");
+    }
+
+    #[test]
+    fn emitted_client_size_boundaries_are_inclusive_in_the_clients_units() {
+        for row in [
+            "codex-input-schema-bytes",
+            "codex-input-schema-margin",
+            "claude-code-tool-description-chars",
+            "vscode-parameter-description-chars",
+            "anthropic-tool-name-charset",
+            "mcp-output-schema-depth",
+            "mcp-output-schema-point-of-use-depth",
+            "mcp-output-schema-subschemas",
+        ] {
+            let limit = all_limits().find(|limit| limit.name == row).unwrap();
+            for target in [limit.budget - 1, limit.budget, limit.budget + 1] {
+                let mut tool = minimal_tool();
+                match row {
+                    "codex-input-schema-bytes" | "codex-input-schema-margin" => {
+                        let initial = codex_measured_bytes(&tool["inputSchema"]);
+                        let text = tool["inputSchema"]["properties"]["query"]["description"]
+                            .as_str()
+                            .unwrap();
+                        tool["inputSchema"]["properties"]["query"]["description"] =
+                            json!(format!("{text}{}", "x".repeat(target - initial)));
+                    }
+                    "claude-code-tool-description-chars" => {
+                        tool["description"] = json!(format!(
+                            "{}{}",
+                            "𝄞".repeat(target / 2),
+                            "x".repeat(target % 2)
+                        ));
+                    }
+                    "vscode-parameter-description-chars" => {
+                        tool["inputSchema"]["properties"]["query"]["description"] = json!(format!(
+                            "{}{}",
+                            "𝄞".repeat(target / 2),
+                            "x".repeat(target % 2)
+                        ));
+                    }
+                    "anthropic-tool-name-charset" => tool["name"] = json!("a".repeat(target)),
+                    "mcp-output-schema-depth" | "mcp-output-schema-point-of-use-depth" => {
+                        let mut output = json!({"type": "string"});
+                        for _ in 1..target {
+                            output = json!({"type": "array", "items": output});
+                        }
+                        tool["outputSchema"] = output;
+                    }
+                    "mcp-output-schema-subschemas" => {
+                        let properties: Map<String, Value> = (1..target)
+                            .map(|index| (format!("f{index}"), json!({"type": "string"})))
+                            .collect();
+                        tool["outputSchema"] = json!({"type": "object", "properties": properties});
+                    }
+                    _ => unreachable!(),
+                }
+                let finding = evaluate(&[tool], &ClientLimitOverrides::new(), true)
+                    .into_iter()
+                    .find(|finding| finding.limit.name == row)
+                    .unwrap();
+                assert_eq!(finding.measured, target, "{}", finding.diagnostic());
+                assert_eq!(
+                    finding.status == Status::Fail,
+                    target > limit.budget,
+                    "inclusive boundary regression: {}",
+                    finding.diagnostic()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn serialized_response_artifacts_cross_each_client_cap_at_the_documented_boundary() {
+        for limit in HARNESS_LIMITS
+            .iter()
+            .filter(|limit| limit.applies_to == AppliesTo::Response)
+        {
+            let ratio = if limit.unit == "tokens" { 4 } else { 1 };
+            for delta in [-1isize, 0, 1] {
+                let target = limit.budget * ratio;
+                let target = target.checked_add_signed(delta).unwrap();
+                let empty =
+                    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text("")]);
+                let overhead = serde_json::to_string(&empty).unwrap().chars().count();
+                let result =
+                    rmcp::model::CallToolResult::success(vec![rmcp::model::ContentBlock::text(
+                        "x".repeat(target - overhead),
+                    )]);
+                let measured = serde_json::to_string(&result).unwrap().chars().count();
+                let finding =
+                    evaluate_response("synthetic", measured, &ClientLimitOverrides::new(), true)
+                        .into_iter()
+                        .find(|finding| finding.limit.name == limit.name)
+                        .unwrap();
+                assert_eq!(
+                    finding.status == Status::Fail,
+                    delta > 0,
+                    "{}",
+                    finding.diagnostic()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ledger_field_costs_measure_real_normalized_values_and_pins_in_both_directions() {
+        let mut tool = minimal_tool();
+        tool["inputSchema"]["properties"]["query"]["description"] = json!("x".repeat(6000));
+        tool["inputSchema"]["properties"]["inferred"] = json!({"enum": ["synthetic"]});
+        let ledger = stage_ledger(&[tool.clone()], None);
+        assert_eq!(ledger["stages"]["input_schema_client_normalized"]["bytes"],
+            ledger["tools"][0]["stages"]["input_schema_client_normalized"]["bytes"],
+            "The aggregate Codex stage must include inferred types, exactly like each per-tool budget; reproduce: aise mcp schema-budget --ledger. Use codex_measured_bytes at both aggregation and per-tool measurement.");
+        let query = ledger["tools"][0]["input_field_costs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|field| field["field"] == "query")
+            .unwrap();
+        assert_eq!(
+            query["normalized_value_bytes"],
+            codex_measured_bytes(&tool["inputSchema"]["properties"]["query"])
+        );
+        assert!(!ledger["tools"][0]["pin_changes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            ledger["limit_evidence"].as_array().unwrap().len(),
+            all_limits().count()
+        );
+        for measured in [99, 101] {
+            let message = describe_pin_change("synthetic", "inputSchema", measured, 100, "bytes");
+            assert!(message.contains("difference 1 bytes"), "{message}");
+            assert!(message.contains("same commit"), "{message}");
         }
     }
 
