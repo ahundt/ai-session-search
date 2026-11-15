@@ -499,11 +499,51 @@ const ATTRIBUTED_OR_UNATTRIBUTED_INPUT_SQL: &str = concat!(
 );
 const UNATTRIBUTED_QUEUED_INPUT_SQL: &str = concat!("(", unattributed_queued_input_sql!(), ")");
 /// Excludes the latest queued copy whose text equals the next direct human input in its session.
-/// An intervening direct input breaks the pair; each direct row absorbs at most one queue row.
+/// An intervening direct input breaks the pair; equal-sequence queued rows remain tied.
 /// The delivered row is the one read, so the input counts once.
-/// The lookup reads the session's human rows through
-/// `idx_messages_session_authorship_relation_seq`.
-const NOT_DELIVERED_QUEUED_COPY_SQL: &str = "not (
+/// Pairing is resolved once by an uncorrelated materialized relation, before caller date
+/// or attribution filters. Strict sequence ranges preserve ties: all queues at the latest
+/// matching sequence can pair with any matching direct row at the next direct sequence.
+/// Finding queued sessions scans N provenance-index entries once. For M original messages
+/// in those sessions and B content bytes, source seeks and window sorting cost O(M log N)
+/// row/key comparisons (each may compare content bytes), with O(M + B) SQLite temporary
+/// storage. Sessions without queued input do not enter the window sorts.
+/// Direct keys are read once through `idx_messages_session_authorship_relation_seq`
+/// into SQLite's composite IN-set, avoiding repeated scans even at tied sequences.
+/// Set construction and probes cost O(M log M) key comparisons. No durable storage is added.
+const NOT_DELIVERED_QUEUED_COPY_SQL: &str = "m.id not in (
+    with queued_sessions as materialized (
+        select distinct session_id
+        from messages queued_source indexed by idx_messages_session_authorship_relation_seq
+        where input_origin='queued' and record_relation='original'
+    ), pairing as materialized (
+        select id, session_id, seq, content, input_origin,
+            min(case when authorship='human' and coalesce(input_origin,'unknown')!='queued'
+                then seq end) over (
+                    partition by session_id order by seq
+                    range between 1 following and unbounded following) as next_direct,
+            min(case when input_origin='queued' and authorship in ('human','unknown')
+                then seq end) over (
+                    partition by session_id, content order by seq
+                    range between 1 following and unbounded following) as next_queued
+        from messages pairing_source indexed by idx_messages_session_seq
+        where record_relation='original'
+          and session_id in (select session_id from queued_sessions)
+    )
+    select q.id from pairing q
+    where q.input_origin='queued'
+      and (q.next_queued is null or q.next_queued >= q.next_direct)
+      and (q.session_id,q.next_direct,q.content) in (
+          select session_id,seq,content
+          from messages direct_source indexed by idx_messages_session_authorship_relation_seq
+          where authorship='human' and record_relation='original'
+            and coalesce(input_origin,'unknown')!='queued'
+            and session_id in (select session_id from queued_sessions)
+      )
+)";
+
+#[cfg(test)]
+const REFERENCE_QUEUED_COPY_SQL: &str = "not (
            coalesce(m.input_origin, 'unknown') = 'queued'
            and exists (
                select 1 from messages delivered
@@ -5025,8 +5065,10 @@ impl Db {
     /// Unknown authorship and mirror rows fail closed. Let `M` be structurally eligible messages,
     /// `P_h` human parts, and `B_h` emitted human bytes: work is `O(M + P_h + B_h)` plus the
     /// authoritative literal/regex predicate and output ordering; finite result memory is
-    /// `O(K + bytes(K))`, while an explicit unlimited request retains all matches. SQLite owns the
-    /// correlated part-scan state. This path deliberately does not use raw-content trigrams because
+    /// `O(K + bytes(K))`, while an explicit unlimited request retains all matches. Queued-copy
+    /// pairing adds the index scan, sorting, and temporary storage described by
+    /// [`NOT_DELIVERED_QUEUED_COPY_SQL`]. SQLite also owns the correlated part-scan state.
+    /// This path deliberately does not use raw-content trigrams because
     /// a match may cross two human fragments after an intervening generated fragment is removed.
     pub(crate) fn search_attributable_human_messages(
         &self,
@@ -6355,7 +6397,17 @@ const ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX: &str = "
      from messages m indexed by idx_messages_session_authorship_relation_seq
      where m.session_id = ?1";
 
+// Per-session statements run once per selected session. Bind the pairing input to that
+// same session before materialization, rather than rebuilding the corpus-wide relation.
+fn analysis_copy_exclusion_sql(copy_exclusion: &str) -> String {
+    copy_exclusion.replace(
+        "where input_origin='queued' and record_relation='original'",
+        "where session_id=?1 and input_origin='queued' and record_relation='original'",
+    )
+}
+
 fn analysis_message_counts_sql(copy_exclusion: &str) -> String {
+    let copy_exclusion = analysis_copy_exclusion_sql(copy_exclusion);
     format!(
         "{ANALYSIS_MESSAGE_COUNTS_SQL_PREFIX}{copy_exclusion}{ANALYSIS_MESSAGE_COUNTS_SQL_SUFFIX}"
     )
@@ -6397,6 +6449,7 @@ const ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX: &str = "
      order by seq, message_id";
 
 fn analysis_attributable_human_messages_sql(copy_exclusion: &str) -> String {
+    let copy_exclusion = analysis_copy_exclusion_sql(copy_exclusion);
     format!(
         "{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_PREFIX}{copy_exclusion}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_MIDDLE}{copy_exclusion}{ANALYSIS_ATTRIBUTABLE_HUMAN_MESSAGES_SQL_SUFFIX}"
     )
@@ -15639,6 +15692,201 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    fn queued_test_db() -> (tempfile::TempDir, Db) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute_batch("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source) values('claude:queue','claude','queue','','/synthetic/queue','test','test')").unwrap();
+        (dir, db)
+    }
+
+    #[test]
+    fn queued_pairing_work_growth() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for size in [16, 32, 64] {
+            let (_dir, db) = queued_test_db();
+            for i in 0..size * 2 {
+                db.conn.execute("insert into messages(session_id,provider,seq,role,content,authorship,record_relation,input_origin) values('claude:queue','claude',?1,'user',?2,'human','original',?3)", params![i as i64,format!("distinct {i}"),if i < size { "queued" } else { "direct" }]).unwrap();
+            }
+            let count = Arc::new(AtomicUsize::new(0));
+            let calls = count.clone();
+            db.conn
+                .create_scalar_function(
+                    "count_equal",
+                    2,
+                    rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                    move |ctx| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        Ok(ctx.get::<String>(0)? == ctx.get::<String>(1)?)
+                    },
+                )
+                .unwrap();
+            let predicate = REFERENCE_QUEUED_COPY_SQL.replace(
+                "delivered.content = m.content",
+                "count_equal(delivered.content,m.content)",
+            );
+            let retained: i64 = db
+                .conn
+                .query_row(
+                    &format!("select count(*) from messages m where {predicate}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, (size * 2) as i64);
+            let comparisons = count.load(Ordering::Relaxed);
+            println!("queued={size} comparisons={comparisons}");
+            assert_eq!(comparisons, size * size);
+            count.store(0, Ordering::Relaxed);
+            let calls = count.clone();
+            db.conn
+                .create_scalar_function(
+                    "count_visit",
+                    1,
+                    rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                    move |ctx| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        ctx.get::<i64>(0)
+                    },
+                )
+                .unwrap();
+            let predicate = NOT_DELIVERED_QUEUED_COPY_SQL
+                .replace(
+                    "select id, session_id",
+                    "select count_visit(id) as id, session_id",
+                )
+                .replace(
+                    "select session_id,seq,content",
+                    "select session_id,count_visit(seq),content",
+                );
+            let retained: i64 = db
+                .conn
+                .query_row(
+                    &format!("select count(*) from messages m where {predicate}"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained, (size * 2) as i64);
+            let visits = count.load(Ordering::Relaxed);
+            println!("queued={size} pairing_and_direct_rows={visits}");
+            assert_eq!(visits, size * 3);
+            for exclusion in [REFERENCE_QUEUED_COPY_SQL, NOT_DELIVERED_QUEUED_COPY_SQL] {
+                let plan = db
+                    .conn
+                    .prepare(&format!(
+                        "explain query plan select m.id from messages m where {exclusion}"
+                    ))
+                    .unwrap()
+                    .query_map([], |r| r.get::<_, String>(3))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+                    .join("\n");
+                println!("queued={size}\n{plan}");
+                assert!(
+                    plan.contains("idx_messages_session_authorship_relation_seq"),
+                    "{plan}"
+                );
+                if exclusion == NOT_DELIVERED_QUEUED_COPY_SQL {
+                    assert!(plan.contains("MATERIALIZE pairing"), "{plan}");
+                    assert!(!plan.contains("CORRELATED"), "{plan}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn queued_pairing_matches_quadratic_reference() {
+        let (_dir, db) = queued_test_db();
+        let mut seed = 71_u64;
+        for _ in 0..512 {
+            db.conn.execute("delete from messages", []).unwrap();
+            let mut rows = Vec::new();
+            for _ in 0..32 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let seq = ((seed >> 32) % 12) as i64;
+                let content = ["same", "different", "Same", "same ", ""][(seed >> 24) as usize % 5];
+                let author = ["human", "unknown", "mixed", "agent"][(seed >> 16) as usize % 4];
+                let origin = [Some("queued"), Some("direct"), None][(seed >> 8) as usize % 3];
+                let relation = if seed & 1 == 0 { "original" } else { "mirror" };
+                db.conn.execute("insert into messages(session_id,provider,seq,role,content,authorship,record_relation,input_origin) values('claude:queue','claude',?1,'user',?2,?3,?4,?5)", params![seq,content,author,relation,origin]).unwrap();
+                rows.push((
+                    db.conn.last_insert_rowid(),
+                    seq,
+                    content,
+                    author,
+                    relation,
+                    origin,
+                ));
+            }
+            let expected: Vec<i64> = rows
+                .iter()
+                .filter(|q| {
+                    let next_direct = rows
+                        .iter()
+                        .filter(|d| {
+                            d.3 == "human"
+                                && d.4 == "original"
+                                && d.5 != Some("queued")
+                                && d.1 > q.1
+                        })
+                        .map(|d| d.1)
+                        .min();
+                    let next_queued = rows
+                        .iter()
+                        .filter(|n| {
+                            matches!(n.3, "human" | "unknown")
+                                && n.4 == "original"
+                                && n.5 == Some("queued")
+                                && n.2 == q.2
+                                && n.1 > q.1
+                        })
+                        .map(|n| n.1)
+                        .min();
+                    let delivered = next_direct.is_some_and(|seq| {
+                        next_queued.is_none_or(|queued| queued >= seq)
+                            && rows.iter().any(|d| {
+                                d.1 == seq
+                                    && d.2 == q.2
+                                    && d.3 == "human"
+                                    && d.4 == "original"
+                                    && d.5 != Some("queued")
+                            })
+                    });
+                    q.4 == "original" && !(q.5 == Some("queued") && delivered)
+                })
+                .map(|q| q.0)
+                .collect();
+            db.conn
+                .execute(
+                    "update messages set ts=printf('2026-01-%02dT00:00:00Z',seq+1)",
+                    [],
+                )
+                .unwrap();
+            for exclusion in [REFERENCE_QUEUED_COPY_SQL, NOT_DELIVERED_QUEUED_COPY_SQL] {
+                for dated in [false, true] {
+                    let scope = if dated {
+                        "m.ts >= '2026-01-07T00:00:00Z'"
+                    } else {
+                        "1=1"
+                    };
+                    let scoped_expected: Vec<i64> = expected
+                        .iter()
+                        .copied()
+                        .filter(|id| !dated || rows.iter().any(|r| r.0 == *id && r.1 >= 6))
+                        .collect();
+                    let actual = db.conn.prepare(&format!("select m.id from messages m where m.record_relation='original' and {exclusion} and {scope} order by m.id")).unwrap()
+                        .query_map([], |r| r.get::<_, i64>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                    assert_eq!(actual, scoped_expected);
+                    let scoped_exclusion = analysis_copy_exclusion_sql(exclusion);
+                    let actual = db.conn.prepare(&format!("select m.id from messages m where m.session_id=?1 and m.record_relation='original' and {scoped_exclusion} and {scope} order by m.id")).unwrap()
+                        .query_map(["claude:queue"], |r| r.get::<_, i64>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+                    assert_eq!(actual, scoped_expected);
+                }
+            }
+        }
     }
 
     #[test]
