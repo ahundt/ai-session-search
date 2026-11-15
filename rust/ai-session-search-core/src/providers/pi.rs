@@ -699,37 +699,59 @@ struct PiParentCopy {
     consumed: HashSet<String>,
 }
 
+// Admission bounds retained maps, not transient evidence needed by the current parse.
+const PI_PARENT_CACHE_MAX_ENTRIES: usize = 4096;
+const PI_PARENT_CACHE_MAX_ID_BYTES: usize = 256 * 1024;
+type PiParentStamp = (file_id::FileId, u64, std::time::SystemTime);
+type PiParentCache = Option<(PathBuf, PiParentStamp, PiParentCopy)>;
+
+#[cfg(test)]
+thread_local! {
+    // Isolate counter-based tests from unrelated concurrent parser tests. Production uses
+    // one process-wide slot below; both call the same read_cached implementation.
+    static PI_PARENT_CACHE: std::cell::RefCell<PiParentCache> = const { std::cell::RefCell::new(None) };
+}
+
 impl PiParentCopy {
+    /// Cache one most-recent successful parent, at most 4096 entry IDs and 256 KiB of IDs.
+    /// The byte budget includes the session ID.
+    /// Active parses own Arc snapshots independently. Oversized parents still classify
+    /// correctly but rescan on every call, including both parser calls of one refresh.
+    /// Misses are serialized while scanning; no negative or deleted-parent entry is retained.
     fn read(child: &Path, parent: &str) -> Option<Self> {
-        // One current snapshot per canonical parent, shared across adapters and refreshes
-        // in this process. Cost is O(sum of distinct parent entries), not parent bytes or
-        // refresh count. Replacing a stamp drops the old snapshot once its readers finish.
-        // Per-parent locks prevent duplicate scans without serializing unrelated parents.
-        type Stamp = (file_id::FileId, u64, std::time::SystemTime);
-        type Slot = std::sync::Arc<std::sync::Mutex<Option<(Stamp, Option<PiParentCopy>)>>>;
-        type Cache = std::sync::Mutex<HashMap<PathBuf, Slot>>;
-        static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+        #[cfg(test)]
+        {
+            PI_PARENT_CACHE.with(|cache| Self::read_cached(child, parent, &mut cache.borrow_mut()))
+        }
+        #[cfg(not(test))]
+        {
+            static CACHE: std::sync::Mutex<PiParentCache> = std::sync::Mutex::new(None);
+            Self::read_cached(
+                child,
+                parent,
+                &mut CACHE.lock().unwrap_or_else(|e| e.into_inner()),
+            )
+        }
+    }
+
+    fn read_cached(child: &Path, parent: &str, cache: &mut PiParentCache) -> Option<Self> {
+        // Taking the slot first clears stale, failed and missing parents on every early exit.
+        let previous = cache.take();
         let parent = std::fs::canonicalize(child.parent()?.join(parent)).ok()?;
         if parent == std::fs::canonicalize(child).ok()? {
             return None;
         }
-        let stamp = || -> Option<Stamp> {
+        let stamp = || -> Option<PiParentStamp> {
             let identity = file_id::get_file_id(&parent).ok()?;
             let metadata = std::fs::metadata(&parent).ok()?;
             Some((identity, metadata.len(), metadata.modified().ok()?))
         };
-        let slot = CACHE
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entry(parent.clone())
-            .or_default()
-            .clone();
-        let mut cache = slot.lock().unwrap_or_else(|e| e.into_inner());
         let before = stamp()?;
-        if let Some((cached_stamp, snapshot)) = cache.as_ref() {
-            if cached_stamp == &before {
-                return snapshot.clone();
+        if let Some((path, cached_stamp, snapshot)) = previous {
+            if path == parent && cached_stamp == before {
+                let result = snapshot.clone();
+                *cache = Some((path, cached_stamp, snapshot));
+                return Some(result);
             }
         }
         let file = std::fs::File::open(&parent).ok()?;
@@ -738,37 +760,44 @@ impl PiParentCopy {
             let (count, bytes) = reads.get();
             reads.set((count + 1, bytes + before.1));
         });
-        let snapshot = (|| {
-            let mut session_id = None;
-            let mut entries = HashMap::new();
-            for line in crate::util::lines_replacing_invalid_utf8(std::io::BufReader::new(&file)) {
-                let line = line.ok()?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let value: Value = serde_json::from_str(&line).ok()?;
-                if value.get("type").and_then(Value::as_str) == Some("session") {
-                    session_id = value.get("id").and_then(Value::as_str).map(str::to_owned);
-                } else if let Some((id, digest)) = Self::key(&value) {
-                    entries
-                        .entry(id)
-                        .and_modify(|entry| *entry = None)
-                        .or_insert(Some(digest));
+        let mut session_id = None;
+        let mut entries = HashMap::new();
+        let mut id_bytes = 0usize;
+        for line in crate::util::lines_replacing_invalid_utf8(std::io::BufReader::new(&file)) {
+            let line = line.ok()?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let value: Value = serde_json::from_str(&line).ok()?;
+            if value.get("type").and_then(Value::as_str) == Some("session") {
+                session_id = value.get("id").and_then(Value::as_str).map(str::to_owned);
+            } else if let Some((id, digest)) = Self::key(&value) {
+                match entries.entry(id) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        entry.insert(None);
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        id_bytes = id_bytes.saturating_add(entry.key().len());
+                        entry.insert(Some(digest));
+                    }
                 }
             }
-            Some(Self {
-                session_id: session_id?,
-                entries: std::sync::Arc::new(entries),
-                consumed: HashSet::new(),
-            })
-        })();
+        }
+        let snapshot = Self {
+            session_id: session_id?,
+            entries: std::sync::Arc::new(entries),
+            consumed: HashSet::new(),
+        };
         let after = file.metadata().ok()?;
         if before != stamp()? || before.1 != after.len() || before.2 != after.modified().ok()? {
-            *cache = None;
             return None;
         }
-        *cache = Some((before, snapshot.clone()));
-        snapshot
+        if snapshot.entries.len() <= PI_PARENT_CACHE_MAX_ENTRIES
+            && id_bytes.saturating_add(snapshot.session_id.len()) <= PI_PARENT_CACHE_MAX_ID_BYTES
+        {
+            *cache = Some((parent, before, snapshot.clone()));
+        }
+        Some(snapshot)
     }
 
     fn key(value: &Value) -> Option<(String, [u8; 32])> {
@@ -1461,6 +1490,80 @@ mod tests {
     }
 
     #[test]
+    fn parent_cache_retains_only_the_last_parent_and_rejects_oversized_maps() {
+        use super::PiParentCopy;
+        use serde_json::json;
+        let dir = tempdir().unwrap();
+        let child = dir.path().join("child.jsonl");
+        fs::write(&child, "").unwrap();
+        let record =
+            json!({"type":"message","id":"entry","message":{"role":"user","content":"same"}});
+        let body = format!("{}\n{record}\n", json!({"type":"session","id":"parent"}));
+        for name in ["one.jsonl", "two.jsonl"] {
+            fs::write(dir.path().join(name), &body).unwrap();
+        }
+        super::PI_PARENT_READS.with(|reads| reads.set((0, 0)));
+        for name in ["one.jsonl", "two.jsonl", "one.jsonl", "two.jsonl"] {
+            assert!(PiParentCopy::read(&child, name).unwrap().take_copy(&record));
+            super::PI_PARENT_CACHE.with(|cache| {
+                let cache = cache.borrow();
+                assert_eq!(cache.iter().count(), 1);
+                let (path, _, snapshot) = cache.as_ref().unwrap();
+                assert_eq!(path.file_name().unwrap(), name);
+                assert_eq!(snapshot.entries.len(), 1);
+                assert_eq!(snapshot.entries.keys().map(String::len).sum::<usize>(), 5);
+            });
+        }
+        assert_eq!(
+            super::PI_PARENT_READS.with(|reads| reads.get()),
+            (4, 4 * body.len() as u64)
+        );
+        let mut large = format!("{}\n", json!({"type":"session","id":"large"}));
+        for id in 0..4097 {
+            large.push_str(&format!("{}\n", json!({"type":"message","id":format!("entry-{id}"),"message":{"role":"user","content":"same"}})));
+        }
+        fs::write(dir.path().join("large.jsonl"), &large).unwrap();
+        let copied =
+            json!({"type":"message","id":"entry-4096","message":{"role":"user","content":"same"}});
+        super::PI_PARENT_READS.with(|reads| reads.set((0, 0)));
+        for _ in 0..2 {
+            assert!(PiParentCopy::read(&child, "large.jsonl")
+                .unwrap()
+                .take_copy(&copied));
+            super::PI_PARENT_CACHE.with(|cache| assert!(cache.borrow().is_none()));
+        }
+        assert_eq!(
+            super::PI_PARENT_READS.with(|reads| reads.get()),
+            (2, 2 * large.len() as u64)
+        );
+        // The independent ID-byte bound also rejects a map with just one entry.
+        let long_id = "x".repeat(super::PI_PARENT_CACHE_MAX_ID_BYTES + 1);
+        let copied =
+            json!({"type":"message","id":long_id,"message":{"role":"user","content":"same"}});
+        let large = format!("{}\n{copied}\n", json!({"type":"session","id":"large"}));
+        fs::write(dir.path().join("large.jsonl"), &large).unwrap();
+        super::PI_PARENT_READS.with(|reads| reads.set((0, 0)));
+        for _ in 0..2 {
+            assert!(PiParentCopy::read(&child, "large.jsonl")
+                .unwrap()
+                .take_copy(&copied));
+            super::PI_PARENT_CACHE.with(|cache| assert!(cache.borrow().is_none()));
+        }
+        assert_eq!(
+            super::PI_PARENT_READS.with(|reads| reads.get()),
+            (2, 2 * large.len() as u64)
+        );
+        assert!(PiParentCopy::read(&child, "one.jsonl").is_some());
+        fs::rename(dir.path().join("one.jsonl"), dir.path().join("moved.jsonl")).unwrap();
+        assert!(PiParentCopy::read(&child, "one.jsonl").is_none());
+        super::PI_PARENT_CACHE.with(|cache| assert!(cache.borrow().is_none()));
+        assert!(PiParentCopy::read(&child, "two.jsonl").is_some());
+        fs::create_dir(dir.path().join("unreadable.jsonl")).unwrap();
+        assert!(PiParentCopy::read(&child, "unreadable.jsonl").is_none());
+        super::PI_PARENT_CACHE.with(|cache| assert!(cache.borrow().is_none()));
+    }
+
+    #[test]
     fn parent_cache_validates_identity_and_stamp_and_consumes_per_parse() {
         use super::PiParentCopy;
         use serde_json::json;
@@ -1504,11 +1607,12 @@ mod tests {
         let mut grown = PiParentCopy::read(&child, "parent.jsonl").unwrap();
         assert!(!grown.take_copy(&record));
         assert_eq!(super::PI_PARENT_READS.with(|reads| reads.get().0), 3);
-        // Cache invalid parent evidence too, rather than rescanning twice per tail refresh.
+        // Failed reads are not retained; each call retries invalid parent evidence.
         fs::write(&parent, "not json\n").unwrap();
         assert!(PiParentCopy::read(&child, "parent.jsonl").is_none());
         assert!(PiParentCopy::read(&child, "parent.jsonl").is_none());
-        assert_eq!(super::PI_PARENT_READS.with(|reads| reads.get().0), 4);
+        assert_eq!(super::PI_PARENT_READS.with(|reads| reads.get().0), 5);
+        super::PI_PARENT_CACHE.with(|cache| assert!(cache.borrow().is_none()));
     }
 
     #[test]
