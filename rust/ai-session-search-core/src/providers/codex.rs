@@ -875,6 +875,10 @@ impl CodexAdapter {
         // Only the first one identifies this file, so bind the id once. See the guard below.
         let mut session_id_bound = false;
         let mut header_spawn_origin = stored_spawn;
+        let mut spawn_header = stored_session
+            .and_then(|session| session.raw_metadata_json.as_deref())
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|metadata| metadata.get(SPAWN_HEADER_KEY).cloned());
         let mut cwd = None;
         let mut created_at = None;
         let mut updated_at = None;
@@ -900,8 +904,8 @@ impl CodexAdapter {
         let mut fork_parent = None;
         let mut replayed_file_edits = None;
 
-        for line in crate::util::lines_with_byte_offsets(reader) {
-            let (byte_offset, line) = line?;
+        for line in crate::util::lines_with_source_bytes(reader) {
+            let (byte_offset, source_bytes, line) = line?;
             unrecognized.record(context, byte_offset);
             let is_new = context.is_none_or(|c| byte_offset >= c.new_bytes_start);
             let count_line = !seeded_counts || is_new;
@@ -959,6 +963,13 @@ impl CodexAdapter {
                             );
                         }
                         if !session_id_bound {
+                            if context.is_none() {
+                                spawn_header = Some(json!({
+                                    "offset": byte_offset,
+                                    "length": source_bytes.len(),
+                                    "sha256": crate::hashing::sha256(&source_bytes),
+                                }));
+                            }
                             fork_parent = payload
                                 .get("forked_from_id")
                                 .and_then(Value::as_str)
@@ -1396,6 +1407,9 @@ impl CodexAdapter {
         // full-parse result; sidecar values remain authoritative when present.
         let parent_session_id = parent_session_id.or(header_spawn_origin.0);
         let agent_label = agent_label.or(header_spawn_origin.1);
+        if let Some(header) = spawn_header {
+            raw_metadata[SPAWN_HEADER_KEY] = header;
+        }
         unrecognized.publish(&mut raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
         let agent_started = parent_session_id.is_some() || agent_label.is_some();
@@ -1462,6 +1476,59 @@ impl CodexAdapter {
             .and_then(|captures| captures.get(1))
             .map(|match_| match_.as_str().to_string())
     }
+}
+
+pub(crate) const SPAWN_HEADER_KEY: &str = "codex_spawn_header";
+
+#[derive(serde::Deserialize)]
+struct SpawnHeaderCheckpoint {
+    offset: u64,
+    length: u64,
+    sha256: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_SPAWN_HEADER_VALIDATION_BYTES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// Validate the record that supplied stored provenance, not an arbitrary file prefix.
+// Hash one bounded range in O(header bytes) time and O(1) streaming memory.
+// Missing checkpoints from older indexes safely request one full parse.
+pub(crate) fn spawn_header_is_current(
+    path: &Path,
+    session: &SessionRecord,
+    checkpoint_offset: i64,
+) -> bool {
+    use std::io::{Read as _, Seek as _};
+    let checkpoint = session
+        .raw_metadata_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|metadata| metadata.get(SPAWN_HEADER_KEY).cloned())
+        .and_then(|value| serde_json::from_value::<SpawnHeaderCheckpoint>(value).ok());
+    let Some(checkpoint) = checkpoint else {
+        return false;
+    };
+    if checkpoint.length == 0
+        || checkpoint
+            .offset
+            .checked_add(checkpoint.length)
+            .is_none_or(|end| end > checkpoint_offset as u64)
+    {
+        return false;
+    }
+    let validate = || -> std::io::Result<bool> {
+        let mut file = fs::File::open(path)?;
+        file.seek(std::io::SeekFrom::Start(checkpoint.offset))?;
+        let mut range = file.take(checkpoint.length);
+        let digest = crate::hashing::sha256_reader(&mut range)?;
+        #[cfg(test)]
+        TEST_SPAWN_HEADER_VALIDATION_BYTES
+            .with(|counts| counts.borrow_mut().push(checkpoint.length - range.limit()));
+        Ok(range.limit() == 0 && digest == checkpoint.sha256)
+    };
+    validate().unwrap_or(false)
 }
 
 #[derive(Debug, Clone)]
@@ -2607,6 +2674,55 @@ mod tests {
         )
         .unwrap();
         path
+    }
+
+    #[test]
+    fn spawn_header_checkpoint_uses_byte_offsets_and_rejects_invalid_ranges() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("synthetic.jsonl");
+        let header = json!({"type":"session_meta","padding":"invalid x","payload":{"id":"synthetic","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent","agent_nickname":"worker 🦀"}}}}}).to_string();
+        let prefix = " \r\n";
+        let mut source = format!("{prefix}{header}\r\n").into_bytes();
+        source[prefix.len() + header.find("invalid x").unwrap() + "invalid ".len()] = 0xff;
+        fs::write(&path, &source).unwrap();
+        let parsed = CodexAdapter::new(vec![]).parse_inner(&path).unwrap();
+        let mut session = parsed.session;
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        let stored = metadata[super::SPAWN_HEADER_KEY].clone();
+        assert_eq!(stored["offset"], prefix.len());
+        assert_eq!(stored["length"], header.len() + 1);
+        assert_eq!(
+            stored["sha256"],
+            crate::hashing::sha256(&source[prefix.len()..source.len() - 1])
+        );
+        assert!(super::spawn_header_is_current(
+            &path,
+            &session,
+            source.len() as i64
+        ));
+        for checkpoint in [
+            serde_json::Value::Null,
+            json!({"offset": u64::MAX, "length": 2, "sha256":"invalid"}),
+            json!({"offset": 0, "length": source.len() + 1, "sha256":"invalid"}),
+            json!({"offset": prefix.len(), "length": header.len(), "sha256":"invalid"}),
+        ] {
+            metadata[super::SPAWN_HEADER_KEY] = checkpoint;
+            session.raw_metadata_json = Some(metadata.to_string());
+            assert!(!super::spawn_header_is_current(
+                &path,
+                &session,
+                source.len() as i64
+            ));
+        }
+        metadata[super::SPAWN_HEADER_KEY] = stored;
+        session.raw_metadata_json = Some(metadata.to_string());
+        fs::write(&path, prefix).unwrap();
+        assert!(!super::spawn_header_is_current(
+            &path,
+            &session,
+            source.len() as i64
+        ));
     }
 
     #[cfg(unix)]

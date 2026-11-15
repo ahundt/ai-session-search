@@ -1792,6 +1792,8 @@ fn tail_requires_full_parse(session: &crate::models::SessionRecord) -> bool {
 /// O(B + A) transcript bytes in SQLite, including transient memory, for B stored bytes.
 /// Returned messages retain O(A + overlap) bytes. Digest validation shares the tail buffer,
 /// adding O(overlap) hashing and no file I/O, plus existing table/FTS maintenance costs.
+/// Stored Codex spawn context also validates its header record with one bounded range
+/// read, adding O(H) hashing/I/O and O(1) streaming memory for H header bytes.
 fn try_tail<F>(
     source: &SourceFile,
     source_path: &str,
@@ -1863,6 +1865,14 @@ where
             && session.source_path == source_path
             && session.parse_version == crate::util::provider_parse_version(source.provider)
     });
+    if source.provider == Provider::Codex
+        && validated_session.is_some_and(|session| {
+            (session.parent_session_id.is_some() || session.agent_label.is_some())
+                && !crate::providers::codex::spawn_header_is_current(&source.path, session, offset)
+        })
+    {
+        return Ok(TailOutcome::FullParse);
+    }
     match crate::tail::tail_parse_until(
         &source.path,
         offset,
@@ -3623,6 +3633,116 @@ mod tests {
     }
 
     #[test]
+    fn codex_spawn_header_rewrite_beyond_fingerprint_matches_full_index() {
+        use std::io::{Seek as _, Write as _};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let id = "019efd97-d602-7922-89dd-467272106505";
+        let path = root.join(format!("rollout-2026-06-25T03-04-06-{id}.jsonl"));
+        // Explicit ordering places the changed provenance beyond the head fingerprint.
+        let header = format!(
+            r#"{{"type":"session_meta","padding":"{}","payload":{{"id":"{id}","timestamp":"2026-06-25T03:04:06Z","source":{{"subagent":{{"thread_spawn":{{"parent_thread_id":"root-session","agent_nickname":"worker"}}}}}}}}}}"#,
+            "x".repeat(8192)
+        );
+        let user = |text: &str| {
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"response_item","timestamp":"2026-06-25T03:04:07Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":text}]}})
+            )
+        };
+        let mut initial = format!("{header}\n{}", user("initial prompt"));
+        while initial.len() < header.len() + crate::tail::OVERLAP_BYTES as usize + 8192 {
+            initial.push_str(&format!("{}\n", serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(4096)}]}})));
+        }
+        std::fs::write(&path, &initial).unwrap();
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![normalize_path(&root)];
+        let db = Db::open(&db_path).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let identity = file_id::get_file_id(&path).unwrap();
+        let worker_offset = header.find("worker").unwrap();
+        assert!(worker_offset > crate::tail::FINGERPRINT_LEN);
+        let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(std::io::SeekFrom::Start(worker_offset as u64))
+            .unwrap();
+        file.write_all(b"helper").unwrap();
+        assert_eq!(file.metadata().unwrap().len(), initial.len() as u64);
+        drop(file);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(user("appended prompt").as_bytes())
+            .unwrap();
+        assert_eq!(file_id::get_file_id(&path).unwrap(), identity);
+        assert_eq!(
+            &std::fs::read(&path).unwrap()[..crate::tail::FINGERPRINT_LEN],
+            &initial.as_bytes()[..crate::tail::FINGERPRINT_LEN]
+        );
+        TEST_TAIL_OUTCOMES.with(|counts| counts.borrow_mut().clear());
+        crate::providers::codex::TEST_SPAWN_HEADER_VALIDATION_BYTES
+            .with(|counts| counts.borrow_mut().clear());
+        reindex(&config, &db, false, None).unwrap();
+        crate::providers::codex::TEST_SPAWN_HEADER_VALIDATION_BYTES
+            .with(|counts| assert_eq!(*counts.borrow(), vec![header.len() as u64]));
+        let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+        reindex(&config, &fresh, true, None).unwrap();
+        let session_id = format!("codex:{id}");
+        let actual = db.resolve_session_record(&session_id).unwrap();
+        let expected = fresh.resolve_session_record(&session_id).unwrap();
+        assert_eq!(expected.agent_label.as_deref(), Some("helper"));
+        assert_eq!(
+            actual.agent_label, expected.agent_label,
+            "spawn attribution differs from full index"
+        );
+        assert_eq!(actual.parent_session_id, expected.parent_session_id);
+        TEST_TAIL_OUTCOMES
+            .with(|counts| assert_eq!(*counts.borrow(), vec![TailOutcome::FullParse]));
+        let attribution = |path: &Path| {
+            rusqlite::Connection::open(path).unwrap()
+                .prepare("select json_array(seq,role,content,authorship,input_origin,record_relation) from messages order by seq,id").unwrap()
+                .query_map([], |row| row.get::<_, String>(0)).unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        assert_eq!(
+            attribution(&db_path),
+            attribution(&dir.path().join("fresh.db"))
+        );
+
+        // A pre-checkpoint row retains all existing fields and its parser version.
+        rusqlite::Connection::open(&db_path).unwrap().execute(
+            "update sessions set raw_metadata_json = json_remove(raw_metadata_json, '$.codex_spawn_header')", []
+        ).unwrap();
+        TEST_TAIL_OUTCOMES.with(|counts| counts.borrow_mut().clear());
+        for turn in 0..2 {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(user(&format!("upgrade prompt {turn}")).as_bytes())
+                .unwrap();
+            reindex(&config, &db, false, None).unwrap();
+            let stored = db.resolve_session_record(&session_id).unwrap();
+            let metadata: serde_json::Value =
+                serde_json::from_str(stored.raw_metadata_json.as_deref().unwrap()).unwrap();
+            assert_eq!(
+                metadata[crate::providers::codex::SPAWN_HEADER_KEY]["length"],
+                header.len()
+            );
+            assert_eq!(stored.agent_label.as_deref(), Some("helper"));
+        }
+        TEST_TAIL_OUTCOMES.with(|counts| {
+            assert_eq!(
+                *counts.borrow(),
+                vec![TailOutcome::FullParse, TailOutcome::Appended]
+            )
+        });
+    }
+
+    #[test]
     fn codex_spawn_metadata_beyond_overlap_reuses_validated_context() {
         use std::io::Write as _;
 
@@ -3646,6 +3766,7 @@ mod tests {
         })
         .to_string()
             + "\n";
+        let header_length = initial.len() as u64 - 1;
         initial.push_str(concat!(
             r#"{"type":"response_item","timestamp":"2026-06-25T03:04:06Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"spawned tail prompt"}]}}"#,
             "\n"
@@ -3684,6 +3805,8 @@ mod tests {
         );
 
         let mut outcomes = Vec::new();
+        crate::providers::codex::TEST_SPAWN_HEADER_VALIDATION_BYTES
+            .with(|counts| counts.borrow_mut().clear());
         for turn in 0..10 {
             writeln!(
                 std::fs::OpenOptions::new()
@@ -3751,6 +3874,8 @@ mod tests {
         }
         eprintln!("10 append outcomes: {outcomes:?}");
         assert_eq!(outcomes, vec![TailOutcome::Appended; 10]);
+        crate::providers::codex::TEST_SPAWN_HEADER_VALIDATION_BYTES
+            .with(|counts| assert_eq!(*counts.borrow(), vec![header_length; 10]));
         let filters = crate::models::MessageFilters {
             role: Some(crate::models::Role::User),
             session_id: Some(session_id),
@@ -3767,7 +3892,7 @@ mod tests {
             11
         );
 
-        let assert_full_fallback = || {
+        let assert_full_fallback = |case| {
             let adapters = ProviderSet::new(&config);
             let source = adapters.discover_enabled(&config).sources.remove(0);
             let outcome = try_tail(
@@ -3783,7 +3908,7 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(outcome, TailOutcome::FullParse);
+            assert_eq!(outcome, TailOutcome::FullParse, "{case}");
             reindex(&config, &db, false, None).unwrap();
         };
         let append_newline = || {
@@ -3799,7 +3924,7 @@ mod tests {
             .replace("worker", "helper");
         std::fs::write(&path, rewritten).unwrap();
         append_newline();
-        assert_full_fallback();
+        assert_full_fallback("rewritten header");
         assert_eq!(
             db.session_metadata(std::slice::from_ref(&format!("codex:{id}")))
                 .unwrap()[&format!("codex:{id}")]
@@ -3812,7 +3937,21 @@ mod tests {
         std::fs::write(&replacement, std::fs::read(&path).unwrap()).unwrap();
         std::fs::rename(&replacement, &path).unwrap();
         append_newline();
-        assert_full_fallback();
+        // File identity is checked by reindex before try_tail is called.
+        // Removing the receipt also proves that this path actually reparses.
+        rusqlite::Connection::open(&db_path).unwrap().execute(
+            "update sessions set raw_metadata_json = json_remove(raw_metadata_json, '$.codex_spawn_header')", []
+        ).unwrap();
+        TEST_TAIL_OUTCOMES.with(|counts| counts.borrow_mut().clear());
+        reindex(&config, &db, false, None).unwrap();
+        TEST_TAIL_OUTCOMES.with(|counts| assert!(counts.borrow().is_empty()));
+        let stored = db.resolve_session_record(&format!("codex:{id}")).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(stored.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            metadata[crate::providers::codex::SPAWN_HEADER_KEY]["length"],
+            header_length
+        );
 
         rusqlite::Connection::open(&db_path)
             .unwrap()
@@ -3822,7 +3961,7 @@ mod tests {
             )
             .unwrap();
         append_newline();
-        assert_full_fallback();
+        assert_full_fallback("stale parser");
     }
 
     #[test]
