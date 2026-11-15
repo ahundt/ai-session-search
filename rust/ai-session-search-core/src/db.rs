@@ -7632,8 +7632,9 @@ struct ClaudeInputMatch {
 /// order, reserving the original before the replay. Demotion requires BOTH parsed
 /// occurrences and a separate stored row after reserving the original. Replay-only
 /// evidence can match a known mirror, never a typed row, even at a unique timestamp.
-/// Unmatched archived rows retain their classification. New rows append; no existing
-/// row is deleted or renumbered. A known mirror is never consumed as a typed original.
+/// Unmatched archived rows retain their classification. This matcher only assigns
+/// occurrences; it does not delete or renumber rows. A known mirror is never consumed
+/// as a typed original. Identity-less legacy originals are reserved only for originals.
 ///
 /// The caller detects replay markers while building existing parsed keys and repeated
 /// stored UUIDs while building existing identity queues. Ordinary unique non-replay
@@ -7651,16 +7652,14 @@ fn claude_input_matches(
     for (position, (_, keys)) in stored.iter().enumerate() {
         #[cfg(test)]
         CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
-        if let Some(identity) = keys.correlation {
-            by_time
-                .entry((identity, keys.role_content_timestamp, keys.mirror))
-                .or_default()
-                .push_back(position);
-            by_content
-                .entry((identity, keys.role_and_content, keys.mirror))
-                .or_default()
-                .push_back(position);
-        }
+        by_time
+            .entry((keys.correlation, keys.role_content_timestamp, keys.mirror))
+            .or_default()
+            .push_back(position);
+        by_content
+            .entry((keys.correlation, keys.role_and_content, keys.mirror))
+            .or_default()
+            .push_back(position);
     }
     let mut consumed = vec![false; stored.len()];
     let mut originals = std::collections::HashSet::new();
@@ -7698,23 +7697,35 @@ fn claude_input_matches(
                 None
             };
             let mut matched = take(
-                by_time.get_mut(&(identity, keys.role_content_timestamp, replay)),
+                by_time.get_mut(&(Some(identity), keys.role_content_timestamp, replay)),
                 &mut consumed,
             )
             .or_else(|| {
                 take(
-                    by_content.get_mut(&(identity, keys.role_and_content, replay)),
+                    by_content.get_mut(&(Some(identity), keys.role_and_content, replay)),
                     &mut consumed,
                 )
             });
-            if replay && matched.is_none() && originals.contains(&group) {
+            if !replay && matched.is_none() {
                 matched = take(
-                    by_time.get_mut(&(identity, keys.role_content_timestamp, false)),
+                    by_time.get_mut(&(None, keys.role_content_timestamp, false)),
                     &mut consumed,
                 )
                 .or_else(|| {
                     take(
-                        by_content.get_mut(&(identity, keys.role_and_content, false)),
+                        by_content.get_mut(&(None, keys.role_and_content, false)),
+                        &mut consumed,
+                    )
+                });
+            }
+            if replay && matched.is_none() && originals.contains(&group) {
+                matched = take(
+                    by_time.get_mut(&(Some(identity), keys.role_content_timestamp, false)),
+                    &mut consumed,
+                )
+                .or_else(|| {
+                    take(
+                        by_content.get_mut(&(Some(identity), keys.role_and_content, false)),
                         &mut consumed,
                     )
                 });

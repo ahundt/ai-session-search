@@ -5150,13 +5150,14 @@ mod tests {
     fn replay_reconciliation_occurrence_matrix() {
         use crate::models::{MessageFilters, MessageRecordRelation, Role};
         // Stored: none, one typed original, typed original plus known mirror,
-        // and two or three legacy typed occurrences. Parsed: neither, original, replay, both.
+        // two or three legacy typed occurrences, an identity-less original, and a distinct
+        // native original. Parsed: neither, original, replay, both.
         for provider_path in [
             "sessions/synthetic.jsonl",
             "local-agent-mode-sessions/synthetic/audit.jsonl",
         ] {
             for time_mode in [1, 2, 0] {
-                for stored_mode in [1, 0, 2, 3, 4] {
+                for stored_mode in [5, 6, 1, 0, 2, 3, 4] {
                     for parsed_mode in [2, 1, 3, 0] {
                         let temp = tempdir().unwrap();
                         let path = temp.path().join(provider_path);
@@ -5200,13 +5201,23 @@ mod tests {
                             }
                             parsed
                         };
-                        let count = [0, 1, 2, 3, 2][stored_mode];
+                        let count = [0, 1, 2, 3, 2, 1, 1][stored_mode];
                         let mut old = parse(
                             (0..count)
                                 .map(|i| record(i, stored_mode == 2 && i == 1))
                                 .collect(),
                         );
                         old.session.parse_version = "claude-legacy".into();
+                        if stored_mode == 5 {
+                            old.messages[0].provenance.correlation_identity = None;
+                        } else if stored_mode == 6 {
+                            old.messages[0]
+                                .provenance
+                                .correlation_identity
+                                .as_mut()
+                                .unwrap()
+                                .id = "other-input".into();
+                        }
                         // Equal timestamps are distinct occurrences despite equal text.
                         if stored_mode == 3 || stored_mode == 4 {
                             old.messages = (0..count)
@@ -5241,17 +5252,22 @@ mod tests {
                         }
                         let current = parse(records);
                         assert_eq!(current.session.id, old.session.id);
-                        let initial_typed = [0, 1, 1, 3, 2][stored_mode];
-                        let expected = if parsed_mode == 3 && stored_mode >= 3 {
+                        let initial_typed = [0, 1, 1, 3, 2, 1, 1][stored_mode];
+                        let expected = if parsed_mode == 3 && matches!(stored_mode, 3 | 4) {
                             initial_typed - 1
-                        } else if stored_mode == 0 && parsed_mode & 1 != 0 {
-                            1
+                        } else if matches!(stored_mode, 0 | 6) && parsed_mode & 1 != 0 {
+                            initial_typed + 1
                         } else {
                             initial_typed
                         };
+                        let mut previous = None;
                         for generation in [2, 3] {
                             db.upsert_session(&current, generation, generation).unwrap();
                             let after = coordinates();
+                            if let Some(previous) = &previous {
+                                assert_eq!(&after, previous);
+                            }
+                            previous = Some(after.clone());
                             for coordinate in &before {
                                 assert!(after.contains(coordinate));
                             }
@@ -5282,6 +5298,27 @@ mod tests {
                                 }
                             );
                             assert_eq!(after.len(), expected + mirrors as usize);
+                            if stored_mode == 5 && parsed_mode == 3 {
+                                let fresh =
+                                    crate::db::Db::open(&temp.path().join("fresh.db")).unwrap();
+                                fresh.upsert_session(&current, 1, 1).unwrap();
+                                let projection = |db: &crate::db::Db| {
+                                    let mut rows = db
+                                        .search_messages("", &MessageFilters::default())
+                                        .unwrap()
+                                        .into_iter()
+                                        .map(|m| {
+                                            (
+                                                m.content,
+                                                serde_json::to_string(&m.provenance).unwrap(),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>();
+                                    rows.sort();
+                                    rows
+                                };
+                                assert_eq!(projection(&db), projection(&fresh));
+                            }
                             assert!(current.messages.iter().all(|m| m.provenance.record_relation
                                 == MessageRecordRelation::Original
                                 || m.provenance.record_relation == MessageRecordRelation::Mirror));
