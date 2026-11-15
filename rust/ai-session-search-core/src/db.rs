@@ -6133,21 +6133,13 @@ impl Db {
     }
 
     pub fn resolve_session(&self, value: &str) -> Result<SessionWithTranscript> {
-        let exact = self.session_resolution_matches(
-            RESOLVE_SESSION_EXACT_SQL,
+        self.resolve_session_payload(
             value,
-            row_to_session_with_transcript,
-        )?;
-        if !exact.is_empty() {
-            return unique_session_match(value, exact, |session| &session.session.id);
-        }
-        let prefix = literal_like_prefix_pattern(value);
-        let matches = self.session_resolution_matches(
+            RESOLVE_SESSION_EXACT_SQL,
             RESOLVE_SESSION_PREFIX_SQL,
-            &prefix,
             row_to_session_with_transcript,
-        )?;
-        unique_session_match(value, matches, |session| &session.session.id)
+            |session| &session.session.id,
+        )
     }
 
     /// Resolve an exact parent recorded by accessible children before trying session prefixes.
@@ -6164,21 +6156,13 @@ impl Db {
     }
 
     pub fn resolve_session_record(&self, value: &str) -> Result<SessionRecord> {
-        let exact = self.session_resolution_matches(
-            RESOLVE_SESSION_RECORD_EXACT_SQL,
+        self.resolve_session_payload(
             value,
-            row_to_session_record,
-        )?;
-        if !exact.is_empty() {
-            return unique_session_match(value, exact, |session| &session.id);
-        }
-        let prefix = literal_like_prefix_pattern(value);
-        let matches = self.session_resolution_matches(
+            RESOLVE_SESSION_RECORD_EXACT_SQL,
             RESOLVE_SESSION_RECORD_PREFIX_SQL,
-            &prefix,
             row_to_session_record,
-        )?;
-        unique_session_match(value, matches, |session| &session.id)
+            |session| &session.id,
+        )
     }
 
     /// Inspect one session's canonical transcript without cloning the complete TEXT value into
@@ -6208,6 +6192,23 @@ impl Db {
             drop(statement);
             result
         })
+    }
+
+    fn resolve_session_payload<T>(
+        &self,
+        value: &str,
+        exact_sql: &str,
+        prefix_sql: &str,
+        mapper: fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+        id: impl Fn(&T) -> &str,
+    ) -> Result<T> {
+        let exact = self.session_resolution_matches(exact_sql, value, mapper)?;
+        if !exact.is_empty() {
+            return unique_session_match(value, exact, id);
+        }
+        let prefix = literal_like_prefix_pattern(value);
+        let matches = self.session_resolution_matches(prefix_sql, &prefix, mapper)?;
+        unique_session_match(value, matches, id)
     }
 
     /// Query one exact or prefix session-resolution stage under the current access authority.
@@ -15139,6 +15140,50 @@ mod tests {
             0,
             "the earlier build's copy is emptied once"
         );
+    }
+
+    #[test]
+    fn session_resolution_payloads_preserve_exact_precedence_and_literal_prefixes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        for native in ["one", "one-more", "under_score", "under_score-more"] {
+            let id = format!("claude:{native}");
+            db.conn
+                .execute(
+                    "insert into sessions (id, provider, provider_session_id, preview_text, \
+                 source_path, parse_version, discovery_source) \
+                 values (?1, 'claude', ?2, '', '/p', '1', 'test')",
+                    params![id, native],
+                )
+                .unwrap();
+            db.conn
+                .execute(
+                    "insert into transcripts (session_id, transcript_text) values (?1, ?2)",
+                    params![id, format!("transcript {native}")],
+                )
+                .unwrap();
+        }
+        for (input, expected) in [
+            ("one", "one"),
+            ("claude:one", "one"),
+            ("one-m", "one-more"),
+            ("under_score", "under_score"),
+            ("under_score-m", "under_score-more"),
+        ] {
+            let full = db.resolve_session(input).unwrap();
+            assert_eq!(full.session.id, format!("claude:{expected}"));
+            assert_eq!(full.transcript_text, format!("transcript {expected}"));
+            assert_eq!(
+                db.resolve_session_record(input).unwrap().id,
+                full.session.id
+            );
+        }
+        for input in ["absent", "%", "_", "on", "under_"] {
+            assert_eq!(
+                db.resolve_session(input).unwrap_err().to_string(),
+                db.resolve_session_record(input).unwrap_err().to_string(),
+            );
+        }
     }
 
     #[test]
