@@ -1046,6 +1046,8 @@ class QueryScope:
 class SessionQuery:
     """Session list/search filters; None uses search.default_limit, 0 selects every match.
 
+    ``session_kinds`` (alias ``session_kind``) accepts a string or list; both spellings combine.
+
     ``dates`` intersects an inclusive query period with each known indexed session span from
     ``created_at`` through ``updated_at``. The span can contain gaps and does not assert continuous
     process activity. ``current_repo`` overrides repository-aware ranking. When omitted,
@@ -1075,7 +1077,8 @@ class SessionQuery:
         provider: _ProviderId | None = None,
         path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
-        session_kinds: list[_SessionKind] | None = None,
+        session_kinds: _SessionKind | list[_SessionKind] | None = None,
+        session_kind: _SessionKind | list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
         warnings_only: bool = False,
         current_repo: _PathInput | None = None,
@@ -1102,6 +1105,8 @@ class SqlSchemaResult:
 class AnalysisRequest:
     """Scope and explicit population strategy for longitudinal session analysis.
 
+    ``session_kinds`` (alias ``session_kind``) accepts a string or list; both spellings combine.
+
     Omit ``first_canonical_sessions`` to analyze every eligible session. A positive value selects
     the first N eligible sessions in canonical session-ID order; it is not a recency sample,
     representative sample, or message limit.
@@ -1127,7 +1132,8 @@ class AnalysisRequest:
         provider: _ProviderId | None = None,
         path_prefix: _PathInput | None = None,
         exclusions: QueryExclusions | None = None,
-        session_kinds: list[_SessionKind] | None = None,
+        session_kinds: _SessionKind | list[_SessionKind] | None = None,
+        session_kind: _SessionKind | list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
         warnings_only: bool = False,
         dates: DateRange | None = None,
@@ -1157,7 +1163,10 @@ class MessageExclusions:
 
 @final
 class MessageScope:
-    """Message-only scope with distinct workspace and transcript path domains."""
+    """Message-only scope with distinct workspace and transcript path domains.
+
+    ``session_kinds`` (alias ``session_kind``) accepts a string or list; both spellings combine.
+    """
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached JSON-ready dictionary using structured-output field names."""
@@ -1178,7 +1187,8 @@ class MessageScope:
         *,
         providers: list[_ProviderId] | None = None,
         session_id: str | None = None,
-        session_kinds: list[_SessionKind] | None = None,
+        session_kinds: _SessionKind | list[_SessionKind] | None = None,
+        session_kind: _SessionKind | list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
         workspace_path_prefix: _PathInput | None = None,
         transcript_path_prefix: _PathInput | None = None,
@@ -1189,6 +1199,9 @@ class MessageScope:
 @final
 class MessageSearchRequest:
     """Canonical message predicates, match window, presentation, extent, purpose, and receipt.
+
+    ``kinds`` (alias ``kind``) and ``session_kinds`` (alias ``session_kind``) accept strings or
+    lists; both spellings combine. Omit for the operation default; an empty list selects no classes.
 
     ``role="user"`` searches recorded user input across source roles, including queued
     submissions and linked answers. Known parent-agent prompts sent to spawned sessions are excluded
@@ -1248,8 +1261,8 @@ class MessageSearchRequest:
         *,
         scope: MessageScope | QueryScope | None = None,
         role: _MessageRole | None = None,
-        kind: _MessageKind | None = None,
-        kinds: list[_MessageKind] | None = None,
+        kind: _MessageKind | list[_MessageKind] | None = None,
+        kinds: _MessageKind | list[_MessageKind] | None = None,
         field: _SearchField = "content",
         argument_path: str | None = None,
         seq_from: int | None = None,
@@ -1276,7 +1289,8 @@ class MessageSearchRequest:
         session_id: str | None = None,
         workspace_path_prefix: _PathInput | None = None,
         dates: DateRange | None = None,
-        session_kinds: list[_SessionKind] | None = None,
+        session_kinds: _SessionKind | list[_SessionKind] | None = None,
+        session_kind: _SessionKind | list[_SessionKind] | None = None,
         parent_session_id: str | None = None,
     ) -> Self: ...
 
@@ -1320,7 +1334,10 @@ class SkillSelector:
 
 @final
 class MessageClassificationQuery:
-    """Typed arguments for the message-classification skill capability."""
+    """Typed arguments for the message-classification skill capability.
+
+    ``session_kinds`` (alias ``session_kind``) accepts a string or list; both spellings combine.
+    """
 
     def to_dict(self) -> dict[str, Any]:
         """Return a detached JSON-ready dictionary using structured-output field names."""
@@ -1358,7 +1375,8 @@ class MessageClassificationQuery:
         cls,
         *,
         scope: QueryScope | None = None,
-        session_kinds: list[str] | None = None,
+        session_kinds: str | list[str] | None = None,
+        session_kind: str | list[str] | None = None,
         additional_skills: list[SkillSelector] | None = None,
         limit: int | None = None,
         offset: int = 0,
@@ -1941,12 +1959,15 @@ class SessionSearch:
         seq_from: int | None = None,
         seq_to: int | None = None,
         lines_per_message: int = 0,
-        kinds: list[_MessageKind] | None = None,
+        kinds: _MessageKind | list[_MessageKind] | None = None,
+        kind: _MessageKind | list[_MessageKind] | None = None,
         dates: DateRange | None = None,
     ) -> list[MessageHit]:
         """Read one session's messages, selecting the oldest or newest ``limit`` by ``order``
         (``"oldest"``/``"newest"``), always returned chronologically. To page a long session,
-        advance ``seq_from`` (next chunk = last seq + 1) rather than growing ``limit``."""
+        advance ``seq_from`` (next chunk = last seq + 1) rather than growing ``limit``.
+        ``kinds`` (alias ``kind``) accepts a string or list; both spellings combine.
+        Omit for every class except harness_notice; an empty list selects no classes."""
         ...
     def schema(self, *, table: str | None = None, include_internal: bool = False) -> SqlSchemaResult:
         """Return schema objects or columns with semantic notes; allowed under every access scope."""
