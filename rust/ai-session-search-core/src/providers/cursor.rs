@@ -1355,6 +1355,86 @@ mod tests {
     }
 
     #[test]
+    fn appended_native_clock_survives_overlap_eviction_and_second_refresh() {
+        use std::io::Write;
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("projects");
+        let dir = root.join("empty-window").join("agent-transcripts");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synthetic.jsonl");
+        let turn = |day, text| {
+            let weekday = if day == 2 { "Monday" } else { "Tuesday" };
+            let content = format!("<timestamp>{weekday}, Nov {day}, 2026, 3:04 PM (UTC+0)</timestamp><user_query>{text}</user_query>");
+            assert!(super::cursor_native_timestamp(&content).is_some());
+            json!({"role":"user","message":{"content":content}})
+        };
+        fs::write(&path, format!("{}\n", turn(2, "first"))).unwrap();
+        let db_path = temp.path().join("index.db");
+        let config = cursor_fixture_config(&root, &db_path);
+        let db = crate::db::Db::open(&db_path).unwrap();
+        crate::indexer::reindex(&config, &db, false, None).unwrap();
+        let snapshot = |path: &std::path::Path| {
+            rusqlite::Connection::open(path)
+                .unwrap()
+                .prepare("select seq,ts from messages order by seq,id")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let mut appended = format!("{}\n", turn(3, "second"));
+        let mut n = 0;
+        while appended.len() < crate::tail::OVERLAP_BYTES as usize + 8192 {
+            appended.push_str(&format!("{}\n", json!({"role":"assistant","message":{"content":format!("reply {n} {}", "x".repeat(4096))}})));
+            n += 1;
+        }
+        for (refresh, text) in [
+            appended,
+            format!(
+                "{}\n",
+                json!({"role":"assistant","message":{"content":"next-day evidence"}})
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(text.as_bytes())
+                .unwrap();
+            crate::indexer::reindex(&config, &db, false, None).unwrap();
+            let fresh_path = temp.path().join(format!("fresh-{refresh}.db"));
+            let fresh = crate::db::Db::open(&fresh_path).unwrap();
+            crate::indexer::reindex(&config, &fresh, true, None).unwrap();
+            let actual = snapshot(&db_path);
+            let expected = snapshot(&fresh_path);
+            assert_eq!(actual.len(), expected.len());
+            for (actual, expected) in actual.iter().zip(&expected) {
+                assert_eq!(
+                    actual, expected,
+                    "refresh {refresh}: message timestamp differs from full index"
+                );
+            }
+        }
+        let filters = crate::models::MessageFilters {
+            since: crate::util::parse_datetime("2026-11-03T00:00:00Z"),
+            until: crate::util::parse_datetime("2026-11-03T23:59:59Z"),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_messages("next-day evidence", &filters)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn clockless_cursor_messages_remain_date_filterable() {
         let temp = tempdir().unwrap();
         let path = temp.path().join("synthetic.jsonl");
