@@ -69,7 +69,8 @@ types; malformed attachments and skipped binary payloads appear as parse warning
 Corrections and repeats use input with evidence of a human sender, including queued input. Older
 Claude Code transcripts can omit the sender: reports count those rows as `unattributed_input_count`
 and leave them out by default. Pass `--include-unattributed-input` to include them; a program may
-have sent them. `aise repeats --format json --report` includes that count alongside its groups.
+have sent them. `aise repeats --format json` returns one report object with those counts and
+`groups`; `--format jsonl` returns the same object on one line.
 
 The shipped correction categories are a small starter set of fixed phrasings. They will miss
 corrections worded for the situation. To find where a session went wrong, list its recorded input

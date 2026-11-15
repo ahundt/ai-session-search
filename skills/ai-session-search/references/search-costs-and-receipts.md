@@ -46,7 +46,9 @@ rows stay incremental. Linked Claude interactive answers, Codex `request_user_in
 and Codex `thread_settings_applied` records closing fork replay can also require earlier context.
 Refresh does not detect rewrites between the head fingerprint and overlap; use `aise reindex --full`.
 Codex fork reconciliation checks each fork's own edits; a parent edit reparses a fork only when
-that fork holds a matching edit. Compressed sources and providers without incremental parsing
+that fork holds a matching edit. Codex, Pi, and Prime Agent fork reconciliation runs while the
+index writer lock is held. Every parser version changes in 1.1.0, so the first refresh after
+upgrading reparses every source. Compressed sources and providers without incremental parsing
 read the whole source. Index persistence additionally counts stored session messages and copies
 stored transcript bytes.
 

@@ -486,7 +486,8 @@ mcp_config = "/srv/openclaw/team.json5"
 Pi and Prime Agent accept `mcp_config` overrides for their strict-JSON MCP files.
 Config paths replace automatic endpoints; the existing repeatable CLI path flags add extra targets.
 Relative config paths resolve beside the aise config, and skill roots are parent directories under
-which aise creates an `ai-session-search` link. Install, status, uninstall, and post-upgrade refresh
+which aise creates an `ai-session-search` link, or an owned copy on Windows without link
+privilege. Install, status, uninstall, and post-upgrade refresh
 share these settings. See
 [configuration](configuration.md#integration-installer-destinations-and-selectors) for precedence,
 supported fields, pinned upstream evidence, and historical-destination limits.

@@ -105,14 +105,17 @@ before writing the assignment. A distinctive exact lookup completes fastest in t
   are preserved for same-second ordering. Forms: `7d`, `yesterday`, `2026-01`, `2026-01/..`,
   RFC 3339; `aise dates` is the reference.
 - **Path.** Session commands use `--path` (MCP `path_prefix`) for a directory and its
-  component-boundary descendants, excluding siblings such as `project-other`. Message search
+  component-boundary descendants, excluding siblings such as `project-other`; `%` and `_` are
+  literal. Windows drive and UNC paths accept either separator and ignore ASCII case; macOS
+  also ignores ASCII case for POSIX paths, while other POSIX paths are case-sensitive. These
+  rules also apply to exclusions and access scopes. Message search
   separates workspace and transcript paths with `--workspace-path` and `--transcript-path`.
 - **Session class.** A run spawned by another session is indexed as a session of its own with
   `parent_session_id` (the spawning session's whole id) and `agent_label` (`Explore`,
   `general-purpose`, a Codex agent nickname). Both classes come back by default;
   `--session-kinds` (alias `--session-kind`) accepts one or several comma- or space-separated values; repeated spellings combine. The values are the
   providers' own (Codex records `thread_source: user | subagent`).
-- **Message class.** `--kinds` accepts several values and `--kind` selects one. `harness-notice`
+- **Message class.** `--kinds` (alias `--kind`) accepts several values; repeated spellings combine. `harness-notice`
   rows (Stop-hook feedback, PreToolUse blocks, local-command caveats, task notifications) are what
   the harness told the agent; they are indexed and left out of ordinary results, so
   `corrections`, `repeats`, and a user-role search see what people wrote. Search them with
@@ -230,7 +233,10 @@ prints it in a terminal.
 
 Range reads omit harness notices by default; an explicit `--kinds` list can include them.
 For a complete session date window, call `get_session(session_id="ID", when="2026-01")`; `since`/`until` select inclusive event timestamp bounds instead of a period. Omit dates for no bound. Dates compose with range filters and paging, not focused `seq`, summary, or transcript modes; `when` conflicts with `since`/`until`. Queryless `search_messages` is an alternative with search-hit output and a bounded default page.
-MCP `get_session` ranges accept `kinds=["conversation", "harness_notice"]`. Focused context
+MCP `get_session` ranges accept `role`, `limit`, `offset`, `order`, `since`, `until`, `when`,
+and `kinds=["conversation", "harness_notice"]`; `kinds` alone selects a range. Integer arguments
+with a wrong type or out-of-range value are argument errors. Omit summary-only `summary_items`
+and `include` on focused or range reads, where they are argument errors. Focused context
 already includes every class. Use MCP `seq` for a focused read. MCP focused/range reads use `detail="compact"|"full"`, like
 message search; `response_format="concise"|"detailed"` remains a deprecated alias.
 
