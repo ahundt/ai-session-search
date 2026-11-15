@@ -2646,12 +2646,43 @@ def test_message_search_planner_rejects_caller_input_as_value_error(tmp_path: Pa
         )
 
 
-def test_message_search_request_rejects_kind_and_kinds_together() -> None:
-    with pytest.raises(ValueError, match="kind and kinds cannot be used together"):
-        native.MessageSearchRequest(
-            kind="conversation",
-            kinds=["tool_result"],
-        )
+def test_message_search_request_combines_kind_spellings() -> None:
+    request = native.MessageSearchRequest(kind="conversation", kinds=["tool_result"])
+    assert request.kinds == ["tool_result", "conversation"]
+    assert native.MessageSearchRequest(kind=["conversation", "tool_call"]).kinds == ["conversation", "tool_call"]
+    assert native.MessageSearchRequest(kinds="tool_result").kinds == ["tool_result"]
+    assert native.MessageSearchRequest(kind="conversation").kind == "conversation"
+    assert request.kind is None
+
+
+@pytest.mark.parametrize("constructor", [native.SessionQuery, native.AnalysisRequest,
+    native.MessageScope, native.MessageSearchRequest, native.MessageClassificationQuery])
+def test_session_kind_keyword_aliases(constructor: Any) -> None:
+    def selected(value: Any) -> Any:
+        return value.scope.session_kinds if isinstance(value, native.MessageSearchRequest) else value.session_kinds
+
+    assert selected(constructor(session_kind="subagent")) == ["subagent"]
+    assert selected(constructor(session_kinds="user")) == ["user"]
+    assert selected(constructor(session_kinds=["user"], session_kind=["subagent"])) == ["user", "subagent"]
+    assert selected(constructor(session_kind=[])) == []
+    with pytest.raises(ValueError, match="session kind"):
+        constructor(session_kind="invalid")
+
+
+def test_read_session_kind_keyword_alias(tmp_path: Path) -> None:
+    with native.SessionSearch(tmp_path / "index.db") as search:
+        with write_database(tmp_path / "index.db") as connection:
+            connection.executescript("""
+                insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source)
+                values (\'claude:alias\',\'claude\',\'alias\',\'\',\'/synthetic\',\'test\',\'test\');
+                insert into messages(session_id,provider,seq,role,kind,content)
+                values (\'claude:alias\',\'claude\',0,\'user\',\'conversation\',\'hello\'),
+                       (\'claude:alias\',\'claude\',1,\'tool\',\'tool_result\',\'done\');
+            """)
+        assert [row.seq for row in search.read_session_messages("claude:alias", kind="tool_result")] == [1]
+        assert [row.seq for row in search.read_session_messages("claude:alias", kinds="conversation", kind=["tool_result"])] == [0, 1]
+        with pytest.raises(ValueError, match="message kind"):
+            search.read_session_messages("synthetic", kind="invalid")
 
 
 def test_message_search_request_rejects_incomplete_purpose_and_invalid_windows() -> None:

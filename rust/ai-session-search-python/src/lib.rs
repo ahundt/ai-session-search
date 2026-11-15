@@ -457,11 +457,36 @@ fn _run_cli_command(py: Python<'_>, args: Vec<String>) -> PyResult<i32> {
     })
 }
 
+// Normalize scalar/list keyword spellings before typed enum parsing.
+fn optional_string_list_argument(value: &Bound<'_, PyAny>) -> PyResult<Option<Vec<String>>> {
+    if value.is_none() {
+        Ok(None)
+    } else if let Ok(value) = value.extract::<String>() {
+        Ok(Some(vec![value]))
+    } else {
+        value.extract::<Vec<String>>().map(Some)
+    }
+}
+
+fn combine_alias_values(
+    plural: Option<Vec<String>>,
+    singular: Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    match (plural, singular) {
+        (None, None) => None,
+        (plural, singular) => Some(
+            plural
+                .into_iter()
+                .flatten()
+                .chain(singular.into_iter().flatten())
+                .collect(),
+        ),
+    }
+}
+
 /// Parse session-class names into the typed set.
-///
-/// `None` keeps the default set (every class); an empty list is a caller who deselected every
-/// class and gets no rows, which is why the two are not collapsed. The rejection message is the
-/// enum's own, so it names the accepted values and cannot drift from what parses.
+/// `None` keeps the operation default; an empty list selects no classes.
+/// Rejections use the enum parser so accepted values cannot drift.
 fn parse_session_kinds(values: Option<Vec<String>>) -> PyResult<Option<Vec<SessionKind>>> {
     values
         .map(|values| {
@@ -2531,6 +2556,7 @@ impl QueryExclusions {
 #[derive(Clone, Default)]
 /// Session list/search filters; an omitted limit follows search.default_limit, and 0 selects all.
 /// offset skips sessions in the existing list or ranked order. Accept flat filters or QueryScope.
+/// `session_kinds` (alias `session_kind`) accepts a string or list; both spellings combine.
 /// `current_repo` overrides repository-aware ranking; omission honors `prefer_current_repo` and
 /// derives the repository from the process working directory when search runs.
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
@@ -2555,13 +2581,16 @@ struct SessionQuery {
 python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","current_repo","warnings_only","dates","limit","offset"]);
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, current_repo=None, warnings_only=false, dates=None, limit=None, offset=0, scope=None))]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, session_kind=None, parent_session_id=None, current_repo=None, warnings_only=false, dates=None, limit=None, offset=0, scope=None))]
     fn new(
         provider: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
         path_prefix: Option<String>,
         exclusions: Option<QueryExclusions>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
         session_kinds: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
+        session_kind: Option<Vec<String>>,
         parent_session_id: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
         current_repo: Option<String>,
@@ -2579,7 +2608,7 @@ python_value! { SessionQuery, slf => value_fields(slf.as_any(), &["provider","pa
             provider: scope.provider,
             path_prefix: scope.path_prefix,
             exclusions: scope.exclusions,
-            session_kinds: parse_session_kinds(session_kinds)?,
+            session_kinds: parse_session_kinds(combine_alias_values(session_kinds, session_kind))?,
             parent_session_id,
             current_repo,
             warnings_only,
@@ -2649,6 +2678,7 @@ impl SessionQuery {
 
 #[derive(Clone, Default)]
 /// Scope and explicit population strategy for longitudinal session analysis.
+/// `session_kinds` (alias `session_kind`) accepts a string or list; both spellings combine.
 ///
 /// Omitted `first_canonical_sessions` analyzes every eligible session. A positive value selects
 /// the first N eligible sessions in canonical session-ID order; it is not a recency sample,
@@ -2676,13 +2706,16 @@ struct NativeAnalysisRequest {
 python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["provider","path_prefix","exclusions","session_kinds","parent_session_id","warnings_only","dates","first_canonical_sessions"]);
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, parent_session_id=None, warnings_only=false, dates=None, first_canonical_sessions=None))]
+    #[pyo3(signature = (*, provider=None, path_prefix=None, exclusions=None, session_kinds=None, session_kind=None, parent_session_id=None, warnings_only=false, dates=None, first_canonical_sessions=None))]
     fn new(
         provider: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
         path_prefix: Option<String>,
         exclusions: Option<QueryExclusions>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
         session_kinds: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
+        session_kind: Option<Vec<String>>,
         parent_session_id: Option<String>,
         warnings_only: bool,
         dates: Option<DateRange>,
@@ -2706,7 +2739,7 @@ python_value! { NativeAnalysisRequest, slf => value_fields(slf.as_any(), &["prov
             provider: parse_provider(provider)?,
             path_prefix,
             exclusions: exclusions.unwrap_or_default(),
-            session_kinds: parse_session_kinds(session_kinds)?,
+            session_kinds: parse_session_kinds(combine_alias_values(session_kinds, session_kind))?,
             parent_session_id,
             warnings_only,
             dates: dates.unwrap_or_default(),
@@ -2946,6 +2979,7 @@ python_value! { MessageExclusions, slf => value_fields(slf.as_any(), &["workspac
 }
 
 /// Message-only scope with distinct workspace and transcript path domains.
+/// `session_kinds` (alias `session_kind`) accepts a string or list; both spellings combine.
 #[derive(Clone, Default)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageScope {
@@ -2966,11 +3000,14 @@ struct MessageScope {
 python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","session_id","session_kinds","parent_session_id","workspace_path_prefix","transcript_path_prefix","exclusions","dates"]);
     #[new]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, providers=None, session_id=None, session_kinds=None, parent_session_id=None, workspace_path_prefix=None, transcript_path_prefix=None, exclusions=None, dates=None))]
+    #[pyo3(signature = (*, providers=None, session_id=None, session_kinds=None, session_kind=None, parent_session_id=None, workspace_path_prefix=None, transcript_path_prefix=None, exclusions=None, dates=None))]
     fn new(
         providers: Option<Vec<String>>,
         session_id: Option<String>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
         session_kinds: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
+        session_kind: Option<Vec<String>>,
         parent_session_id: Option<String>,
         #[pyo3(from_py_with = optional_path_argument)]
         workspace_path_prefix: Option<String>,
@@ -2981,7 +3018,7 @@ python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","s
     ) -> PyResult<Self> {
         Ok(Self {
             providers: parse_provider_set(providers)?,
-            session_kinds: parse_session_kinds(session_kinds)?,
+            session_kinds: parse_session_kinds(combine_alias_values(session_kinds, session_kind))?,
             parent_session_id,
             session_id,
             workspace_path_prefix,
@@ -3031,6 +3068,8 @@ python_value! { MessageScope, slf => value_fields(slf.as_any(), &["providers","s
 /// omits this constraint. A non-path value raises TypeError; combining it with scope raises
 /// InvalidArgumentError. A QueryScope.path_prefix passed through scope has the same workspace-only
 /// meaning; use MessageScope.transcript_path_prefix to select transcript locations.
+/// `kinds` (alias `kind`) and `session_kinds` (alias `session_kind`) accept strings or lists;
+/// both spellings combine. Omit for the operation default; an empty list selects no classes.
 #[derive(Clone)]
 #[pyclass(module = "ai_session_search._native", frozen, from_py_object)]
 struct MessageSearchRequest {
@@ -3078,11 +3117,13 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
     // Independent message filters stay flat and keyword-only; grouping them would restore the
     // one-use wrapper types this API intentionally removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None, query_mode=None, provider=None, session_id=None, workspace_path_prefix=None, dates=None, session_kinds=None, parent_session_id=None))]
+    #[pyo3(signature = (*, scope=None, role=None, kind=None, kinds=None, field="content", argument_path=None, seq_from=None, seq_to=None, tool_name_contains=None, include_compaction=true, limit=None, all_results=false, offset=0, match_window=None, context=None, context_before=None, context_after=None, include=None, lines_per_message=None, detail=None, field_view=None, match_view=None, purpose=None, purpose_version=None, receipt_level=None, query_mode=None, provider=None, session_id=None, workspace_path_prefix=None, dates=None, session_kinds=None, session_kind=None, parent_session_id=None))]
     fn new(
         scope: Option<MessageScopeInput>,
         role: Option<&str>,
-        kind: Option<&str>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
+        kind: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
         kinds: Option<Vec<String>>,
         field: &str,
         argument_path: Option<String>,
@@ -3111,12 +3152,16 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
         #[pyo3(from_py_with = optional_path_argument)]
         workspace_path_prefix: Option<String>,
         dates: Option<DateRange>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
         session_kinds: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
+        session_kind: Option<Vec<String>>,
         parent_session_id: Option<String>,
     ) -> PyResult<Self> {
         if query_mode.as_deref().is_some_and(|mode| !matches!(mode, "literal" | "regex" | "fuzzy")) {
             return Err(invalid_argument_error("query_mode must be literal, regex, or fuzzy"));
         }
+        let session_kinds = combine_alias_values(session_kinds, session_kind);
         if scope.is_some() && (provider.is_some() || session_id.is_some() || workspace_path_prefix.is_some() || dates.is_some() || session_kinds.is_some() || parent_session_id.is_some()) {
             return Err(invalid_argument_error("scope cannot be combined with flat provider, session_id, workspace_path_prefix, dates, session_kinds, or parent_session_id filters"));
         }
@@ -3138,11 +3183,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
                 })
                 .transpose()
         };
-        if kind.is_some() && kinds.is_some() {
-            return Err(invalid_argument_error(
-                "kind and kinds cannot be used together; use kind for one class or kinds for several",
-            ));
-        }
+        let kinds = combine_alias_values(kinds, kind);
         if all_results && limit.is_some() {
             return Err(invalid_argument_error(
                 "limit and all_results cannot be used together",
@@ -3190,10 +3231,7 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
                 .map(str::parse)
                 .transpose()
                 .map_err(invalid_argument_error)?,
-            kind: kind
-                .map(str::parse)
-                .transpose()
-                .map_err(invalid_argument_error)?,
+            kind: None,
             kinds: kinds
                 .map(|kinds| {
                     kinds
@@ -3257,7 +3295,9 @@ python_value! { MessageSearchRequest, slf => value_fields(slf.as_any(), &["query
 
     #[getter]
     fn kind(&self) -> Option<&str> {
-        self.kind.map(|kind| kind.as_str())
+        self.kind
+            .or_else(|| self.kinds.as_ref().filter(|kinds| kinds.len() == 1).map(|kinds| kinds[0]))
+            .map(|kind| kind.as_str())
     }
 
     #[getter]
@@ -3599,6 +3639,7 @@ impl NativeSkillSelector {
 }
 
 /// Typed arguments for the message-classification skill capability.
+/// `session_kinds` (alias `session_kind`) accepts a string or list; both spellings combine.
 #[derive(Clone, Default)]
 #[pyclass(
     name = "MessageClassificationQuery",
@@ -3621,10 +3662,13 @@ struct NativeMessageClassificationQuery {
 
 python_value! { NativeMessageClassificationQuery, slf => value_fields(slf.as_any(), &["scope","session_kinds","additional_skills","limit","offset","include_unattributed_input"]);
     #[new]
-    #[pyo3(signature = (*, scope=None, session_kinds=None, additional_skills=None, limit=None, offset=0, include_unattributed_input=false))]
+    #[pyo3(signature = (*, scope=None, session_kinds=None, session_kind=None, additional_skills=None, limit=None, offset=0, include_unattributed_input=false))]
     fn new(
         scope: Option<QueryScope>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
         session_kinds: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_string_list_argument)]
+        session_kind: Option<Vec<String>>,
         additional_skills: Option<Vec<NativeSkillSelector>>,
         limit: Option<i64>,
         offset: i64,
@@ -3632,7 +3676,7 @@ python_value! { NativeMessageClassificationQuery, slf => value_fields(slf.as_any
     ) -> PyResult<Self> {
         Ok(Self {
             scope: scope.unwrap_or_default(),
-            session_kinds: parse_session_kinds(session_kinds)?,
+            session_kinds: parse_session_kinds(combine_alias_values(session_kinds, session_kind))?,
             additional_skills: additional_skills.unwrap_or_default(),
             limit: limit
                 .map(|value| paging_argument(PagingArgument::Limit, value))
@@ -5175,7 +5219,7 @@ impl SessionSearch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (session_id, *, order="oldest", role=None, limit=0, offset=0, seq_from=None, seq_to=None, lines_per_message=0, kinds=None, dates=None))]
+    #[pyo3(signature = (session_id, *, order="oldest", role=None, limit=0, offset=0, seq_from=None, seq_to=None, lines_per_message=0, kinds=None, kind=None, dates=None))]
     /// Read one session's messages, selecting the oldest or newest `limit` by `order`, always
     /// returned in chronological (seq-ascending) order.
     ///
@@ -5185,7 +5229,8 @@ impl SessionSearch {
     /// at the last seq + 1) rather than growing `limit`, which re-sends what you already read.
     /// `lines_per_message` is the presentation-only per-message line window.
     /// `kinds` defaults to every class except harness_notice; supply an explicit class list
-    /// to include notices. Focused message_context reads already include every class.
+    /// to include notices. Alias `kind` accepts a string or list, as does `kinds`; both combine.
+    /// Focused message_context reads already include every class.
     fn read_session_messages(
         &self,
         py: Python<'_>,
@@ -5197,7 +5242,8 @@ impl SessionSearch {
         seq_from: Option<i64>,
         seq_to: Option<i64>,
         lines_per_message: i64,
-        kinds: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_string_list_argument)] kinds: Option<Vec<String>>,
+        #[pyo3(from_py_with = optional_string_list_argument)] kind: Option<Vec<String>>,
         dates: Option<DateRange>,
     ) -> PyResult<Vec<NativeMessageHit>> {
         let order = match order {
@@ -5213,7 +5259,7 @@ impl SessionSearch {
             .map(str::parse)
             .transpose()
             .map_err(invalid_argument_error)?;
-        let kinds = kinds
+        let kinds = combine_alias_values(kinds, kind)
             .map(|values| {
                 values
                     .into_iter()
