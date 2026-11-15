@@ -117,13 +117,68 @@ fn filtered_range_reads_share_event_dates_role_and_newest_order() {
         &[(
             "get_session",
             json!({"session_id":id,
-        "role":"assistant", "since":"2026-02-01T00:00:00Z", "limit":1, "order":"newest"}),
+        "role":"assistant", "limit":1, "order":"newest"}),
         )],
     )
     .remove(0)
     .unwrap();
     assert_eq!(response["session_id"], id);
     assert_eq!(read_rows(&response), expected);
+    for filter in [
+        json!({"when":"2026-02"}),
+        json!({"since":"2026-02-01T00:00:00Z"}),
+        json!({"until":"2026-01-31T23:59:59Z"}),
+        json!({"role":"assistant"}),
+        json!({"kinds":["conversation"]}),
+    ] {
+        let mut read = filter.clone();
+        read["session_id"] = json!(id);
+        read["seq_from"] = json!(0);
+        let mut search = filter;
+        search["session_id"] = json!(id);
+        search["all_results"] = json!(true);
+        let is_date = ["since", "until", "when"]
+            .iter()
+            .any(|key| read.get(*key).is_some());
+        let mut range = if is_date {
+            let mut dates = ai_session_search::dates::DateRange::default();
+            dates.since = read["since"].as_str().map(str::to_owned);
+            dates.until = read["until"].as_str().map(str::to_owned);
+            dates.when = read["when"].as_str().map(str::to_owned);
+            let (since, until) = dates.resolve_now().unwrap();
+            let mut filters = MessageFilters::default().with_session_id(id);
+            filters.since = since;
+            filters.until = until;
+            hit_ids(
+                service
+                    .read_session(&filters, MessageOrder::OldestFirst)
+                    .unwrap(),
+            )
+        } else {
+            read_rows(&mcp_calls(&f, &[("get_session", read)]).remove(0).unwrap())
+        };
+        let result = mcp_calls(&f, &[("search_messages", search)])
+            .remove(0)
+            .unwrap();
+        let mut matches = ids_from_results(&result["results"]);
+        range.sort();
+        matches.sort();
+        assert!(!range.is_empty());
+        assert_eq!(matches, range);
+    }
+    for name in ["since", "until", "when"] {
+        let mut args = json!({"session_id":id});
+        args[name] = json!("2026-02");
+        let error = mcp_calls(&f, &[("get_session", args)])
+            .remove(0)
+            .unwrap_err();
+        assert!(
+            error.contains(name)
+                && error.contains("search_messages")
+                && error.contains("session_id"),
+            "{error}"
+        );
+    }
 }
 
 #[test]

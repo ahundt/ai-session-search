@@ -52,15 +52,16 @@ def test_read_event_dates_and_warning_scopes(tmp_path: Path) -> None:
                 "clientInfo": {"name": "synthetic", "version": "1"}}},
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
-                "name": "get_session", "arguments": {"session_id": "claude:warning", "role": "assistant",
-                "order": "newest", "limit": 1, "since": "2026-02-01T00:00:00Z"}}},
+                "name": "search_messages", "arguments": {"session_id": "claude:warning", "role": "assistant",
+                "limit": 1, "since": "2026-02-01T00:00:00Z"}}},
         ]
         mcp = subprocess.run([*command, "mcp", "serve"], env=env, capture_output=True, text=True,
                              input="".join(json.dumps(request) + "\n" for request in requests), check=True)
         response = next(json.loads(line) for line in mcp.stdout.splitlines() if json.loads(line).get("id") == 2)
         assert not response["result"].get("isError"), response
         payload = response["result"]["structuredContent"]
-        assert [(payload["session_id"], row["seq"]) for row in payload["messages"]] == expected
+        assert [(row["message_ref"]["session_id"], row["message_ref"]["message_seq"])
+                for row in payload["results"]] == expected
 
 
 def test_python_schema_returns_semantic_notes(tmp_path: Path) -> None:
