@@ -496,7 +496,7 @@ fn collect_text_content(value: &Value, out: &mut Vec<String>) {
 // input region; inline, repeated, nested and incomplete tags are ambiguous.
 fn cursor_query_region(text: &str) -> Option<(usize, usize)> {
     let prefix = if text.starts_with("<timestamp>") {
-        cursor_timestamp_prefix(text)?.1
+        text.find("</timestamp>")? + "</timestamp>".len()
     } else {
         0
     };
@@ -848,7 +848,7 @@ mod tests {
         }));
         assert_eq!(
             parsed.messages[0].provenance.authorship,
-            crate::models::MessageAuthorship::Unknown
+            crate::models::MessageAuthorship::Mixed
         );
         assert_eq!(
             parsed.messages[2].provenance.authorship,
@@ -960,6 +960,13 @@ mod tests {
                 .build()
                 .unwrap();
                 assert_eq!(service.search(request).unwrap().hits().len(), 0);
+                let ordinary = crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal(text).unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                )
+                .build()
+                .unwrap();
+                assert_eq!(service.search(ordinary).unwrap().hits().len(), 1);
             }
         }
     }
@@ -978,6 +985,31 @@ mod tests {
         assert_eq!(
             cursor_message_text(&value),
             "<timestamp>Tuesday</timestamp>\n<user_query>\nFind the billing bug\n</user_query>"
+        );
+    }
+
+    #[test]
+    fn complete_query_framing_keeps_input_when_its_clock_is_unparseable() {
+        let text = "<timestamp>Tuesday</timestamp>\n<user_query>framed request</user_query>";
+        let parsed = CursorAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(json!({"role":"user","message":{"content":text}}).to_string()),
+                std::path::Path::new("synthetic.jsonl"),
+            )
+            .unwrap();
+        let temp = tempdir().unwrap();
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        let filters = crate::models::MessageFilters {
+            role: Some(crate::models::Role::User),
+            ..Default::default()
+        };
+        assert_eq!(
+            db.search_messages("framed request", &filters)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
@@ -1008,6 +1040,20 @@ mod tests {
             .collect();
         assert_eq!(human, "request 🦀");
         assert_eq!(message.provenance.content_parts.len(), 3);
+        let temp = tempdir().unwrap();
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        assert_eq!(
+            db.search_messages(text, &Default::default()).unwrap().len(),
+            1
+        );
+        let user = crate::models::MessageFilters {
+            role: Some(crate::models::Role::User),
+            ..Default::default()
+        };
+        assert_eq!(db.search_messages("request 🦀", &user).unwrap().len(), 1);
+        assert_eq!(db.search_messages("user_query", &user).unwrap().len(), 0);
     }
 
     #[test]
@@ -1336,6 +1382,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(db.search_messages("clockless", &messages).unwrap().len(), 2);
+        let range = crate::models::MessageFilters {
+            session_id: Some(parsed.session.id.clone()),
+            ..messages
+        };
+        assert_eq!(
+            db.read_session_messages(&range, crate::db::MessageOrder::OldestFirst)
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -1544,6 +1600,18 @@ mod tests {
             .messages
             .iter()
             .any(|m| m.content.contains("never written")));
+        let temp = tempdir().unwrap();
+        let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+        db.mark_schema_current().unwrap();
+        db.upsert_session(&parsed, 0, 0).unwrap();
+        assert_eq!(db.file_search(&Default::default()).unwrap().len(), 1);
+        for path in ["failed.txt", "pending.txt", "success.txt"] {
+            let filters = crate::models::MessageFilters {
+                role: Some(crate::models::Role::Tool),
+                ..Default::default()
+            };
+            assert_eq!(db.search_messages(path, &filters).unwrap().len(), 1);
+        }
     }
 
     #[test]
