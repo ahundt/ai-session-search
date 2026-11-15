@@ -2009,7 +2009,7 @@ class SessionSearch:
         *,
         format: Literal["markdown", "md", "text", "json"] = "markdown",
     ) -> ExportPublicationReceipt:
-        """Publish selected sessions to a new destination as json or text and return a receipt. The destination must not exist. SessionQuery supplies filters; its historical export default is 50 sessions, and an explicit limit=0 selects all."""
+        """Publish selected sessions to a new destination as Markdown (default), JSON, or text and return a receipt. The destination must not exist. SessionQuery supplies filters; its historical export default is 50 sessions, and an explicit limit=0 selects all."""
     def source_inventory(self) -> list[ProviderSourceStatus]:
         """Return configured provider roots, discovered file counts and non-fatal traversal warnings. Disabled providers are reported without scanning their transcript roots."""
     def analysis_documents(

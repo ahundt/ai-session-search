@@ -5517,7 +5517,7 @@ impl SessionSearch {
     }
 
     #[pyo3(signature = (destination, request=None, *, format="markdown"))]
-    #[doc = "Publish selected sessions to a new destination as json or text and return a receipt. The destination must not exist. SessionQuery supplies filters; its historical export default is 50 sessions, and an explicit limit=0 selects all."]
+    #[doc = "Publish selected sessions to a new destination as Markdown (default), JSON, or text and return a receipt. The destination must not exist. SessionQuery supplies filters; its historical export default is 50 sessions, and an explicit limit=0 selects all."]
     fn export_sessions(
         &self,
         py: Python<'_>,

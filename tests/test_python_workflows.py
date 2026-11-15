@@ -22,6 +22,18 @@ CLI = shutil.which("aise")
 assert CLI is not None, "run `uv run maturin develop --uv` to install the aise console script"
 
 
+def test_export_sessions_documents_formats_and_default():
+    doc = aise.SessionSearch.export_sessions.__doc__
+    assert doc is not None
+    sentence = (
+        "Publish selected sessions to a new destination as Markdown (default), "
+        "JSON, or text and return a receipt."
+    )
+    assert sentence in doc
+    stub = Path(__file__).resolve().parents[1] / "ai_session_search" / "_native.pyi"
+    assert sentence in stub.read_text(encoding="utf-8")
+
+
 @pytest.fixture
 def corpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     executable = tmp_path / "claude"
