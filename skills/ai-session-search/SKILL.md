@@ -104,7 +104,7 @@ before writing the assignment. A distinctive exact lookup completes fastest in t
 - **Session class.** A run spawned by another session is indexed as a session of its own with
   `parent_session_id` (the spawning session's whole id) and `agent_label` (`Explore`,
   `general-purpose`, a Codex agent nickname). Both classes come back by default;
-  `--session-kinds` accepts several values and `--session-kind` selects one; the values are the
+  `--session-kinds` (alias `--session-kind`) accepts one or several comma- or space-separated values; repeated spellings combine. The values are the
   providers' own (Codex records `thread_source: user | subagent`).
 - **Message class.** `--kinds` accepts several values and `--kind` selects one. `harness-notice`
   rows (Stop-hook feedback, PreToolUse blocks, local-command caveats, task notifications) are what

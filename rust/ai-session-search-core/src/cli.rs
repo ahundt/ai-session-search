@@ -499,19 +499,16 @@ struct SessionFilterArgs {
     path: Option<String>,
     #[command(flatten)]
     exclusions: ExclusionArgs,
-    /// Restrict to one session class; one-value alias for --session-kinds. Omit for both classes.
-    #[arg(help_heading = SESSION_FILTER_HEADING, long = "session-kind", value_enum)]
-    session_kind: Option<SessionKind>,
     /// Session classes to return: user for sessions you started, subagent for runs those
     /// sessions spawned. Omit for both. With --parent-session, use subagent or omit this option;
-    /// user cannot match a spawned run.
+    /// user cannot match a spawned run. Alias: --session-kind; repeated spellings combine comma- or space-separated values.
     #[arg(
         help_heading = SESSION_FILTER_HEADING,
         long = "session-kinds",
         value_enum,
         num_args = 1..,
         value_delimiter = ',',
-        conflicts_with = "session_kind"
+        alias = "session-kind"
     )]
     session_kinds: Vec<SessionKind>,
     /// Restrict to runs spawned by this exact session id. Omit to include root and spawned runs
@@ -656,7 +653,6 @@ impl QueryArgs {
             provider,
             path,
             exclusions,
-            session_kind,
             session_kinds,
             parent_session,
             dates,
@@ -684,9 +680,6 @@ impl QueryArgs {
         }
         for session in &exclusions.exclude_sessions {
             push(&mut command, "--exclude-session", session);
-        }
-        if let Some(kind) = session_kind {
-            push(&mut command, "--session-kind", &value_enum_token(kind));
         }
         // One comma-joined token, which the `value_delimiter = ','` parser splits back into the
         // same list. Separate tokens would let `num_args = 1..` swallow a following bare value.
@@ -2361,12 +2354,7 @@ fn build_filters(args: &SessionFilterArgs, limit: usize) -> Result<SearchFilters
         path_prefix: args.path.as_deref().map(crate::util::normalize_path_prefix),
         exclude_path_prefixes: args.exclusions.normalized_paths(),
         exclude_session_ids: args.exclusions.exclude_sessions.clone(),
-        // Clap enforces that --session-kind and --session-kinds are not both given, so this
-        // cannot silently drop one. Same resolution as messages.rs for --kind/--kinds.
-        session_kinds: args
-            .session_kind
-            .map(|kind| vec![kind])
-            .or_else(|| (!args.session_kinds.is_empty()).then(|| args.session_kinds.clone())),
+        session_kinds: (!args.session_kinds.is_empty()).then(|| args.session_kinds.clone()),
         parent_session_id: args.parent_session.clone(),
         since,
         until,
@@ -3501,6 +3489,40 @@ mod tests {
     /// The session-class filter reaches every command that takes session filters, because it
     /// lives on the flattened `SessionFilterArgs` rather than on one subcommand.
     #[test]
+    fn session_class_spellings_combine_as_one_parameter() {
+        for base in [
+            vec!["aise", "list"],
+            vec!["aise", "search", "needle"],
+            vec!["aise", "messages", "search", "needle"],
+            vec!["aise", "skills", "corrections"],
+        ] {
+            for values in [
+                vec!["--session-kinds", "user,subagent"],
+                vec!["--session-kind", "user,subagent"],
+                vec!["--session-kinds", "user", "subagent"],
+                vec!["--session-kind", "user", "subagent"],
+                vec!["--session-kind", "user", "--session-kinds", "subagent"],
+            ] {
+                let mut args = base.clone();
+                args.extend(values);
+                let parsed = Cli::try_parse_from(args).unwrap();
+                let kinds = match parsed.command {
+                    Commands::List(args) => args.filters.session_kinds,
+                    Commands::Search(args) => args.filters.filters.session_kinds,
+                    Commands::Messages(crate::messages::MessagesCmd::Search(args)) => {
+                        args.session_kinds
+                    }
+                    Commands::Skills(command) => {
+                        command.into_execution().unwrap().args.session_kinds
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(kinds, vec![SessionKind::User, SessionKind::Subagent]);
+            }
+        }
+    }
+
+    #[test]
     fn session_class_filters_reach_every_session_command() {
         // `search` takes a required QUERY, `list` takes none; both flatten SessionFilterArgs.
         for base in [vec!["aise", "search", "migrations"], vec!["aise", "list"]] {
@@ -3525,7 +3547,6 @@ mod tests {
             for rejected in [
                 vec!["--session-kinds", "agent"],
                 vec!["--session-kinds", "top-level"],
-                vec!["--session-kind", "user", "--session-kinds", "subagent"],
             ] {
                 let mut args = base.clone();
                 args.extend_from_slice(&rejected);

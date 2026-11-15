@@ -260,8 +260,8 @@ pub struct CorrectionsArgs {
     /// Session classes to scan. Omit for user-started sessions only, because a correction is
     /// something a person told the agent: in a spawned run the `user` rows are the calling
     /// agent's delegation prompt. Pass `user subagent` for both, as `search` and `list` return
-    /// by default.
-    #[arg(long = "session-kinds", value_enum, num_args = 1.., value_delimiter = ',')]
+    /// by default. Alias: --session-kind; repeated spellings combine comma- or space-separated values.
+    #[arg(long = "session-kinds", alias = "session-kind", value_enum, num_args = 1.., value_delimiter = ',')]
     pub session_kinds: Vec<crate::models::SessionKind>,
     /// Additional message-classification skills to evaluate, in argument order after the primary
     /// selected skill. Each value is a catalog name, skill directory, or exact SKILL.md path.
