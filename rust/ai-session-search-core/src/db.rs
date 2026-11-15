@@ -3145,6 +3145,11 @@ impl Db {
                 && stored.id == session.id
                 && (stored.parent_session_id.is_some() || stored.agent_label.is_some())
         });
+        if session.provider == Provider::Cursor {
+            for key in ["cursor_clock_anchor", "cursor_last_native_timestamp"] {
+                patch[key] = metadata[key].clone();
+            }
+        }
         if spawned_codex {
             // These cumulative counters were seeded alongside the immutable spawn context.
             for key in ["line_count", "valid_record_count", "malformed_line_count"] {
