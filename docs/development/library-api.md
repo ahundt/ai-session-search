@@ -160,7 +160,8 @@ configuration selects existing-only; that policy still refuses missing indexes a
 
 Path arguments also accept `pathlib.Path` and other `os.PathLike` values. `DateRange`
 accepts `datetime.date` and `datetime.datetime` as well as text; it sends their ISO representation
-to the shared Rust date parser. Naive datetimes use the same local-zone rule as timestamp text.
+to the shared Rust date parser. Naive datetimes and timestamp text without an offset or zone are
+read in UTC.
 
 File queries default to all matching files and versions (`limit=0`), as on the CLI and in Rust.
 Set a positive limit and offset to page a large edit history.
