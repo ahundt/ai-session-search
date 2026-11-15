@@ -371,7 +371,7 @@ from query cost: incremental refresh reads appended bytes plus at most 1 MiB of 
 checkpoints or parser versions, changed overlap bytes, and new records that change indexed rows.
 
 For library use, Python `search_sessions()`/`list_sessions()`, `search_messages()`,
-`read_session_messages()`/`message_context()`, `reconstruct_file()`, `classify_messages()` and
+`read_session_messages()`/`message_context()`, `reconstruct_file()`, `run_skill()` and
 `repeats()` cover discovery, search, reading, recovery, and analysis. Rust exposes those routes
 through `SessionSearch::catalog()`, `messages()`, `files()`, and `analysis()`; `index()` controls
 freshness. See the [library guide](https://github.com/ahundt/ai-session-search/blob/main/docs/development/library-api.md).
