@@ -358,44 +358,66 @@ fn infer_cursor_workspace(path: &Path) -> Option<String> {
     None
 }
 
+/// Resolve only a unique existing directory. At most 256 candidates are examined;
+/// slugs needing more partitions return no workspace. For S slug bytes, time is
+/// O(256 * S), memory O(S), and filesystem probes are at most 256.
 fn decode_cursor_project_dir(encoded: &str) -> Option<PathBuf> {
-    if encoded == "empty-window" {
-        return None;
-    }
-    let parts: Vec<&str> = encoded.split('-').collect();
-    if parts.first().copied() != Some("Users") || parts.len() < 3 {
-        return None;
-    }
-    let suffixes = partition_suffixes(&parts[1..]);
-    suffixes
-        .into_iter()
-        .map(|suffix| {
-            let mut path = PathBuf::from("/");
-            path.push("Users");
-            for part in suffix {
-                path.push(part);
-            }
-            path
-        })
-        .find(|candidate| candidate.exists())
+    decode_cursor_project_dir_with(encoded, |candidate| {
+        candidate.is_absolute() && candidate.is_dir()
+    })
 }
 
-fn partition_suffixes(parts: &[&str]) -> Vec<Vec<String>> {
-    fn walk(parts: &[&str], index: usize, current: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
-        if index >= parts.len() {
-            out.push(current.clone());
-            return;
+#[cfg(test)]
+thread_local! {
+    static WORKSPACE_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn decode_cursor_project_dir_with(
+    encoded: &str,
+    mut is_dir: impl FnMut(&Path) -> bool,
+) -> Option<PathBuf> {
+    let parts: Vec<&str> = encoded.split('-').collect();
+    let (root, suffix, separator) = match parts.as_slice() {
+        [root @ ("Users" | "home"), suffix @ ..] if suffix.len() >= 2 => {
+            (format!("/{root}"), suffix, "/")
         }
-        for end in index + 1..=parts.len() {
-            current.push(parts[index..end].join("-"));
-            walk(parts, end, current, out);
-            current.pop();
+        [drive, "Users", suffix @ ..]
+            if drive.len() == 1
+                && drive.as_bytes()[0].is_ascii_alphabetic()
+                && suffix.len() >= 2 =>
+        {
+            (format!("{drive}:\\Users"), suffix, "\\")
+        }
+        _ => return None,
+    };
+    // Refuse before shifting or allocating candidate partitions.
+    if suffix.len() > 9 || suffix.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+    let mut found = None;
+    for mask in 0..(1usize << (suffix.len() - 1)) {
+        let mut candidate = root.clone();
+        candidate.push_str(separator);
+        candidate.push_str(suffix[0]);
+        for (index, part) in suffix.iter().enumerate().skip(1) {
+            candidate.push_str(if mask & (1 << (index - 1)) != 0 {
+                separator
+            } else {
+                "-"
+            });
+            candidate.push_str(part);
+        }
+        let candidate = PathBuf::from(candidate);
+        #[cfg(test)]
+        WORKSPACE_CANDIDATES.with(|count| count.set(count.get() + 1));
+        if is_dir(&candidate) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(candidate);
         }
     }
-
-    let mut out = Vec::new();
-    walk(parts, 0, &mut Vec::new(), &mut out);
-    out
+    found
 }
 
 #[cfg(test)]
@@ -805,6 +827,37 @@ mod tests {
             extract_tag("prefix <user_query>hello</user_query> suffix", "user_query"),
             Some("hello".to_string())
         );
+    }
+
+    #[test]
+    fn workspace_candidates_have_a_fixed_bound() {
+        for length in [4, 8, 12, 25, 50] {
+            super::WORKSPACE_CANDIDATES.with(|count| count.set(0));
+            let slug = format!("Users-{}", vec!["aisemissing"; length].join("-"));
+            assert!(decode_cursor_project_dir(&slug).is_none());
+            let count = super::WORKSPACE_CANDIDATES.with(|count| count.get());
+            assert!(
+                count <= 256,
+                "{length} components examined {count} candidates, maximum 256"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_roots_and_ambiguity_are_host_independent() {
+        for (slug, expected) in [
+            ("Users-person-project", "/Users/person/project"),
+            ("home-person-project", "/home/person/project"),
+            ("C-Users-person-project", "C:\\Users\\person\\project"),
+        ] {
+            let expected = std::path::PathBuf::from(expected);
+            assert_eq!(
+                super::decode_cursor_project_dir_with(slug, |path| path == expected),
+                Some(expected)
+            );
+            assert!(super::decode_cursor_project_dir_with(slug, |_| false).is_none());
+            assert!(super::decode_cursor_project_dir_with(slug, |_| true).is_none());
+        }
     }
 
     #[test]
