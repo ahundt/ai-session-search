@@ -9195,8 +9195,9 @@ fn push_file_filters(
 }
 
 /// One component-containment rule for inclusion, exclusion and authorization. POSIX paths
-/// compare byte-exactly; Windows drive/UNC paths accept either separator and ASCII case.
-/// Never use LIKE here: its ASCII folding would broaden POSIX authorization roots.
+/// fold ASCII case on macOS and compare byte-exactly on other hosts. Windows drive/UNC paths
+/// accept either separator and fold ASCII case on every host. Range bounds keep '%' and '_'
+/// literal and exclude component siblings on both kinds of host.
 ///
 /// Query construction takes O(columns * prefix bytes) time and memory. Evaluation scans the
 /// already-scanned session paths, O(path bytes) per comparison, with O(path bytes) transient
@@ -9207,6 +9208,16 @@ fn push_path_columns<A: From<String>>(
     args: &mut Vec<A>,
     prefix: &str,
     columns: &[&str],
+) {
+    push_path_columns_with_case(sql, args, prefix, columns, cfg!(target_os = "macos"));
+}
+
+fn push_path_columns_with_case<A: From<String>>(
+    sql: &mut String,
+    args: &mut Vec<A>,
+    prefix: &str,
+    columns: &[&str],
+    fold_posix_case: bool,
 ) {
     use std::fmt::Write as _;
     let windows = crate::util::is_windows_absolute_path(prefix);
@@ -9230,7 +9241,11 @@ fn push_path_columns<A: From<String>>(
     };
     // Every child prefix ends with ASCII '/', so its strict upper bound always exists.
     let upper = prefix_upper_bound(&child).expect("path child prefix has an upper bound");
-    let collation = if windows { "nocase" } else { "binary" };
+    let collation = if windows || fold_posix_case {
+        "nocase"
+    } else {
+        "binary"
+    };
     sql.push('(');
     for (index, column) in columns.iter().enumerate() {
         if index > 0 {
@@ -12721,6 +12736,23 @@ mod tests {
     }
 
     #[test]
+    fn posix_path_case_matches_the_host_filesystem_convention() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        db.conn.execute(
+            "insert into sessions(id,provider,provider_session_id,cwd,preview_text,source_path,parse_version,discovery_source)
+             values ('fixture','claude','fixture','/work/proj/sub','','','1','test')", [],
+        ).unwrap();
+        let sessions = db
+            .list_recent(&SearchFilters {
+                path_prefix: Some("/work/Proj".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(sessions.len(), usize::from(cfg!(target_os = "macos")));
+    }
+
+    #[test]
     fn path_scope_inclusions_exclusions_and_authority_return_the_same_sessions() {
         use crate::config::{SearchScopeConfig, SearchScopeMode};
         use crate::search_scope::{EffectiveAccessScope, TrustedAccessInputs};
@@ -12759,8 +12791,22 @@ mod tests {
                 .unwrap();
         }
         for (prefix, expected) in [
-            ("/work/Proj/", vec!["s0", "s1"]),
-            ("/work/proj", vec!["s2", "s3"]),
+            (
+                "/work/Proj/",
+                if cfg!(target_os = "macos") {
+                    vec!["s0", "s1", "s2", "s3"]
+                } else {
+                    vec!["s0", "s1"]
+                },
+            ),
+            (
+                "/work/proj",
+                if cfg!(target_os = "macos") {
+                    vec!["s0", "s1", "s2", "s3"]
+                } else {
+                    vec!["s2", "s3"]
+                },
+            ),
             (r"C:\WORK\proj/", vec!["s4", "s5"]),
             ("//SERVER/share/Proj/", vec!["s7", "s8"]),
         ] {
@@ -12929,6 +12975,26 @@ mod tests {
              select id,'claude',0,'Write','/work/proj/file.rs','file.rs' from sessions;",
             )
             .unwrap();
+        // Both collation policies must retain the existing ordered session-index scan.
+        for fold in [false, true] {
+            let mut sql = String::from("select s.id from sessions s where ");
+            let mut args: Vec<String> = Vec::new();
+            push_path_columns_with_case(
+                &mut sql,
+                &mut args,
+                "/work/Proj",
+                &["s.cwd", "s.repo_root", "s.source_path"],
+                fold,
+            );
+            sql.push_str(" order by s.updated_at desc, s.id asc limit 20");
+            let args = args
+                .into_iter()
+                .map(rusqlite::types::Value::Text)
+                .collect::<Vec<_>>();
+            let plan = query_plan(&db, &sql, &args);
+            println!("session-list fold={fold}: {plan}");
+            assert!(plan.contains("idx_sessions_updated"), "{plan}");
+        }
         for prefix in ["/work/proj", r"C:\work\proj"] {
             let mut sql = format!(
                 "select {} from sessions s where 1 = 1",
@@ -12994,12 +13060,42 @@ mod tests {
     }
 
     #[test]
+    fn posix_path_comparison_exercises_both_case_policies_on_every_host() {
+        let db = Connection::open_in_memory().unwrap();
+        for fold in [false, true] {
+            for (prefix, value, expected) in [
+                ("/work/Proj", "/work/proj", fold),
+                ("/work/Proj", "/work/proj/sub", fold),
+                ("/work/Proj", "/work/Proj/sub", true),
+                ("/work/Proj", "/work/proj-other", false),
+                ("/work/Proj%_", "/work/proj%_/sub", fold),
+                ("/work/Proj%_", "/work/project/sub", false),
+                ("/work/Ä", "/work/ä/sub", false),
+                (r"C:\work\Proj", "c:/WORK/proj/sub", true),
+            ] {
+                let mut sql = String::from("select ");
+                let mut args: Vec<String> = Vec::new();
+                push_path_columns_with_case(&mut sql, &mut args, prefix, &["path"], fold);
+                sql.push_str(" from (select ? as path)");
+                args.push(value.into());
+                let found: bool = db
+                    .query_row(&sql, rusqlite::params_from_iter(args), |row| row.get(0))
+                    .unwrap();
+                assert_eq!(
+                    found, expected,
+                    "fold={fold}, prefix={prefix:?}, path={value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn portable_path_predicates_share_case_separator_and_boundary_rules() {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(&dir.path().join("index.db")).unwrap();
         let cases = [
-            ("/work/Proj", "/work/proj", false),
-            ("/work/Proj", "/work/proj/sub", false),
+            ("/work/Proj", "/work/proj", cfg!(target_os = "macos")),
+            ("/work/Proj", "/work/proj/sub", cfg!(target_os = "macos")),
             ("C:/work/proj", "C:/work/proj/sub", true),
             (r"C:\work\Proj", r"c:\work\proj", true),
             (r"C:\work\Proj", r"c:\work\proj\sub", true),
@@ -13011,7 +13107,7 @@ mod tests {
             ("/work/Proj", "/work/Proj/", true),
             ("/work/Proj", "/work/Proj/sub", true),
             ("/work/Proj", "/work/Proj-other", false),
-            ("/work/proj", "/work/Proj/sub", false),
+            ("/work/proj", "/work/Proj/sub", cfg!(target_os = "macos")),
             (r"/work/proj\name", r"/work/proj\name/sub", true),
             (r"/work/proj\name", "/work/proj/name/sub", false),
             ("/work/proj%_", "/work/proj%_/sub", true),
