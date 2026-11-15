@@ -5830,7 +5830,13 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-python_value! { NativeSessionRecord, slf => value_fields(slf.as_any(), &["id","provider","provider_session_id","title","summary","cwd","repo_root","created_at","updated_at","last_message_at","preview_text","raw_metadata_json","source_path","message_count","parse_warning","parent_session_id","agent_label","discovery_source","parse_version"]); }
+python_value! { NativeSessionRecord, slf => {
+    let result = value_fields(slf.as_any(), &["id","provider","provider_session_id","title","summary","cwd","repo_root","created_at","updated_at","last_message_at","preview_text","raw_metadata_json","source_path","message_count","parse_warning","parent_session_id","agent_label","discovery_source","parse_version"])?;
+    if slf.borrow().raw_metadata_json.is_none() {
+        result.cast::<PyDict>()?.del_item("raw_metadata_json")?;
+    }
+    Ok(result)
+}; }
 
 #[pymethods]
 impl NativeAnalysisCursor {
