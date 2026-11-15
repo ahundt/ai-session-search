@@ -4822,11 +4822,11 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "since": { "type": "string", "description": "Inclusive event start, RFC 3339 or period (7d, 2026-01); UTC unless offset/zone. Omit for unbounded." },
                             "until": { "type": "string", "description": "Inclusive event end; same forms as since. Omit for unbounded." },
                             "when": { "type": "string", "description": "Event period; conflicts with since/until. Omit for unbounded." },
-                            "context_before": { "type": "integer", "minimum": 0, "description": "Messages before seq; omit for context. 0 selects none." },
-                            "context_after": { "type": "integer", "minimum": 0, "description": "Messages after seq; omit for context. 0 selects none." },
+                            "context_before": { "type": "integer", "minimum": 0, "description": "With seq: sequence-number radius before anchor, 0..9223372036854775807; all rows tied at each sequence included. Omit for context (default 0)." },
+                            "context_after": { "type": "integer", "minimum": 0, "description": "With seq: sequence-number radius after anchor, 0..9223372036854775807; all rows tied at each sequence included. Omit for context (default 0)." },
                             "context": {
                                 "type": "integer", "minimum": 0,
-                                "description": "When seq is provided, include this many turns before and after that message (default 0)."
+                                "description": "With seq: sequence-number radius on both sides, 0..9223372036854775807; all tied rows included. Omit for 0 (anchor sequence only)."
                             },
                             "include_refs": {
                                 "type": "boolean",

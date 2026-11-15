@@ -859,16 +859,16 @@ pub struct MessageGetArgs {
     /// indexed. A sequence past the session's end returns no rows. Omit to read the whole session.
     #[arg(long)]
     pub seq: Option<i64>,
-    /// With --seq, include this many neighboring messages (0 or greater) before and after the
-    /// selected seq; 0 (the default) shows only the selected message.
+    /// With --seq, sequence-number radius on both sides (0..9223372036854775807).
+    /// All rows tied at each sequence are included; default 0 selects only the anchor sequence.
     #[arg(long, default_value_t = 0, value_parser = parse_context_count)]
     pub context: i64,
-    /// With --seq, override the number of messages before the anchor (0 or greater).
-    /// Omit to use --context.
+    /// With --seq, sequence-number radius before the anchor (0..9223372036854775807).
+    /// All rows tied at each sequence are included. Omit to use --context (default 0).
     #[arg(long, requires = "seq", value_parser = parse_context_count)]
     pub context_before: Option<i64>,
-    /// With --seq, override the number of messages after the anchor (0 or greater).
-    /// Omit to use --context.
+    /// With --seq, sequence-number radius after the anchor (0..9223372036854775807).
+    /// All rows tied at each sequence are included. Omit to use --context (default 0).
     #[arg(long, requires = "seq", value_parser = parse_context_count)]
     pub context_after: Option<i64>,
     /// Include extracted URL references in output for the focused --seq window or whole session.
