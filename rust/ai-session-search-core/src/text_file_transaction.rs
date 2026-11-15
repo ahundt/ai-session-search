@@ -74,12 +74,39 @@ impl TextFileChange {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SymlinkImage {
     Absent,
     Directory,
     Link { target: EncodedPath },
+}
+
+impl PartialEq for SymlinkImage {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Absent, Self::Absent) | (Self::Directory, Self::Directory) => true,
+            (Self::Link { target: left }, Self::Link { target: right }) => {
+                match (left, right) {
+                    (EncodedPath::WindowsWide(left), EncodedPath::WindowsWide(right)) => {
+                        // Win32 accepts either separator, but verbatim/device paths do not.
+                        // Keep case, relative targets, dot components, and every other unit exact.
+                        let literal = |units: &[u16]| {
+                            units.starts_with(&[92, 92, 63, 92])
+                                || units.starts_with(&[92, 92, 46, 92])
+                        };
+                        if literal(left) || literal(right) {
+                            return left == right;
+                        }
+                        let separator = |unit: &u16| if *unit == 47 { 92 } else { *unit };
+                        left.iter().map(separator).eq(right.iter().map(separator))
+                    }
+                    _ => left == right,
+                }
+            }
+            _ => false,
+        }
+    }
 }
 
 impl SymlinkImage {
@@ -903,6 +930,30 @@ mod tests {
         assert_eq!(fs::read_to_string(first).unwrap(), "before-1");
         assert_eq!(fs::read_to_string(second).unwrap(), "before-2");
         assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn windows_link_images_compare_injected_readings_by_native_separators() {
+        let image = |path: &str| SymlinkImage::Link {
+            target: EncodedPath::WindowsWide(path.encode_utf16().collect()),
+        };
+        // Model symlink_dir receiving a joined path and read_link returning backslashes.
+        let planned = image(r"C:\work/package\ai-session-search");
+        let read_back = image(r"C:\work\package\ai-session-search");
+        assert_eq!(planned, read_back);
+        assert_ne!(planned, image(r"C:\work\other\ai-session-search"));
+        assert_ne!(planned, image(r"c:\work\package\ai-session-search"));
+        assert_ne!(planned, image(r"work\package\ai-session-search"));
+        assert_ne!(image(r"\\?\C:\work/package"), image(r"\\?\C:\work\package"));
+        assert_ne!(image(r"\\.\C:\work/package"), image(r"\\.\C:\work\package"));
+        assert_ne!(
+            SymlinkImage::Link {
+                target: EncodedPath::UnixBytes(b"/work/a\\b".to_vec())
+            },
+            SymlinkImage::Link {
+                target: EncodedPath::UnixBytes(b"/work/a/b".to_vec())
+            }
+        );
     }
 
     #[test]
