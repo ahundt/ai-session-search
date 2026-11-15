@@ -103,7 +103,6 @@ across stored message roles, and adds file-recovery filters and typed library op
    prompts and interactive answers and lose skill expansions, attached context, and copied parent
    history in Codex, Pi, and Prime Agent forks. Omit `--role` on message search for complete
    stored content; use `aise db query` with `WHERE role = 'user'` for stored-role rows.
-   There is no switch to restore the older attribution rules.
 3. `aise files history FILE` returns every version by default; 1.0.0 stopped at 50.
    Use `--limit 50` for the earlier extent. Python file queries also default to every match
    instead of 50; pass `request=FileQuery(limit=50)` for the earlier page.
@@ -111,8 +110,7 @@ across stored message roles, and adds file-recovery filters and typed library op
    descendants, treating `%` and `_` literally. Windows drive and UNC (network share) paths
    accept either separator and ignore ASCII case; macOS also ignores ASCII case for Unix-style
    paths, including the directory itself. Unix-style paths on other systems are case-sensitive,
-   unlike 1.0.0 descendant matching. Use the recorded case on those systems; there is no
-   case-insensitive path option.
+   unlike 1.0.0 descendant matching. Use the recorded case on those systems.
 5. Library date bounds on file history and reconstruction now select edit timestamps instead of
    being ignored. Reconstruction replays earlier edits before selecting versions, keeping their
    numbers; one-version reads choose the last version in the period and reject an explicitly
