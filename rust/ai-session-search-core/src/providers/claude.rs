@@ -4984,7 +4984,7 @@ mod tests {
         db.upsert_session(&old, 1, 1).unwrap();
         for generation in [2, 3] {
             db.upsert_session(&parsed, generation, generation).unwrap();
-            assert_eq!(db.message_count().unwrap(), 6);
+            assert_eq!(db.message_count().unwrap(), 8);
             let human = db
                 .search_messages(
                     "",
@@ -4996,8 +4996,8 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 human.len(),
-                3,
-                "two submissions plus the archive, not replays"
+                5,
+                "two submissions, two ambiguous legacy originals and the archive"
             );
             let conn = rusqlite::Connection::open(temp.path().join("index.db")).unwrap();
             let transcript: String = conn
@@ -5017,10 +5017,10 @@ mod tests {
         use crate::models::{MessageFilters, MessageRecordRelation, Role};
         for (keep_original, keep_replay, second_submission, expected_human, time_mode) in [
             (true, true, false, 1, 0),
-            (false, true, false, 1, 0),
-            (true, false, false, 1, 0),
+            (false, true, false, 2, 0),
+            (true, false, false, 2, 0),
             (false, false, false, 2, 0),
-            (false, true, true, 2, 0),
+            (false, true, true, 3, 0),
             // Equal or absent stored timestamps cannot identify the replay-only row.
             (false, true, false, 2, 1),
             (false, true, false, 2, 2),
@@ -5099,7 +5099,10 @@ mod tests {
             let parsed = parse(current);
             for generation in [2, 3] {
                 db.upsert_session(&parsed, generation, generation).unwrap();
-                assert_eq!(coordinates(), before, "no deletion or coordinate changes");
+                let after = coordinates();
+                for coordinate in &before {
+                    assert!(after.contains(coordinate));
+                }
                 let human = db
                     .search_messages(
                         "",
@@ -5127,13 +5130,191 @@ mod tests {
                 );
                 assert_eq!(
                     relations[1],
-                    if (keep_original || keep_replay) && time_mode == 0 {
+                    if keep_original && keep_replay {
                         "mirror"
                     } else {
                         "original"
                     }
                 );
             }
+        }
+    }
+
+    #[test]
+    fn replay_reconciliation_occurrence_matrix() {
+        use crate::models::{MessageFilters, MessageRecordRelation, Role};
+        // Stored: none, one typed original, typed original plus known mirror,
+        // and two or three legacy typed occurrences. Parsed: neither, original, replay, both.
+        for provider_path in [
+            "sessions/synthetic.jsonl",
+            "local-agent-mode-sessions/synthetic/audit.jsonl",
+        ] {
+            for time_mode in [1, 2, 0] {
+                for stored_mode in [1, 0, 2, 3, 4] {
+                    for parsed_mode in [2, 1, 3, 0] {
+                        let temp = tempdir().unwrap();
+                        let path = temp.path().join(provider_path);
+                        let record = |index: usize, replay: bool| {
+                            let mut value = json!({"type":"user","uuid":"input-1",
+                                "session_id":"synthetic","message":{"role":"user",
+                                "content":"synthetic repeated submission"}});
+                            if replay {
+                                value["isReplay"] = json!(true);
+                            }
+                            if time_mode != 2 {
+                                value["timestamp"] = json!(if time_mode == 1 || index == 0 {
+                                    "2026-01-01T00:00:00Z"
+                                } else if index == 1 {
+                                    "2026-01-01T00:00:01Z"
+                                } else {
+                                    "2026-01-01T00:00:02Z"
+                                });
+                                value["_audit_timestamp"] = value["timestamp"].clone();
+                            }
+                            value
+                        };
+                        let parse = |records: Vec<Value>| {
+                            let mut parsed = ClaudeAdapter::new(vec![])
+                                .parse_reader(
+                                    std::io::Cursor::new(
+                                        records
+                                            .iter()
+                                            .map(Value::to_string)
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
+                                    ),
+                                    &path,
+                                )
+                                .unwrap();
+                            // Exercise missing timestamps without session-date backfilling.
+                            if time_mode == 2 {
+                                for message in &mut parsed.messages {
+                                    message.ts = None;
+                                }
+                            }
+                            parsed
+                        };
+                        let count = [0, 1, 2, 3, 2][stored_mode];
+                        let mut old = parse(
+                            (0..count)
+                                .map(|i| record(i, stored_mode == 2 && i == 1))
+                                .collect(),
+                        );
+                        old.session.parse_version = "claude-legacy".into();
+                        // Equal timestamps are distinct occurrences despite equal text.
+                        if stored_mode == 3 || stored_mode == 4 {
+                            old.messages = (0..count)
+                                .map(|i| {
+                                    let mut message =
+                                        parse(vec![record(i, false)]).messages.remove(0);
+                                    message.seq = i as i64;
+                                    message
+                                })
+                                .collect();
+                        }
+                        let db_path = temp.path().join("index.db");
+                        let db = crate::db::Db::open(&db_path).unwrap();
+                        db.upsert_session(&old, 1, 1).unwrap();
+                        let conn = rusqlite::Connection::open(&db_path).unwrap();
+                        let coordinates = || {
+                            conn.prepare("select id, seq from messages order by id")
+                                .unwrap()
+                                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))
+                                .unwrap()
+                                .collect::<rusqlite::Result<Vec<_>>>()
+                                .unwrap()
+                        };
+                        let before = coordinates();
+                        let mut records = Vec::new();
+                        if parsed_mode & 1 != 0 {
+                            records.push(record(0, false));
+                        }
+                        if parsed_mode & 2 != 0 {
+                            records.push(record(1, true));
+                            records.push(record(1, true)); // Declined duplicate must not delete archives.
+                        }
+                        let current = parse(records);
+                        assert_eq!(current.session.id, old.session.id);
+                        let initial_typed = [0, 1, 1, 3, 2][stored_mode];
+                        let expected = if parsed_mode == 3 && stored_mode >= 3 {
+                            initial_typed - 1
+                        } else if stored_mode == 0 && parsed_mode & 1 != 0 {
+                            1
+                        } else {
+                            initial_typed
+                        };
+                        for generation in [2, 3] {
+                            db.upsert_session(&current, generation, generation).unwrap();
+                            let after = coordinates();
+                            for coordinate in &before {
+                                assert!(after.contains(coordinate));
+                            }
+                            let human = db
+                                .search_messages(
+                                    "",
+                                    &MessageFilters {
+                                        role: Some(Role::User),
+                                        ..Default::default()
+                                    },
+                                )
+                                .unwrap();
+                            assert_eq!(human.len(), expected,
+                                "stored={stored_mode}, parsed={parsed_mode}, time={time_mode}, provider={provider_path}");
+                            let mirrors: i64 = conn
+                                .query_row(
+                                    "select count(*) from messages where record_relation='mirror'",
+                                    [],
+                                    |r| r.get(0),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                mirrors,
+                                if parsed_mode & 2 != 0 || stored_mode == 2 {
+                                    1
+                                } else {
+                                    0
+                                }
+                            );
+                            assert_eq!(after.len(), expected + mirrors as usize);
+                            assert!(current.messages.iter().all(|m| m.provenance.record_relation
+                                == MessageRecordRelation::Original
+                                || m.provenance.record_relation == MessageRecordRelation::Mirror));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_claude_reconciliation_skips_replay_work() {
+        for count in [4, 8] {
+            let temp = tempdir().unwrap();
+            let path = temp.path().join("synthetic.jsonl");
+            let text = (0..count)
+                .map(|i| {
+                    json!({"type":"user","uuid":format!("input-{i}"),
+                "sessionId":"synthetic","message":{"role":"user","content":format!("request {i}")}})
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let parsed = ClaudeAdapter::new(vec![])
+                .parse_reader(std::io::Cursor::new(text), &path)
+                .unwrap();
+            let mut old = parsed.clone();
+            old.session.parse_version = "claude-legacy".into();
+            let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+            db.upsert_session(&old, 1, 1).unwrap();
+            crate::db::CLAUDE_INPUT_WORK.with(|work| work.set(0));
+            db.upsert_session(&parsed, 2, 2).unwrap();
+            crate::db::CLAUDE_INPUT_WORK.with(|work| assert_eq!(work.get(), 0));
+            let mut replayed = parsed.clone();
+            replayed.messages[0].provenance.record_relation =
+                crate::models::MessageRecordRelation::Mirror;
+            crate::db::CLAUDE_INPUT_WORK.with(|work| work.set(0));
+            db.upsert_session(&replayed, 3, 3).unwrap();
+            crate::db::CLAUDE_INPUT_WORK.with(|work| assert_eq!(work.get(), 3 * count));
         }
     }
 
