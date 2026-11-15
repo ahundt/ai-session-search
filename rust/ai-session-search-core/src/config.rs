@@ -1915,22 +1915,18 @@ impl Config {
             };
             move |origin: String| labels.origin(origin)
         };
-        let (config_path, config_origin, explicit_config_path) =
-            if let Some(path) = overrides.config_path {
-                (expand_override_path(path), "cli --config".to_string(), true)
-            } else if let Some(path) = environment.config_path {
-                (
-                    expand_override_path(path),
-                    "environment AI_SESSION_SEARCH_CONFIG".to_string(),
-                    true,
-                )
-            } else {
-                (
-                    Self::config_path(),
-                    "platform/legacy discovery".to_string(),
-                    false,
-                )
-            };
+        let explicit_config_path =
+            overrides.config_path.is_some() || environment.config_path.is_some();
+        let (config_path, config_origin) = select_config_value(
+            overrides
+                .config_path
+                .map(|path| (expand_override_path(path), "cli --config")),
+            environment
+                .config_path
+                .map(|path| (path, "environment AI_SESSION_SEARCH_CONFIG")),
+            || (Self::config_path(), "platform/legacy discovery"),
+            |path| Ok(expand_override_path(path)),
+        )?;
         // Initialization creates or explicitly replaces this file, including an invalid old file.
         let raw = if initializing {
             String::new()
@@ -1967,38 +1963,42 @@ impl Config {
             has_cache_config,
         );
 
-        let (database, database_origin) = if let Some(path) = overrides.database_path {
-            (path, "cli --database".to_string())
-        } else if let Some(path) = environment.database_path {
-            (path, "environment AI_SESSION_SEARCH_DATABASE".to_string())
-        } else {
-            (
-                config.db_path(),
-                if has_database_config {
-                    "config file"
-                } else {
-                    "typed/platform default"
-                }
-                .to_string(),
-            )
-        };
+        let (database, database_origin) = select_config_value(
+            overrides.database_path.map(|path| (path, "cli --database")),
+            environment
+                .database_path
+                .map(|path| (path, "environment AI_SESSION_SEARCH_DATABASE")),
+            || {
+                (
+                    config.db_path(),
+                    if has_database_config {
+                        "config file"
+                    } else {
+                        "typed/platform default"
+                    },
+                )
+            },
+            Ok,
+        )?;
         config.index.db_path = Some(database.to_string_lossy().into_owned());
 
-        let (cache, cache_origin) = if let Some(path) = overrides.cache_dir {
-            (path, "cli --cache-dir".to_string())
-        } else if let Some(path) = environment.cache_dir {
-            (path, "environment AI_SESSION_SEARCH_CACHE_DIR".to_string())
-        } else {
-            (
-                config.cache_dir(),
-                if has_cache_config {
-                    "config file"
-                } else {
-                    "typed/platform default"
-                }
-                .to_string(),
-            )
-        };
+        let (cache, cache_origin) = select_config_value(
+            overrides.cache_dir.map(|path| (path, "cli --cache-dir")),
+            environment
+                .cache_dir
+                .map(|path| (path, "environment AI_SESSION_SEARCH_CACHE_DIR")),
+            || {
+                (
+                    config.cache_dir(),
+                    if has_cache_config {
+                        "config file"
+                    } else {
+                        "typed/platform default"
+                    },
+                )
+            },
+            Ok,
+        )?;
         config.index.cache_dir = Some(cache.to_string_lossy().into_owned());
 
         let (index_refresh, index_refresh_origin) = resolve_index_refresh_setting(
@@ -2531,32 +2531,46 @@ fn parse_positive_threads(name: &str, raw: &str) -> Result<usize> {
     }
 }
 
+fn select_config_value<T, E>(
+    explicit: Option<(T, &str)>,
+    environment: Option<(E, &str)>,
+    configured: impl FnOnce() -> (T, &'static str),
+    parse_environment: impl FnOnce(E) -> Result<T>,
+) -> Result<(T, String)> {
+    if let Some((value, origin)) = explicit {
+        return Ok((value, origin.to_string()));
+    }
+    if let Some((raw, origin)) = environment {
+        return Ok((parse_environment(raw)?, origin.to_string()));
+    }
+    let (value, origin) = configured();
+    Ok((value, origin.to_string()))
+}
+
 fn resolve_index_refresh_setting(
     cli: Option<IndexRefresh>,
     environment: Option<&str>,
     configured: IndexRefresh,
     configured_explicitly: bool,
 ) -> Result<(IndexRefresh, String)> {
-    if let Some(value) = cli {
-        return Ok((value, "cli --index-refresh".to_string()));
-    }
-    if let Some(raw) = environment {
-        return Ok((
-            raw.parse().map_err(|error: String| {
-                anyhow::anyhow!("AI_SESSION_SEARCH_INDEX_REFRESH {error}")
-            })?,
-            "environment AI_SESSION_SEARCH_INDEX_REFRESH".to_string(),
-        ));
-    }
-    Ok((
-        configured,
-        if configured_explicitly {
-            "config file"
-        } else {
-            "typed default"
-        }
-        .to_string(),
-    ))
+    select_config_value(
+        cli.map(|value| (value, "cli --index-refresh")),
+        environment.map(|raw| (raw, "environment AI_SESSION_SEARCH_INDEX_REFRESH")),
+        || {
+            (
+                configured,
+                if configured_explicitly {
+                    "config file"
+                } else {
+                    "typed default"
+                },
+            )
+        },
+        |raw| {
+            raw.parse()
+                .map_err(|error: String| anyhow::anyhow!("AI_SESSION_SEARCH_INDEX_REFRESH {error}"))
+        },
+    )
 }
 
 fn resolve_threads_setting(
@@ -2565,27 +2579,24 @@ fn resolve_threads_setting(
     configured: usize,
     configured_explicitly: bool,
 ) -> Result<(usize, String)> {
-    if let Some(value) = cli {
-        if value == 0 {
-            bail!("--threads must be a positive integer");
-        }
-        return Ok((value, "cli --threads".to_string()));
+    if cli == Some(0) {
+        bail!("--threads must be a positive integer");
     }
-    if let Some(raw) = canonical_env {
-        return Ok((
-            parse_positive_threads("AI_SESSION_SEARCH_THREADS", raw)?,
-            "environment AI_SESSION_SEARCH_THREADS".to_string(),
-        ));
-    }
-    Ok((
-        configured,
-        if configured_explicitly {
-            "config file"
-        } else {
-            "typed/host default"
-        }
-        .to_string(),
-    ))
+    select_config_value(
+        cli.map(|value| (value, "cli --threads")),
+        canonical_env.map(|raw| (raw, "environment AI_SESSION_SEARCH_THREADS")),
+        || {
+            (
+                configured,
+                if configured_explicitly {
+                    "config file"
+                } else {
+                    "typed/host default"
+                },
+            )
+        },
+        |raw| parse_positive_threads("AI_SESSION_SEARCH_THREADS", raw),
+    )
 }
 
 /// Resolve the serialized-`CallToolResult` ceiling: registration environment, then config file,
@@ -2606,21 +2617,21 @@ fn resolve_max_tool_result_chars(
     configured: usize,
     configured_explicitly: bool,
 ) -> Result<(usize, String)> {
-    if let Some(raw) = environment {
-        return Ok((
-            parse_positive_result_ceiling("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", raw)?,
-            "environment AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS".to_string(),
-        ));
-    }
-    Ok((
-        configured,
-        if configured_explicitly {
-            "config file"
-        } else {
-            "typed default"
-        }
-        .to_string(),
-    ))
+    select_config_value(
+        None,
+        environment.map(|raw| (raw, "environment AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS")),
+        || {
+            (
+                configured,
+                if configured_explicitly {
+                    "config file"
+                } else {
+                    "typed default"
+                },
+            )
+        },
+        |raw| parse_positive_result_ceiling("AI_SESSION_SEARCH_MAX_TOOL_RESULT_CHARS", raw),
+    )
 }
 
 /// A ceiling of zero would reject every result including the smallest, so 1 is the floor.
@@ -4390,6 +4401,34 @@ mcp_config = "kilo.jsonc"
             (7, "environment AI_SESSION_SEARCH_THREADS")
         );
         assert!(resolve_threads_setting(None, Some("0"), 3, true).is_err());
+        assert_eq!(
+            resolve_threads_setting(Some(11), Some("bad"), 3, true).unwrap(),
+            (11, "cli --threads".into())
+        );
+        assert_eq!(
+            resolve_threads_setting(Some(0), Some("7"), 3, true)
+                .unwrap_err()
+                .to_string(),
+            "--threads must be a positive integer"
+        );
+        assert_eq!(
+            resolve_threads_setting(None, None, 3, true).unwrap(),
+            (3, "config file".into())
+        );
+        assert_eq!(
+            resolve_threads_setting(None, None, 0, false).unwrap(),
+            (0, "typed/host default".into())
+        );
+        assert_eq!(
+            resolve_index_refresh_setting(
+                Some(IndexRefresh::Auto),
+                Some("bad"),
+                IndexRefresh::Auto,
+                false
+            )
+            .unwrap(),
+            (IndexRefresh::Auto, "cli --index-refresh".into())
+        );
     }
 
     #[test]
