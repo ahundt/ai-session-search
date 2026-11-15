@@ -14,7 +14,6 @@ import pytest
 import ai_session_search as aise
 
 
-@pytest.mark.integration
 def test_codex_unknown_record_inventory_matches_python_cli_and_mcp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
