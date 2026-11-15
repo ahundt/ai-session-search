@@ -1083,7 +1083,9 @@ skill_discovery_roots = ["configured/skills"]
         assert!(
             entries
                 .iter()
-                .any(|entry| entry["path"] == path.to_str().unwrap() && entry["current"] == true),
+                .any(|entry| entry["path"].as_str().map(std::path::Path::new)
+                    == Some(path.as_path())
+                    && entry["current"] == true),
             "{status}"
         );
     }
