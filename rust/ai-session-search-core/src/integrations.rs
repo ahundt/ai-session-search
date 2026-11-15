@@ -5116,20 +5116,36 @@ fn json_server_layout(format: ConfigFormat) -> Option<JsonServerLayout> {
     })
 }
 
-fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
+enum JsonEntryShape {
+    CommandArgs { stdio: bool },
+    LocalCommand,
+}
+
+fn json_entry_shape(format: ConfigFormat) -> JsonEntryShape {
     match format {
         ConfigFormat::VscodeServers | ConfigFormat::PrimeAgent | ConfigFormat::Cursor => {
-            json!({"type": "stdio", "command": binary, "args": ["mcp", "serve"]})
+            JsonEntryShape::CommandArgs { stdio: true }
         }
-        ConfigFormat::OpenCode | ConfigFormat::Kilo => {
-            json!({"type": "local", "command": [binary, "mcp", "serve"]})
-        }
+        ConfigFormat::OpenCode | ConfigFormat::Kilo => JsonEntryShape::LocalCommand,
         ConfigFormat::JsonMcpServers
         | ConfigFormat::Pi
         | ConfigFormat::ZedContextServers
         | ConfigFormat::OpenClaw
-        | ConfigFormat::CodexToml => {
-            json!({"command": binary, "args": ["mcp", "serve"]})
+        | ConfigFormat::CodexToml => JsonEntryShape::CommandArgs { stdio: false },
+    }
+}
+
+fn json_server_entry(format: ConfigFormat, binary: &str) -> Value {
+    match json_entry_shape(format) {
+        JsonEntryShape::CommandArgs { stdio } => {
+            let mut entry = json!({"command": binary, "args": ["mcp", "serve"]});
+            if stdio {
+                entry["type"] = json!("stdio");
+            }
+            entry
+        }
+        JsonEntryShape::LocalCommand => {
+            json!({"type": "local", "command": [binary, "mcp", "serve"]})
         }
     }
 }
@@ -6104,8 +6120,12 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
     let Some(entry) = entry.as_object() else {
         return false;
     };
-    match format {
-        ConfigFormat::OpenCode | ConfigFormat::Kilo => {
+    // Codex uses the command/args writer as an intermediate value for TOML, not JSON status.
+    if matches!(format, ConfigFormat::CodexToml) {
+        return false;
+    }
+    match json_entry_shape(format) {
+        JsonEntryShape::LocalCommand => {
             entry.get("type").and_then(Value::as_str) == Some("local")
                 && entry
                     .get("command")
@@ -6116,21 +6136,13 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
                             && mcp_serve_arguments(&command[1..])
                     })
         }
-        ConfigFormat::JsonMcpServers
-        | ConfigFormat::Pi
-        | ConfigFormat::PrimeAgent
-        | ConfigFormat::Cursor
-        | ConfigFormat::VscodeServers
-        | ConfigFormat::ZedContextServers
-        | ConfigFormat::OpenClaw => {
+        JsonEntryShape::CommandArgs { stdio } => {
             let command_is_set = entry
                 .get("command")
                 .and_then(Value::as_str)
                 .is_some_and(|command| !command.is_empty());
-            let type_is_valid = !matches!(
-                format,
-                ConfigFormat::VscodeServers | ConfigFormat::PrimeAgent | ConfigFormat::Cursor
-            ) || entry.get("type").and_then(Value::as_str) == Some("stdio");
+            let type_is_valid =
+                !stdio || entry.get("type").and_then(Value::as_str) == Some("stdio");
             command_is_set
                 && type_is_valid
                 && entry
@@ -6138,7 +6150,6 @@ fn json_entry_is_current(entry: &Value, format: ConfigFormat) -> bool {
                     .and_then(Value::as_array)
                     .is_some_and(|args| mcp_serve_arguments(args))
         }
-        ConfigFormat::CodexToml => false,
     }
 }
 
@@ -6866,6 +6877,87 @@ mod tests {
         ));
         assert!(!json_array_is_strings(Some(&json!("mcp serve")), &["mcp"]));
         assert!(!json_array_is_strings(None, &["mcp", "serve"]));
+    }
+
+    #[test]
+    fn json_entry_generation_and_acceptance_preserve_all_format_shapes() {
+        for (format, expected) in [
+            (
+                ConfigFormat::JsonMcpServers,
+                json!({"command":"aise","args":["mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::Pi,
+                json!({"command":"aise","args":["mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::ZedContextServers,
+                json!({"command":"aise","args":["mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::OpenClaw,
+                json!({"command":"aise","args":["mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::CodexToml,
+                json!({"command":"aise","args":["mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::PrimeAgent,
+                json!({"type":"stdio","command":"aise","args":["mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::Cursor,
+                json!({"type":"stdio","command":"aise","args":["mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::VscodeServers,
+                json!({"type":"stdio","command":"aise","args":["mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::OpenCode,
+                json!({"type":"local","command":["aise","mcp","serve"]}),
+            ),
+            (
+                ConfigFormat::Kilo,
+                json!({"type":"local","command":["aise","mcp","serve"]}),
+            ),
+        ] {
+            assert_eq!(
+                json_server_entry(format, "aise").to_string(),
+                expected.to_string()
+            );
+            let accepted = !matches!(format, ConfigFormat::CodexToml);
+            assert_eq!(json_entry_is_current(&expected, format), accepted);
+            let mut extended = expected.clone();
+            extended["env"] = json!({"EXTRA":"value"});
+            if let Some(args) = extended.get_mut("args") {
+                *args = json!(["--database", "/synthetic/index.db", "mcp", "serve"]);
+            } else {
+                extended["command"] =
+                    json!(["aise", "--database", "/synthetic/index.db", "mcp", "serve"]);
+            }
+            assert_eq!(json_entry_is_current(&extended, format), accepted);
+            let mut untyped = expected.clone();
+            untyped.as_object_mut().unwrap().remove("type");
+            assert_eq!(
+                json_entry_is_current(&untyped, format),
+                matches!(
+                    format,
+                    ConfigFormat::JsonMcpServers
+                        | ConfigFormat::Pi
+                        | ConfigFormat::ZedContextServers
+                        | ConfigFormat::OpenClaw
+                )
+            );
+            let mut empty_command = expected;
+            empty_command["command"] = if empty_command["command"].is_array() {
+                json!(["", "mcp", "serve"])
+            } else {
+                json!("")
+            };
+            assert!(!json_entry_is_current(&empty_command, format));
+        }
     }
 
     #[test]
