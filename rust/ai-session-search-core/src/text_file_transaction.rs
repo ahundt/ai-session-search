@@ -1162,7 +1162,7 @@ mod tests {
         assert!(root.join("receipt.json").is_file());
         let diagnostic = format!("{error:#}");
         assert!(
-            diagnostic.contains(&replaced.display().to_string()),
+            crate::durable_path::diagnostic_contains_path(&diagnostic, replaced),
             "{diagnostic}"
         );
         assert!(

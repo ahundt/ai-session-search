@@ -78,9 +78,75 @@ impl EncodedPath {
     }
 }
 
+/// Match a displayed path in a diagnostic without assuming Windows preserved separator spelling.
+#[cfg(test)]
+pub(crate) fn diagnostic_contains_path(diagnostic: &str, path: &Path) -> bool {
+    diagnostic_contains_path_with_platform(diagnostic, &path.display().to_string(), cfg!(windows))
+}
+
+#[cfg(test)]
+fn diagnostic_contains_path_with_platform(diagnostic: &str, path: &str, windows: bool) -> bool {
+    if windows && !path.starts_with(r"\\?\") && !path.starts_with(r"\\.\") {
+        // Only displayed ordinary Windows separators are interchangeable. Do not canonicalize
+        // diagnostics, fold case, expand short names, or change filesystem ownership checks.
+        diagnostic
+            .replace('/', r"\")
+            .contains(&path.replace('/', r"\"))
+    } else {
+        diagnostic.contains(path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_path_matching_accepts_injected_windows_separator_readings_only() {
+        let refusal = r"refusing to overwrite C:\fixture\SHORT~1\home\.agents\skills\ai-session-search\SKILL.md: it differs from what install recorded";
+        let mixed = r"C:\fixture\SHORT~1\home\.agents/skills/ai-session-search\SKILL.md";
+        assert!(diagnostic_contains_path_with_platform(refusal, mixed, true));
+        assert!(!diagnostic_contains_path_with_platform(
+            refusal, mixed, false
+        ));
+        assert!(!diagnostic_contains_path_with_platform(
+            refusal,
+            r"C:\fixture\SHORT~1\home\.agents\skills\other\SKILL.md",
+            true
+        ));
+        assert!(!diagnostic_contains_path_with_platform(
+            refusal,
+            r"\\?\C:\fixture\Long Name\home\.agents\skills\ai-session-search\SKILL.md",
+            true
+        ));
+
+        let recovery = r"transaction parent C:\fixture\SHORT~1\copy\references changed location: recorded \\?\C:\fixture\Long Name\copy\references, now \\?\C:\fixture\Long Name\external";
+        assert!(diagnostic_contains_path_with_platform(
+            recovery,
+            r"C:\fixture\SHORT~1\copy/references",
+            true
+        ));
+        assert!(!diagnostic_contains_path_with_platform(
+            recovery,
+            r"\\?\C:\fixture\SHORT~1\copy\references",
+            true
+        ));
+        assert!(!diagnostic_contains_path_with_platform(
+            recovery,
+            r"c:\fixture\SHORT~1\copy\references",
+            true
+        ));
+        assert!(!diagnostic_contains_path_with_platform(
+            r"/fixture/name\piece",
+            "/fixture/name/piece",
+            false
+        ));
+        assert!(!diagnostic_contains_path_with_platform(
+            r"\\?\C:\fixture\name\piece",
+            r"\\?\C:\fixture\name/piece",
+            true
+        ));
+    }
 
     #[test]
     fn a_path_round_trips_through_its_native_encoding() {

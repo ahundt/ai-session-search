@@ -7995,7 +7995,7 @@ mod tests {
         assert!(
             diagnostic.contains("refusing to overwrite")
                 && diagnostic.contains("differs from what install recorded")
-                && diagnostic.contains(&changed.display().to_string()),
+                && crate::durable_path::diagnostic_contains_path(&diagnostic, &changed),
             "{diagnostic}"
         );
         copy_test_uninstall(&receipt, &layout, "codex");
