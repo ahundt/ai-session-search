@@ -498,6 +498,18 @@ const ATTRIBUTED_OR_UNATTRIBUTED_INPUT_SQL: &str = concat!(
     ")))"
 );
 const UNATTRIBUTED_QUEUED_INPUT_SQL: &str = concat!("(", unattributed_queued_input_sql!(), ")");
+
+/// Find earlier identities for one physical source. With S sessions and A matching aliases,
+/// the composite provider/source key bounds lookup to O(log S + A) index/table visits,
+/// plus O(A log A) ordering work and O(A) result memory. No message payload is read.
+const SESSION_RETIREMENT_SQL: &str =
+    "select id from sessions where provider = ?1 and source_path = ?2 and id != ?3 order by id";
+/// Additive storage: one provider/source-path/rowid key per session. Building reads S
+/// sessions once, with O(S log S) comparison work for SQLite's index sort and O(key bytes)
+/// durable storage. The smaller provider-only index still serves provider inventory scans.
+const SESSION_SOURCE_INDEX_SQL: &str =
+    "create index if not exists idx_sessions_provider_source on sessions(provider,source_path)";
+
 /// Excludes the latest queued copy whose text equals the next direct human input in its session.
 /// An intervening direct input breaks the pair; equal-sequence queued rows remain tied.
 /// The delivered row is the one read, so the input counts once.
@@ -1093,6 +1105,16 @@ impl Db {
             db.with_open_writer_permit(path, || db.init())
         };
         let preparation = preparation.and_then(|()| {
+            let has_source_index: bool = db.conn.query_row(
+                "select exists(select 1 from sqlite_schema where name='idx_sessions_provider_source')",
+                [], |row| row.get(0),
+            )?;
+            if !has_source_index {
+                db.with_open_writer_permit(path, || db.with_immediate_transaction(|| {
+                    db.conn.execute_batch(SESSION_SOURCE_INDEX_SQL)?;
+                    Ok(())
+                }))?;
+            }
             let installed: bool = db.conn.query_row(
                 "select exists(select 1 from sqlite_schema where name='idx_sessions_codex_fork_parent')",
                 [], |row| row.get(0),
@@ -1696,6 +1718,7 @@ impl Db {
             .pragma_update(None, "cache_size", -SQLITE_PAGE_CACHE_KIB)?;
         self.conn
             .pragma_update(None, "mmap_size", SQLITE_MMAP_BYTES)?;
+        self.conn.execute_batch(SESSION_SOURCE_INDEX_SQL)?;
         // `create table if not exists` does not add columns to a version-1 index. Additive
         // migration keeps legacy rows readable; `user_version < SCHEMA_VERSION` then requests
         // the full parser backfill that replaces their `unknown` kinds with provider evidence.
@@ -2662,10 +2685,7 @@ impl Db {
         // Unrelated providers naming the same path are kept.
         let mut retired_ids: Vec<String> = Vec::new();
         for path in &source_paths {
-            let mut statement = tx.prepare(
-                "select id from sessions where provider = ?1 and source_path = ?2 and id != ?3
-                 order by id",
-            )?;
+            let mut statement = tx.prepare(SESSION_RETIREMENT_SQL)?;
             let ids = statement
                 .query_map(
                     params![session.provider.as_str(), path, session.id],
@@ -15692,6 +15712,120 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn session_source_index_is_additive_on_released_and_current_layouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../tests/fixtures/v1_0_0_populated.sql"))
+            .unwrap();
+        let original_ids: Vec<String> = conn
+            .prepare("select id from sessions order by id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        // Adding the index alone leaves the released generation and every stored row intact.
+        conn.execute_batch(SESSION_SOURCE_INDEX_SQL).unwrap();
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            5
+        );
+        conn.execute_batch("drop index idx_sessions_provider_source")
+            .unwrap();
+        drop(conn);
+        let db = Db::open(&path).unwrap();
+        let ids: Vec<String> = db
+            .conn
+            .prepare("select id from sessions order by id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, original_ids);
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+        db.conn
+            .execute_batch("drop index idx_sessions_provider_source")
+            .unwrap();
+        drop(db);
+        let reader = Db::open_existing_read_only_with_threads(
+            &path,
+            DEFAULT_BUSY_TIMEOUT_MS,
+            NonZeroUsize::MIN,
+        )
+        .unwrap();
+        assert!(!reader.conn.query_row("select exists(select 1 from sqlite_schema where name='idx_sessions_provider_source')",[],|r|r.get::<_,bool>(0)).unwrap());
+        drop(reader);
+        let db = Db::open(&path).unwrap();
+        assert!(db.conn.query_row("select exists(select 1 from sqlite_schema where name='idx_sessions_provider_source')",[],|r|r.get::<_,bool>(0)).unwrap());
+        assert_eq!(db.schema_version().unwrap(), SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn session_retirement_work_growth() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for size in [16, 32, 64] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db::open(&dir.path().join("index.db")).unwrap();
+            for i in 0..size {
+                db.conn.execute("insert into sessions(id,provider,provider_session_id,preview_text,source_path,parse_version,discovery_source) values(?1,'claude',?1,'',?2,'test','test')", params![format!("claude:{i}"),format!("/synthetic/{i}")]).unwrap();
+            }
+            let count = Arc::new(AtomicUsize::new(0));
+            let calls = count.clone();
+            db.conn
+                .create_scalar_function(
+                    "count_path",
+                    1,
+                    rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                    move |ctx| {
+                        calls.fetch_add(1, Ordering::Relaxed);
+                        ctx.get::<String>(0)
+                    },
+                )
+                .unwrap();
+            let instrumented = SESSION_RETIREMENT_SQL.replace(
+                "source_path = ?2",
+                "count_path(source_path) = ?2 and source_path = ?2",
+            );
+            for i in 0..size {
+                let result = db
+                    .conn
+                    .prepare(&instrumented)
+                    .unwrap()
+                    .query_map(
+                        params!["claude", format!("/synthetic/{i}"), "absent"],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(result, vec![format!("claude:{i}")]);
+            }
+            let visits = count.load(Ordering::Relaxed);
+            println!("sessions={size} source_comparisons={visits}");
+            assert_eq!(visits, size);
+            let plan = db
+                .conn
+                .prepare(&format!("explain query plan {SESSION_RETIREMENT_SQL}"))
+                .unwrap()
+                .query_map(params!["claude", "/synthetic/0", "absent"], |r| {
+                    r.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("\n");
+            println!("{plan}");
+            assert!(
+                plan.contains("idx_sessions_provider_source (provider=? AND source_path=?)"),
+                "{plan}"
+            );
+        }
     }
 
     fn queued_test_db() -> (tempfile::TempDir, Db) {
