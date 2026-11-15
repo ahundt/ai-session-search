@@ -1,6 +1,6 @@
 [package]
 name = "ai-session-search"
-version = "1.1.0"
+version = "1.1.0-rc.1"
 edition = "2021"
 rust-version.workspace = true
 description = "Search and recover local AI coding-agent session history from Claude Code, Codex, Gemini CLI, Cursor, and five more tools via CLI, MCP server, Python, or Rust"
