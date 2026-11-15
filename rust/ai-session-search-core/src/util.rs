@@ -2090,7 +2090,7 @@ fn parser_versions_pin_record_and_health_reconciliation() {
     for (provider, version) in [
         (Provider::Claude, "claude-v20"),
         (Provider::ClaudeDesktop, "claude-desktop-local-agent-v20"),
-        (Provider::Codex, "codex-v14"),
+        (Provider::Codex, "codex-v15"),
         (Provider::Cursor, "cursor-v7"),
         (Provider::Antigravity, "antigravity-v8"),
         (Provider::Pi, "pi-v7"),
@@ -2106,7 +2106,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
     match provider {
         Provider::Claude => "claude-v20",
         Provider::ClaudeDesktop => "claude-desktop-local-agent-v20",
-        Provider::Codex => "codex-v14",
+        Provider::Codex => "codex-v15",
         Provider::Cursor => "cursor-v7",
         Provider::Antigravity => "antigravity-v8",
         Provider::Pi => "pi-v7",
