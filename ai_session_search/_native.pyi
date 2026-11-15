@@ -1836,8 +1836,24 @@ class SessionSearch:
         """Return classification match rows directly; run_skill also returns policy receipts."""
     def vocabulary(self, *, prefix: str | None = None, trigram: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
         """Report index-wide terms and counts; refused under allowed-roots."""
-    def repeats(self, query: str | None = None, *, scope: QueryScope | None = None, role: str | None = None, query_mode: str = "literal", limit: int = 0, include_unattributed_input: bool = False, max_groups: int | None = None, max_examples_per_group: int | None = None, min_matches: int | None = None, phrase_min_words: int | None = None, phrase_max_words: int | None = None, context: int = 0) -> dict[str, Any]:
-        """Mine recurring phrases with examples and unattributed-input counts."""
+    def repeats(self, query: str | None = None, *, scope: QueryScope | None = None, role: str | None = None, query_mode: str = "literal", max_candidates: int = 0, include_unattributed_input: bool = False, max_groups: int | None = None, max_examples_per_group: int | None = None, min_matches: int | None = None, phrase_min_words: int | None = None, phrase_max_words: int | None = None, context: int = 0) -> dict[str, Any]:
+        """Mine recurring phrases and return groups, examples, and unattributed-input counts.
+        query is a string (None by default selects all candidates); query_mode is literal (default)
+        or regex with a query. role accepts user, assistant, tool, slash, or compaction; None (default)
+        uses human input. scope accepts QueryScope; None (default) adds no scope filters.
+        max_candidates counts input messages: integers 0..2**63-1, default 0 examines all candidates.
+        max_groups counts returned groups: None (default) uses analytics.repeat_max_groups (50
+        without configuration); 0 returns all groups. max_examples_per_group similarly uses
+        analytics.repeat_max_examples_per_group (3), with 0 for all examples. Both accept integers
+        0..2**63-1. min_matches and phrase_min_words accept integers 1..2**63-1; None (default)
+        uses analytics.repeat_min_matches (2) and analytics.repeat_phrase_min_words (2).
+        phrase_max_words accepts integers from phrase_min_words through 2**63-1; None (default)
+        uses analytics.repeat_phrase_max_words (5). Phrase widths count words.
+        include_unattributed_input is a bool, default False excludes unknown-sender queued input
+        but still counts it. context accepts integers 0..2**63-1, default 0, and sets only the
+        sequence-number radius in example follow-up commands, not retrieved rows.
+        Invalid values raise InvalidArgumentError; wrong argument types raise TypeError.
+        """
     def query_sql(self, sql: str, *, limit: int | None = None, offset: int = 0, timeout_ms: int | None = None, max_cell_chars: int = 0) -> dict[str, Any]:
         """Run one read-only SQL statement with configured access restrictions and bounds."""
     def resume_command(self, session_id: str) -> dict[str, Any]:

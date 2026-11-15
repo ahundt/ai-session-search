@@ -210,6 +210,11 @@ continues to return the full report with policy receipts and unattributed-input 
 `repeats()` returns the CLI report dictionary (`groups` with example message references,
 `unattributed_input_count`, and `unattributed_input_included`). Its bounds resolve from
 `[analytics]`, and `include_unattributed_input=True` includes queued input of unknown authorship.
+`max_candidates=0` (default) examines all input messages; positive integers cap candidate
+messages, not output groups. `max_groups=None` (default) uses `analytics.repeat_max_groups`
+(50 without configuration); 0 returns all groups and positive integers cap returned groups.
+Both counts accept 0 through `2**63-1`; invalid values raise `InvalidArgumentError` and wrong
+types raise `TypeError`.
 `vocabulary()` returns term/count dictionaries using `[analytics].vocab_limit`.
 `query_sql()` returns `columns`, `rows`, `next_offset`, and `truncated_cell_char_limit`, through
 `SqlService` with the same read-only authorizer and configured bounds as `aise db query`.
