@@ -2326,7 +2326,7 @@ fn claude_desktop_metadata(path: &Path) -> ClaudeDesktopMetadata {
 }
 
 /// Stage file-mutating calls by native id until their corresponding result proves completion.
-fn stage_file_edits(
+pub(crate) fn stage_file_edits(
     message: &Value,
     ts: Option<DateTime<Utc>>,
     pending: &mut PendingFileMutations,
@@ -2387,7 +2387,7 @@ pub(crate) fn collect_file_edits(
     }
 }
 
-fn collect_file_edit_results(
+pub(crate) fn collect_file_edit_results(
     message: &Value,
     pending: &mut PendingFileMutations,
     out: &mut Vec<FileEdit>,
