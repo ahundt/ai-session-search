@@ -61,7 +61,8 @@ across stored message roles, and adds file-recovery filters and typed library op
    completeness; structured message-search hits include nullable timestamps.
    MCP `get_session` focused reads accept `context_before` and `context_after`; range reads
    accept `role`, `limit`, `offset`, `order`, `since`, `until`, `when`, and `kinds`,
-   including `kinds` alone. Session metadata includes `parent_session_id` and `agent_label`.
+   including `kinds` alone. `session_metadata` on `get_session` reads includes
+   `parent_session_id` and `agent_label`.
 6. Rust adds typed errors and services for read-only SQL, repeat and vocabulary reports,
    configured session ranking, transcript windows, and resume-command arguments. Request
    constructors and setters support the non-exhaustive types. `open_strict()` and
@@ -126,7 +127,7 @@ across stored message roles, and adds file-recovery filters and typed library op
    `[providers.gemini-cli]` `paths = ["~/.gemini/tmp"]`.
 8. Cursor uses recorded turn clocks, inherited by following records, instead of assigning every
    message the file modification time; absent a clock it uses a stable file-derived time. Date
-   filters can select different rows after refresh; there is no legacy timestamp option.
+   filters can select different rows after refresh.
    Codex Add File extraction now keeps the final line feed on each added line, normalizes Windows
    line endings to line feeds, and leaves zero-line additions empty; remove the final line feed if
    an older consumer requires its omission.
@@ -169,9 +170,9 @@ across stored message roles, and adds file-recovery filters and typed library op
 
 1. Shortened, rewritten, or replaced transcripts could lose indexed history or leave stale rows;
    refresh now reconciles matching rows and preserves archived messages and file edits, including
-   same-size, same-time replacements with a changed file identity. Codex compressed
-   `.jsonl.zst` rollouts retain their identity, and decompression failures preserve the snapshot
-   for retry. A rewritten growing transcript is detected within its last 1 MiB; older rewrites
+   same-size, same-time replacements with a changed file identity. Codex discovery now reads
+   compressed `.jsonl.zst` rollouts and keeps the session identity when a transcript switches
+   between plain and compressed storage; decompression failures preserve the snapshot for retry. A rewritten growing transcript is detected within its last 1 MiB; older rewrites
    outside the head fingerprint and overlap still need `aise reindex --full`. Discovery warns
    when source names normalize to the same provider path instead of silently dropping a source.
 2. Claude saved API request copies and repeated record identities could add duplicate turns and
@@ -219,6 +220,14 @@ across stored message roles, and adds file-recovery filters and typed library op
 10. Empty message-search results now suggest harness notices, tool arguments, or recoverable
     files as other places to look. MCP keeps `purpose` and `purpose_version` selectable without
     configured search presets, reporting an argument error for an unknown purpose.
+
+### Performance
+
+1. An oldest-first content search with a limit and many candidate messages reads them in
+   session and sequence order and stops once the page is full. Searches that filter by role,
+   message class, provider, tool, or path keep the earlier plan.
+2. Literal matching skips positions that cannot begin a match before applying Unicode case
+   folding.
 
 ### Security
 
