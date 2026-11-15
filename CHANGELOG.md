@@ -11,7 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.1.0] - 2026-11-11
+## [1.1.0rc1] - 2026-11-15
 
 1.1.0 preserves indexed history when transcripts are shortened or rewritten, finds human input
 across stored message roles, and adds file-recovery filters and typed library operations.
@@ -301,6 +301,6 @@ the four release candidates, 1.0.0rc1 to 1.0.0rc4, are in
    this class was missed then. `DateRange` keeps its `Default`, which is how the Python binding
    and any other caller build one.
 
-[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.1.0...HEAD
-[1.1.0]: https://github.com/ahundt/ai-session-search/compare/v1.0.0...v1.1.0
+[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.1.0rc1...HEAD
+[1.1.0rc1]: https://github.com/ahundt/ai-session-search/compare/v1.0.0...v1.1.0rc1
 [1.0.0]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc4...v1.0.0
