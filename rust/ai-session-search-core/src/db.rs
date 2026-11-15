@@ -8334,30 +8334,46 @@ fn store_parsed_file_edits(
         insert_file_edits(tx, session, file_edits.iter().map(|e| (e.seq, *e)))?;
         return Ok(true);
     }
-    let mut positions: HashMap<RowDigest, std::collections::VecDeque<usize>> = HashMap::new();
+    // Match occurrences monotonically within each path, not independently by content.
+    // Search exact and known legacy representations together so an exact match cannot
+    // consume a later occurrence before the current occurrence's legacy match.
+    // For S stored and P parsed edits plus B content bytes: O((S + P) log S + B)
+    // matching work, O(S + P) retained keys/positions, and no extra body copies or I/O.
+    let mut positions: HashMap<RowDigest, std::collections::BTreeSet<usize>> = HashMap::new();
     for (position, (_, _, keys)) in stored.iter().enumerate() {
-        positions.entry(keys.edit).or_default().push_back(position);
+        positions.entry(keys.edit).or_default().insert(position);
     }
+    let mut next_by_path: HashMap<&str, usize> = HashMap::new();
     let matched: Vec<Option<usize>> = parsed_keys
         .iter()
         .zip(&file_edits)
         .map(|(keys, edit)| {
-            let exact = positions
-                .get_mut(&keys.edit)
-                .and_then(|queue| queue.pop_front());
-            if exact.is_some()
-                || same_parser
-                || session.provider != Provider::Codex
-                || edit.tool != "apply_patch"
-            {
-                return exact;
-            }
-            // Older Codex additions omitted the final LF. Match that exact content identity
-            // only for an addition still present in this parse; absent archived edits survive.
-            // Adds O(added content bytes) hashing work and no additional retained body copy.
-            let legacy = edit.new_content.as_deref()?.strip_suffix('\n')?;
-            let key = file_edit_content_key(&edit.tool, &edit.file_path, Some(legacy), None);
-            positions.get_mut(&key).and_then(|queue| queue.pop_front())
+            let next = next_by_path.entry(&edit.file_path).or_default();
+            let legacy_key = (!same_parser
+                && session.provider == Provider::Codex
+                && edit.tool == "apply_patch")
+                .then(|| {
+                    edit.new_content
+                        .as_deref()?
+                        .strip_suffix('\n')
+                        .map(|legacy| {
+                            file_edit_content_key(&edit.tool, &edit.file_path, Some(legacy), None)
+                        })
+                })
+                .flatten();
+            let (position, key) = std::iter::once(keys.edit)
+                .chain(legacy_key)
+                .filter_map(|key| {
+                    positions
+                        .get(&key)?
+                        .range(*next..)
+                        .next()
+                        .map(|&pos| (pos, key))
+                })
+                .min_by_key(|(pos, _)| *pos)?;
+            positions.get_mut(&key).unwrap().remove(&position);
+            *next = position + 1;
+            Some(position)
         })
         .collect();
     let mut changed = false;
@@ -8388,7 +8404,7 @@ fn store_parsed_file_edits(
     let mut retracted = vec![false; stored.len()];
     for edit in retracted_file_edits {
         let key = parsed_file_edit_keys(edit)?.edit;
-        if let Some(position) = positions.get_mut(&key).and_then(|queue| queue.pop_front()) {
+        if let Some(position) = positions.get_mut(&key).and_then(|set| set.pop_first()) {
             retracted[position] = true;
         }
     }

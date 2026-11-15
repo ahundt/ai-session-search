@@ -4228,6 +4228,141 @@ mod tests {
     }
 
     #[test]
+    fn added_file_upgrade_preserves_colliding_occurrences_and_archive() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("rollout-synthetic.jsonl");
+        let mut rows =
+            vec![json!({"type":"session_meta","payload":{"id":"synthetic-collision","cwd":"/p"}})];
+        for (i, patch) in [
+            "*** Add File: /p/f.txt\n+x",
+            "*** Delete File: /p/f.txt",
+            "*** Add File: /p/f.txt\n+x\n+",
+        ]
+        .iter()
+        .enumerate()
+        {
+            rows.push(json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":format!("call_{i}"),"name":"apply_patch","input":format!("*** Begin Patch\n{patch}\n*** End Patch")}}));
+            rows.push(json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":format!("call_{i}"),"output":"Exit code: 0\nWall time: 0.1 seconds\nOutput:\nSuccess. Updated the following files:\nA /p/f.txt\n"}}));
+        }
+        let source = rows
+            .into_iter()
+            .map(|row| row.to_string() + "\n")
+            .collect::<String>();
+        let parsed = CodexAdapter::new(vec![])
+            .parse_reader(std::io::Cursor::new(source), &path)
+            .unwrap();
+        assert_eq!(parsed.file_edits.len(), 3);
+        let mut old = parsed.clone();
+        old.session.parse_version = "codex-v14".into();
+        for edit in &mut old.file_edits {
+            if let Some(content) = &mut edit.new_content {
+                content.pop();
+            }
+        }
+        let mut archive = old.file_edits[0].clone();
+        archive.file_path = "/p/archive.txt".into();
+        archive.file_name = "archive.txt".into();
+        archive.seq = 3;
+        old.file_edits.push(archive);
+        let db = crate::db::Db::open(&temp.path().join("upgrade.db")).unwrap();
+        let fresh = crate::db::Db::open(&temp.path().join("fresh.db")).unwrap();
+        db.upsert_session(&old, 1, 1).unwrap();
+        fresh.upsert_session(&parsed, 1, 1).unwrap();
+        let archive_before = db
+            .file_edits_for_session_id("archive.txt", &parsed.session.id)
+            .unwrap();
+        let connection = rusqlite::Connection::open(temp.path().join("upgrade.db")).unwrap();
+        let row_ids = || {
+            connection
+                .prepare("select id from file_edits order by id")
+                .unwrap()
+                .query_map([], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let ids_before = row_ids();
+        let expected = vec![Some("x\n".to_string()), None, Some("x\n\n".to_string())];
+        for refresh in [2, 3] {
+            db.upsert_session(&parsed, refresh, 1).unwrap();
+            let versions = db
+                .file_edits_for_session_id("f.txt", &parsed.session.id)
+                .unwrap();
+            assert_eq!(versions.len(), 3);
+            assert_eq!(
+                versions
+                    .iter()
+                    .map(|row| row.2.new_content.clone())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            let clean = fresh
+                .file_edits_for_session_id("f.txt", &parsed.session.id)
+                .unwrap();
+            assert_eq!(
+                versions.iter().map(|row| &row.2).collect::<Vec<_>>(),
+                clean.iter().map(|row| &row.2).collect::<Vec<_>>()
+            );
+            let retained = db
+                .file_edits_for_session_id("archive.txt", &parsed.session.id)
+                .unwrap();
+            assert_eq!(retained.len(), 1);
+            assert_eq!(retained, archive_before);
+            assert_eq!(row_ids(), ids_before);
+        }
+    }
+
+    #[test]
+    fn partial_file_refresh_pairs_repeated_writes_in_order() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("rollout-synthetic.jsonl");
+        let source = json!({"type":"session_meta","payload":{"id":"synthetic-repeat","cwd":"/p"}})
+            .to_string()
+            + "\n";
+        let mut parsed = CodexAdapter::new(vec![])
+            .parse_reader(std::io::Cursor::new(source), &path)
+            .unwrap();
+        for (seq, content) in ["first", "middle", "first"].iter().enumerate() {
+            parsed.file_edits.push(crate::models::FileEdit {
+                seq: seq as i64,
+                ts: None,
+                tool: "write_file".into(),
+                file_path: "/p/f.txt".into(),
+                file_name: "f.txt".into(),
+                new_content: Some((*content).into()),
+                edits: vec![],
+            });
+        }
+        let db = crate::db::Db::open(&temp.path().join("partial.db")).unwrap();
+        db.upsert_session(&parsed, 1, 1).unwrap();
+        parsed.file_edits.remove(0);
+        let mut inserted = parsed.file_edits[0].clone();
+        inserted.new_content = Some("inserted".into());
+        parsed.file_edits.insert(1, inserted);
+        for (seq, edit) in parsed.file_edits.iter_mut().enumerate() {
+            edit.seq = seq as i64;
+        }
+        for refresh in [2, 3] {
+            db.upsert_session(&parsed, refresh, 1).unwrap();
+            let stored = db
+                .file_edits_for_session_id("f.txt", &parsed.session.id)
+                .unwrap();
+            assert_eq!(
+                stored
+                    .iter()
+                    .map(|row| row.2.new_content.as_deref())
+                    .collect::<Vec<_>>(),
+                vec![
+                    Some("first"),
+                    Some("middle"),
+                    Some("inserted"),
+                    Some("first")
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn extracts_file_edits_from_apply_patch() {
         let temp = tempdir().unwrap();
         let root = temp.path().to_path_buf();
