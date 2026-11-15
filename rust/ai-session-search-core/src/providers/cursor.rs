@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDateTime, TimeZone, Utc};
 use serde_json::{json, Value};
 
 use crate::models::{FileEdit, ParsedSession, Provider, SessionRecord, SourceFile};
@@ -125,7 +125,7 @@ impl CursorAdapter {
         };
         let cwd = infer_cursor_workspace(path);
         let mut created_at: Option<DateTime<Utc>> = None;
-        let updated_at = file_modified_at(path);
+        let mut updated_at: Option<DateTime<Utc>> = None;
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
@@ -158,11 +158,19 @@ impl CursorAdapter {
             if !matches!(role, "user" | "assistant") {
                 continue;
             }
+            let text = cursor_message_text(&value);
+            let timestamp = (role == "user")
+                .then(|| cursor_native_timestamp(&text).map(|(timestamp, _)| timestamp))
+                .flatten();
+            if let Some(timestamp) = timestamp {
+                created_at = Some(created_at.map_or(timestamp, |old| old.min(timestamp)));
+                updated_at = Some(updated_at.map_or(timestamp, |old| old.max(timestamp)));
+            }
             // Reuse the claude content-block helpers: capture file-mutating tool calls and
             // tag tool output. (Tool outputs are frequently absent from cursor transcripts on
             // disk; when present they are indexed as Role::Tool.)
             if let Some(message) = value.get("message") {
-                super::claude::stage_file_edits(message, updated_at, &mut pending_file_mutations);
+                super::claude::stage_file_edits(message, timestamp, &mut pending_file_mutations);
                 super::claude::collect_file_edit_results(
                     message,
                     &mut pending_file_mutations,
@@ -176,7 +184,7 @@ impl CursorAdapter {
                     requires_full_parse_for_tail = true;
                 }
                 super::claude::collect_tool_use_names(message, &mut tool_use_names);
-                super::claude::append_tool_use_messages(message, updated_at, &mut messages);
+                super::claude::append_tool_use_messages(message, timestamp, &mut messages);
                 if role == "user" {
                     if let Some(mixed) = super::claude::claude_mixed_user_content(
                         message,
@@ -186,12 +194,12 @@ impl CursorAdapter {
                         false,
                         None,
                     ) {
-                        let (raw_message, transcript_text) = mixed.into_raw_message(updated_at);
+                        let (raw_message, transcript_text) = mixed.into_raw_message(timestamp);
                         messages.push(raw_message);
                         if !transcript_text.is_empty() {
                             transcript_lines.push(format_transcript_line(
                                 "user",
-                                updated_at,
+                                timestamp,
                                 &transcript_text,
                             ));
                         }
@@ -208,21 +216,18 @@ impl CursorAdapter {
                             tool_name,
                             output.to_string(),
                             super::claude::tool_result_id(message),
-                            updated_at,
+                            timestamp,
                         ));
                     }
                     continue;
                 }
             }
-            let text = cursor_message_text(&value);
             if !substantive_text(&text) {
                 continue;
             }
-            if created_at.is_none() {
-                created_at = updated_at;
-            }
-            messages.push(RawMessage::message(role, text.clone(), updated_at, None));
-            transcript_lines.push(format_transcript_line(role, updated_at, &text));
+            // Unknown clocks remain None, including after the shared indexing fallback.
+            messages.push(RawMessage::message(role, text.clone(), timestamp, None));
+            transcript_lines.push(format_transcript_line(role, timestamp, &text));
         }
 
         let first_user = messages
@@ -343,13 +348,20 @@ fn collect_text_content(value: &Value, out: &mut Vec<String>) {
 // Retain the entire searchable text. Only a single whole-turn wrapper proves an
 // input region; inline, repeated, nested and incomplete tags are ambiguous.
 fn cursor_query_region(text: &str) -> Option<(usize, usize)> {
-    let body = text
+    let prefix = if text.starts_with("<timestamp>") {
+        cursor_timestamp_prefix(text)?.1
+    } else {
+        0
+    };
+    let framed = text[prefix..].trim_start();
+    let frame_offset = text.len() - framed.len();
+    let body = framed
         .strip_prefix("<user_query>")?
         .strip_suffix("</user_query>")?;
     if body.contains("<user_query>") || body.contains("</user_query>") {
         return None;
     }
-    let start = "<user_query>".len() + body.len() - body.trim_start().len();
+    let start = frame_offset + "<user_query>".len() + body.len() - body.trim_start().len();
     Some((start, start + body.trim().len()))
 }
 
@@ -423,11 +435,49 @@ fn cursor_input_provenance(message: &mut crate::models::Message) {
     message.provenance.content_parts = parts;
 }
 
-fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
-    path.metadata()
-        .ok()
-        .and_then(|metadata| metadata.modified().ok())
-        .map(DateTime::<Utc>::from)
+// Native Cursor framing observed in public JSONL examples. O(text bytes), no I/O.
+// A timestamp is metadata only when followed by one complete whole-turn query.
+fn cursor_native_timestamp(text: &str) -> Option<(DateTime<Utc>, usize)> {
+    let timestamp = cursor_timestamp_prefix(text)?;
+    cursor_query_region(text)?;
+    Some(timestamp)
+}
+
+fn cursor_timestamp_prefix(text: &str) -> Option<(DateTime<Utc>, usize)> {
+    let rest = text.strip_prefix("<timestamp>")?;
+    let (date, _) = rest.split_once("</timestamp>")?;
+    let (local, zone) = date.strip_suffix(')')?.rsplit_once(" (UTC")?;
+    let sign = match zone.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let zone = &zone[1..];
+    let (hours, minutes) = zone.split_once(':').unwrap_or((zone, "0"));
+    if hours.is_empty()
+        || hours.len() > 2
+        || minutes.is_empty()
+        || minutes.len() > 2
+        || !hours.bytes().all(|b| b.is_ascii_digit())
+        || !minutes.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let hours: i32 = hours.parse().ok()?;
+    let minutes: i32 = minutes.parse().ok()?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    let offset = FixedOffset::east_opt(sign * (hours * 3600 + minutes * 60))?;
+    let local = NaiveDateTime::parse_from_str(local, "%A, %b %e, %Y, %l:%M %p").ok()?;
+    let timestamp = offset
+        .from_local_datetime(&local)
+        .single()?
+        .with_timezone(&Utc);
+    Some((
+        timestamp,
+        "<timestamp>".len() + date.len() + "</timestamp>".len(),
+    ))
 }
 
 fn infer_cursor_workspace(path: &Path) -> Option<String> {
@@ -736,6 +786,101 @@ mod tests {
             }
         });
         assert_eq!(cursor_message_text(&value), "I found it.");
+    }
+
+    #[test]
+    fn timestamp_framing_rejects_literal_and_invalid_clocks() {
+        for text in [
+            "<timestamp>Tuesday</timestamp><user_query>x</user_query>",
+            "<timestamp>Monday, Nov 2, 2026, 3:04 PM (UTC+24)</timestamp><user_query>x</user_query>",
+            "<timestamp>Monday, Nov 2, 2026, 3:04 PM (UTC+1:60)</timestamp><user_query>x</user_query>",
+            "<timestamp>Monday, Nov 2, 2026, 3:04 PM (UTC+1)</timestamp> literal example",
+        ] {
+            assert!(super::cursor_native_timestamp(text).is_none());
+        }
+        let text = "<timestamp>Monday, Nov 2, 2026, 3:04 PM (UTC+5:30)</timestamp>\n<user_query>request 🦀</user_query>";
+        let parsed = CursorAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(json!({"role":"user","message":{"content":text}}).to_string()),
+                std::path::Path::new("synthetic.jsonl"),
+            )
+            .unwrap();
+        let message = &parsed.messages[0];
+        message.provenance.validate(text).unwrap();
+        let human: String = message
+            .provenance
+            .content_parts
+            .iter()
+            .filter(|part| part.authorship == crate::models::ContentPartAuthorship::Human)
+            .flat_map(|part| {
+                text.chars()
+                    .skip(part.start_char)
+                    .take(part.end_char - part.start_char)
+            })
+            .collect();
+        assert_eq!(human, "request 🦀");
+        assert_eq!(message.content, text);
+    }
+
+    #[test]
+    fn native_and_missing_timestamps_survive_append_row_by_row() {
+        use std::io::Write;
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("synthetic.jsonl");
+        let adapter = CursorAdapter::new(vec![]);
+        let records = [
+            json!({"role":"user","message":{"content":"<timestamp>Monday, Nov 2, 2026, 3:04 PM (UTC+5:30)</timestamp>\n<user_query>yesterday</user_query>"}}),
+            json!({"role":"assistant","message":{"content":"without a native clock"}}),
+        ];
+        fs::write(&path, format!("{}\n{}\n", records[0], records[1])).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1000))
+            .unwrap();
+        let mut before = adapter.parse_inner(&path).unwrap();
+        crate::util::backfill_parsed_dates(&mut before, 1_000_000_000_000);
+        assert_eq!(
+            before.messages[0].ts,
+            crate::util::parse_datetime("2026-11-02T09:34:00Z")
+        );
+        assert_eq!(before.messages[1].ts, None);
+        let offset = crate::tail::complete_prefix_offset(&path).unwrap();
+        let next = json!({"role":"user","message":{"content":"<timestamp>Tuesday, Nov 3, 2026, 9:00 AM (UTC-7)</timestamp>\n<user_query>today</user_query>"}});
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{next}"
+        )
+        .unwrap();
+        let crate::tail::TailParseRun::Complete(Some(tail)) = crate::tail::tail_parse_until(
+            &path,
+            offset,
+            None,
+            &|| false,
+            |reader, path, context| adapter.parse_reader_with_context(reader, path, Some(context)),
+        )
+        .unwrap() else {
+            panic!("timestamp append must remain tail-parseable")
+        };
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2000))
+            .unwrap();
+        let mut full = adapter.parse_inner(&path).unwrap();
+        crate::util::backfill_parsed_dates(&mut full, 2_000_000_000_000);
+        let mut incremental = before.messages;
+        incremental.extend(tail.new_messages);
+        assert_eq!(incremental.len(), full.messages.len());
+        for (incremental, full) in incremental.iter().zip(&full.messages) {
+            assert_eq!(incremental, full);
+        }
+        assert_eq!(
+            full.messages[2].ts,
+            crate::util::parse_datetime("2026-11-03T16:00:00Z")
+        );
     }
 
     #[test]
