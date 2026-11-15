@@ -119,7 +119,9 @@ file history; it does not prove that such content exists.
 `aise resume SESSION_ID` prints its command when stdin or stdout is redirected; use `--dry-run`
 to request that explicitly in a terminal.
 
-`aise COMMAND --help` documents every parameter and default. Date bounds accept ISO 8601,
+`aise COMMAND --help` lists command parameters. The [configuration reference](docs/development/configuration.md)
+and [generated caller reference](docs/README.md#generated-message-search-caller-contract) describe
+defaults and precedence. Date bounds accept ISO 8601,
 [EDTF](https://www.loc.gov/standards/datetime/), durations, and common natural-language forms,
 read in UTC unless the value names an offset or a trailing
 [RFC 9557](https://www.rfc-editor.org/rfc/rfc9557) zone such as `[Europe/Berlin]`;
