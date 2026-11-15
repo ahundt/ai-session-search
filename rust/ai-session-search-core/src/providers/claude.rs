@@ -5510,9 +5510,10 @@ mod tests {
                 crate::models::MessageRecordRelation::Mirror;
             crate::db::CLAUDE_INPUT_WORK.with(|work| work.set(0));
             db.upsert_session(&replayed, 3, 3).unwrap();
-            // One stored pass, one parsed original inventory and eight reservation passes.
+            // One stored pass, one parsed original inventory and ten input reservation passes.
+            // Two mirror-only legacy passes keep identity-less stored mirrors reachable.
             // Ordinary unique inputs above still perform no occurrence-planning visits.
-            crate::db::CLAUDE_INPUT_WORK.with(|work| assert_eq!(work.get(), 10 * count));
+            crate::db::CLAUDE_INPUT_WORK.with(|work| assert_eq!(work.get(), 12 * count));
         }
     }
 

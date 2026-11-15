@@ -7302,7 +7302,9 @@ fn next_file_edit_seq(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Resul
 ///   highest stored sequence. The same reconciliation path handles a same-parser shrink or rewrite
 ///   without deleting archive history.
 ///
-/// Key work is O(stored + parsed rows and bytes), with O(rows) memory for 32-byte keys.
+/// Hash-key work is expected O(stored + parsed rows and bytes), with O(rows) key memory.
+/// Attachment equality searches cost O(sum(parsed bucket size * stored bucket size))
+/// comparisons plus compared text bytes; a same-identity collision bucket can be quadratic.
 /// When every stored row is matched or retracted, restore parser order; archive-only rows keep
 /// their stored coordinates. Attachment identity checks retain O(stored attachment bytes).
 /// Mixed-row equality additionally performs the indexed checks in [`message_parts_match`].
@@ -7359,6 +7361,10 @@ fn store_parsed_messages(
     let stored = stored_message_keys(tx, &session.id, StoredMessageSelection::All)?;
     let claude = matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop);
     let mut has_claude_replay = false;
+    let mut parsed_identities = std::collections::HashSet::new();
+    let mut ambiguous_identities = std::collections::HashSet::new();
+    let mut parsed_native_roles = HashMap::<_, usize>::new();
+    let mut repeated_claude_uuid = false;
     let parsed_keys: Vec<MessageKeys> = parsed
         .messages
         .iter()
@@ -7366,7 +7372,19 @@ fn store_parsed_messages(
             has_claude_replay |= claude
                 && message.provenance.record_relation
                     == crate::models::MessageRecordRelation::Mirror;
-            parsed_message_keys(message)
+            let keys = parsed_message_keys(message);
+            if claude {
+                if let Some(identity) = keys.correlation {
+                    *parsed_native_roles
+                        .entry((identity, keys.role))
+                        .or_default() += 1;
+                    if !parsed_identities.insert(identity) {
+                        repeated_claude_uuid = true;
+                        ambiguous_identities.insert(identity);
+                    }
+                }
+            }
+            keys
         })
         .collect();
     // A first parse has no archive rows to reconcile. Keep the parser's published sequence
@@ -7397,6 +7415,7 @@ fn store_parsed_messages(
         && !has_attachments
         && !preserve_family_sequences
         && !has_claude_replay
+        && !repeated_claude_uuid
         && covers_every_stored_key(
             stored
                 .iter()
@@ -7418,29 +7437,107 @@ fn store_parsed_messages(
     // present; role/content is the conservative fallback for older rows without an identity.
     // Text alone never merges two copies: every key is consumed once.
     let mut stored_by_identity = HashMap::<_, std::collections::VecDeque<usize>>::new();
+    let mut stored_by_identity_content = HashMap::<_, std::collections::VecDeque<usize>>::new();
+    let mut stored_by_native_role = HashMap::<_, std::collections::VecDeque<usize>>::new();
     let mut stored_by_role_and_content = HashMap::<_, std::collections::VecDeque<usize>>::new();
     let mut stored_by_timestamp = HashMap::<_, std::collections::VecDeque<usize>>::new();
-    let mut repeated_claude_uuid = false;
     for (position, (_, keys)) in stored.iter().enumerate() {
         if let Some(identity) = keys.correlation {
             let queue = stored_by_identity.entry(identity).or_default();
-            repeated_claude_uuid |= claude && !queue.is_empty();
+            if claude && !queue.is_empty() {
+                repeated_claude_uuid = true;
+                ambiguous_identities.insert(identity);
+            }
             queue.push_back(position);
         } else {
             // A text fallback may repair a legacy row that has no identity, but must never
             // merge two rows whose provider identities disagree.
             stored_by_timestamp
-                .entry((keys.role_content_timestamp, claude && keys.mirror))
+                .entry(keys.role_content_timestamp)
                 .or_default()
                 .push_back(position);
             stored_by_role_and_content
-                .entry((keys.role_and_content, claude && keys.mirror))
+                .entry(keys.role_and_content)
                 .or_default()
                 .push_back(position);
         }
     }
+    // Native attachment digests are accelerators, never equality: compare complete stored text
+    // on a matching identity, including when two distinct texts collide on the digest.
+    let mut attachment_content = HashMap::new();
+    if has_attachments {
+        let mut statement = tx.prepare("select id, content from messages where session_id=?1 and correlation_id like 'claude_attachment:%'")?;
+        let rows = statement.query_map(params![session.id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, content) = row?;
+            attachment_content.insert(id, content);
+        }
+    }
     let reconcile_occurrences = has_claude_replay || repeated_claude_uuid;
     let mut matched = vec![false; stored.len()];
+    // After legacy repair, native queues may have a different order from the source.
+    // If all current rows already exist verbatim, another repair must not rotate their
+    // ownership. This counted equality shortcut changes no assignment policy on upgrade.
+    if same_parser && reconcile_occurrences {
+        let mut exact = HashMap::<_, std::collections::VecDeque<usize>>::new();
+        for (position, (_, keys)) in stored.iter().enumerate() {
+            exact
+                .entry(keys.columns_without_seq)
+                .or_default()
+                .push_back(position);
+        }
+        let mut complete = true;
+        for (message, keys) in parsed.messages.iter().zip(&parsed_keys) {
+            let position = exact
+                .get_mut(&keys.columns_without_seq)
+                .and_then(|q| q.pop_front());
+            if let Some(position) = position {
+                if (crate::providers::claude::is_attachment_message(message)
+                    && attachment_content.get(&stored[position].0) != Some(&message.content))
+                    || !message_parts_match(tx, stored[position].0, message)?
+                {
+                    complete = false;
+                    break;
+                }
+                matched[position] = true;
+            } else {
+                complete = false;
+                break;
+            }
+        }
+        if complete {
+            for id in take_retracted_rows(
+                session.provider,
+                &stored,
+                &mut matched,
+                &parsed.retracted.messages,
+                &parsed_keys,
+            ) {
+                tx.execute("delete from messages where id=?1", params![id])?;
+            }
+            return Ok(matched.iter().any(|value| !value));
+        }
+        matched.fill(false);
+    }
+    if repeated_claude_uuid {
+        for (position, (_, keys)) in stored.iter().enumerate() {
+            if let Some(identity) = keys
+                .correlation
+                .filter(|id| ambiguous_identities.contains(id))
+            {
+                stored_by_identity_content
+                    .entry((identity, keys.role_and_content))
+                    .or_default()
+                    .push_back(position);
+                stored_by_native_role
+                    .entry((identity, keys.role))
+                    .or_default()
+                    .push_back(position);
+            }
+        }
+    }
     // Upgrade-only relation matching repairs changed rendering without treating a call ID
     // as event identity. Ambiguous relations on either side remain separate archive rows.
     let mut legacy_tool_results = HashMap::<RowDigest, (usize, Option<usize>)>::new();
@@ -7466,19 +7563,6 @@ fn store_parsed_messages(
             *count == 1 && position.is_some() && parsed_relations.get(key) == Some(&1)
         });
     }
-    // Native attachment digests are accelerators, never equality: compare complete stored text
-    // on a matching identity, including when two distinct texts collide on the digest.
-    let mut attachment_content = HashMap::new();
-    if has_attachments {
-        let mut statement = tx.prepare("select id, content from messages where session_id=?1 and correlation_id like 'claude_attachment:%'")?;
-        let rows = statement.query_map(params![session.id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (id, content) = row?;
-            attachment_content.insert(id, content);
-        }
-    }
     // One assignment owns consumption for native, legacy and replay matches. Reserve
     // exact occurrences globally before any loose same-text fallback can take them.
     // The ordinary path keeps its single source-order pass and builds no replay maps.
@@ -7488,13 +7572,13 @@ fn store_parsed_messages(
         for (position, (_, keys)) in stored.iter().enumerate() {
             #[cfg(test)]
             CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
-            if let Some(identity) = keys.correlation {
+            if keys.input {
                 by_time
-                    .entry((identity, keys.role_content_timestamp, keys.mirror))
+                    .entry((keys.correlation, keys.role_content_timestamp, keys.mirror))
                     .or_default()
                     .push_back(position);
                 by_content
-                    .entry((identity, keys.role_and_content, keys.mirror))
+                    .entry((keys.correlation, keys.role_and_content, keys.mirror))
                     .or_default()
                     .push_back(position);
             }
@@ -7520,167 +7604,118 @@ fn store_parsed_messages(
             .filter(|keys| {
                 #[cfg(test)]
                 CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
-                !keys.mirror
+                keys.input && !keys.mirror
             })
             .filter_map(|keys| keys.correlation.map(|id| (id, keys.role_and_content)))
             .collect()
     } else {
         Default::default()
     };
-    // Originals precede mirrors; only a separate same-identity stored occurrence
-    // can be demoted, and only when the source also contains its original.
-    #[derive(Clone, Copy, PartialEq)]
-    enum AssignmentPhase {
-        OriginalTime,
-        OriginalIdentity,
-        LegacyTime,
-        LegacyContent,
-        MirrorTime,
-        MirrorIdentity,
-        CopyTime,
-        CopyIdentity,
-        Ordinary,
-    }
-    use AssignmentPhase::*;
-    // Each queue entry is popped at most once. Planning takes O(stored + parsed)
-    // time and memory, with no additional source or database reads.
-    let mut assign = |message: &Message,
-                      keys: &MessageKeys,
-                      phase: AssignmentPhase,
-                      matched: &mut [bool]| {
-        let native = |queue: &mut std::collections::VecDeque<usize>| {
-            if crate::providers::claude::is_attachment_message(message) {
-                let index = queue.iter().position(|&position| {
-                    !matched[position]
-                        && attachment_content.get(&stored[position].0) == Some(&message.content)
-                })?;
-                queue.remove(index)
-            } else {
-                take(Some(queue), matched)
+    // Only typed inputs reserve occurrences. Exact keys precede loose keys, and
+    // originals precede mirrors. None identities select legacy-only queues.
+    if reconcile_occurrences {
+        for (mirror, legacy, timestamp, copy) in [
+            (false, false, true, false),
+            (false, false, false, false),
+            (false, true, true, false),
+            (false, true, false, false),
+            (true, false, true, false),
+            (true, false, false, false),
+            (true, true, true, false),
+            (true, true, false, false),
+            (true, false, true, true),
+            (true, false, false, true),
+        ] {
+            for (position, keys) in parsed_keys.iter().enumerate() {
+                #[cfg(test)]
+                CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
+                if !keys.input || assignments[position].is_some() || keys.mirror != mirror {
+                    continue;
+                }
+                let identity = if legacy { None } else { keys.correlation };
+                if !legacy && identity.is_none() {
+                    continue;
+                }
+                // A stored typed copy may be demoted only if its original is in source.
+                if copy
+                    && !identity.is_some_and(|id| originals.contains(&(id, keys.role_and_content)))
+                {
+                    continue;
+                }
+                let stored_mirror = mirror && !copy;
+                let queue = if timestamp {
+                    by_time.get_mut(&(identity, keys.role_content_timestamp, stored_mirror))
+                } else {
+                    by_content.get_mut(&(identity, keys.role_and_content, stored_mirror))
+                };
+                if let Some(candidate) = take(queue, &mut matched) {
+                    matched[candidate] = true;
+                    assignments[position] = Some(candidate);
+                }
             }
-        };
-        let input = phase == OriginalTime
-            && message.role == crate::models::Role::User
-            && message
-                .provenance
-                .correlation_identity
-                .as_ref()
-                .is_none_or(|id| {
-                    id.authority == crate::models::MessageCorrelationAuthority::Anthropic
-                });
-        match phase {
-            OriginalTime if !input => keys
-                .correlation
-                .and_then(|identity| stored_by_identity.get_mut(&identity))
-                .and_then(native),
-            OriginalTime | MirrorTime | CopyTime => keys.correlation.and_then(|id| {
-                let mirror = phase == MirrorTime;
-                if phase == CopyTime && !originals.contains(&(id, keys.role_and_content)) {
-                    return None;
+        }
+    }
+    // Non-inputs always use this one source-order policy, even in replay sessions.
+    let mut ordinary = |message: &Message, keys: &MessageKeys, matched: &mut [bool]| {
+        keys.correlation
+            .and_then(|identity| {
+                // A repeated identity alone cannot identify a changed rendering: taking
+                // another occurrence's native row can strand its legacy counterpart.
+                if ambiguous_identities.contains(&identity) {
+                    if stored_by_native_role
+                        .get(&(identity, keys.role))
+                        .is_some_and(|q| q.len() == 1)
+                        && parsed_native_roles.get(&(identity, keys.role)) == Some(&1)
+                    {
+                        stored_by_native_role.get_mut(&(identity, keys.role))
+                    } else {
+                        stored_by_identity_content.get_mut(&(identity, keys.role_and_content))
+                    }
+                } else {
+                    stored_by_identity.get_mut(&identity)
                 }
-                take(
-                    by_time.get_mut(&(id, keys.role_content_timestamp, mirror)),
-                    matched,
-                )
-            }),
-            OriginalIdentity | MirrorIdentity | CopyIdentity => keys.correlation.and_then(|id| {
-                let mirror = phase == MirrorIdentity;
-                if phase == CopyIdentity && !originals.contains(&(id, keys.role_and_content)) {
-                    return None;
+            })
+            .and_then(|queue| {
+                if crate::providers::claude::is_attachment_message(message) {
+                    // O(bucket size) search and removal per attachment, plus text bytes.
+                    let index = queue.iter().position(|&position| {
+                        !matched[position]
+                            && attachment_content.get(&stored[position].0) == Some(&message.content)
+                    })?;
+                    queue.remove(index)
+                } else {
+                    take(Some(queue), matched)
                 }
-                take(
-                    by_content.get_mut(&(id, keys.role_and_content, mirror)),
-                    matched,
-                )
-            }),
-            LegacyTime => keys
-                .tool_result_relation
-                .and_then(|key| legacy_tool_results.get(&key))
-                .and_then(|(_, position)| *position)
-                .filter(|position| !matched[*position])
-                .or_else(|| {
-                    take(
-                        stored_by_timestamp.get_mut(&(keys.role_content_timestamp, false)),
-                        matched,
-                    )
-                }),
-            LegacyContent => {
-                if message
+            })
+            .or_else(|| {
+                keys.tool_result_relation
+                    .and_then(|key| legacy_tool_results.get(&key))
+                    .and_then(|(_, position)| *position)
+                    .filter(|position| !matched[*position])
+            })
+            .or_else(|| {
+                let queue = if message
                     .provenance
                     .correlation_identity
                     .as_ref()
                     .is_some_and(|id| {
                         id.authority == crate::models::MessageCorrelationAuthority::SourceLocal
                             && id.scope.starts_with("claude_queue:")
-                    })
-                {
-                    None
+                    }) {
+                    stored_by_timestamp.get_mut(&keys.role_content_timestamp)
                 } else {
-                    take(
-                        stored_by_role_and_content.get_mut(&(keys.role_and_content, false)),
-                        matched,
-                    )
-                }
-            }
-            Ordinary => keys
-                .correlation
-                .and_then(|identity| stored_by_identity.get_mut(&identity))
-                .and_then(native)
-                .or_else(|| {
-                    keys.tool_result_relation
-                        .and_then(|key| legacy_tool_results.get(&key))
-                        .and_then(|(_, position)| *position)
-                        .filter(|position| !matched[*position])
-                })
-                .or_else(|| {
-                    let legacy = if message
-                        .provenance
-                        .correlation_identity
-                        .as_ref()
-                        .is_some_and(|id| {
-                            id.authority == crate::models::MessageCorrelationAuthority::SourceLocal
-                                && id.scope.starts_with("claude_queue:")
-                        }) {
-                        stored_by_timestamp.get_mut(&(keys.role_content_timestamp, false))
-                    } else {
-                        stored_by_role_and_content.get_mut(&(keys.role_and_content, false))
-                    };
-                    take(legacy, matched)
-                }),
-        }
+                    stored_by_role_and_content.get_mut(&keys.role_and_content)
+                };
+                take(queue, matched)
+            })
     };
-    if reconcile_occurrences {
-        for phase in [
-            OriginalTime,
-            OriginalIdentity,
-            LegacyTime,
-            LegacyContent,
-            MirrorTime,
-            MirrorIdentity,
-            CopyTime,
-            CopyIdentity,
-        ] {
-            for (position, (message, keys)) in parsed.messages.iter().zip(&parsed_keys).enumerate()
-            {
-                #[cfg(test)]
-                CLAUDE_INPUT_WORK.with(|count| count.set(count.get() + 1));
-                let mirror = matches!(phase, MirrorTime | MirrorIdentity | CopyTime | CopyIdentity);
-                if assignments[position].is_none() && keys.mirror == mirror {
-                    assignments[position] = assign(message, keys, phase, &mut matched);
-                    if let Some(stored_position) = assignments[position] {
-                        matched[stored_position] = true;
-                    }
-                }
-            }
-        }
-    }
     let mut unseen = Vec::new();
     let mut source_sequences = Vec::new();
     for (parsed_position, (message, keys)) in parsed.messages.iter().zip(&parsed_keys).enumerate() {
-        let position = if reconcile_occurrences {
+        let position = if reconcile_occurrences && keys.input {
             assignments[parsed_position]
         } else {
-            assign(message, keys, Ordinary, &mut matched)
+            ordinary(message, keys, &mut matched)
         };
         if let Some(position) = position {
             matched[position] = true;
@@ -8586,6 +8621,8 @@ struct MessageKeys {
     role_content_timestamp: RowDigest,
     timestamped_notice: bool,
     mirror: bool,
+    input: bool,
+    role: Option<Role>,
     correlation: Option<RowDigest>,
     tool_result_relation: Option<RowDigest>,
     seq: i64,
@@ -8656,6 +8693,12 @@ impl MessageColumns<'_> {
             role_content_timestamp: role_content_timestamp.finish_bytes(),
             timestamped_notice: self.kind == Some("harness_notice"),
             mirror: self.record_relation == Some("mirror"),
+            role: self.role.and_then(|role| Role::from_db_str(role).ok()),
+            input: self.role == Some("user")
+                && self.kind != Some("tool_result")
+                && self.kind != Some("harness_notice")
+                && self.correlation[0].is_none_or(|authority| authority == "anthropic")
+                && !self.correlation[2].is_some_and(|id| id.starts_with("claude_attachment:")),
             correlation,
             tool_result_relation: (self.kind == Some("tool_result"))
                 .then(|| tool_result_relation_key(self.tool_name, self.tool_call_id))
@@ -16858,6 +16901,771 @@ mod tests {
             db.stale_session_sources().unwrap(),
             vec![(Provider::Claude, "/b".to_string())]
         );
+    }
+
+    fn occurrence_parse(records: &[serde_json::Value]) -> ParsedSession {
+        let mut parsed = crate::providers::claude::ClaudeAdapter::new(vec![])
+            .parse_reader(
+                std::io::Cursor::new(
+                    records
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                Path::new("/synthetic/occurrences.jsonl"),
+            )
+            .unwrap();
+        parsed.session.id = "claude:synthetic-occurrences".into();
+        parsed.session.provider_session_id = "synthetic-occurrences".into();
+        parsed
+    }
+
+    fn occurrence_record(
+        role: &str,
+        text: &str,
+        time: usize,
+        id: Option<&str>,
+        replay: bool,
+    ) -> serde_json::Value {
+        let mut record = serde_json::json!({"type":role,"sessionId":"synthetic-occurrences",
+            "timestamp":format!("2026-01-01T00:00:0{time}Z"),
+            "message":{"role":role,"content":text}});
+        if let Some(id) = id {
+            record["uuid"] = serde_json::json!(id);
+        }
+        if replay {
+            record["isReplay"] = serde_json::json!(true);
+        }
+        record
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct OccurrenceRow {
+        id: i64,
+        seq: i64,
+        ts: Option<String>,
+        identity: Option<String>,
+        relation: String,
+        role: String,
+        content: String,
+        // Include every stored message column and content part in idempotence checks.
+        columns: String,
+    }
+
+    fn occurrence_rows(conn: &Connection) -> Vec<OccurrenceRow> {
+        conn.prepare("select m.id, m.seq, m.ts,
+            case when correlation_id is not null then json_array(correlation_authority,correlation_scope,correlation_id) end,
+            record_relation, role, content,
+            json_array(provider,kind,authorship,tool_name,tool_call_id,is_compaction,input_delivery_state,input_origin,
+                (select json_group_array(json_array(ordinal,start_char,end_char,authorship,origin)) from message_content_parts where message_id=m.id))
+            from messages m order by m.id")
+            .unwrap().query_map([], |r| Ok(OccurrenceRow {
+                id:r.get(0)?, seq:r.get(1)?, ts:r.get(2)?, identity:r.get(3)?, relation:r.get(4)?,
+                role:r.get(5)?, content:r.get(6)?, columns:r.get(7)?,
+            })).unwrap().collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    struct OccurrenceDb {
+        db: Db,
+        _directory: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for OccurrenceDb {
+        type Target = Db;
+        fn deref(&self) -> &Db {
+            &self.db
+        }
+    }
+
+    fn occurrence_db() -> OccurrenceDb {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Db::open(&directory.path().join("index.db")).unwrap();
+        // Trials roll back their writes; keep their journal in memory, inside this
+        // temporary database only. No durability claim is tested by these fixtures.
+        db.conn
+            .pragma_update(None, "journal_mode", "memory")
+            .unwrap();
+        db.conn.pragma_update(None, "synchronous", "off").unwrap();
+        OccurrenceDb {
+            db,
+            _directory: directory,
+        }
+    }
+
+    fn assert_occurrence_refresh(
+        old: &ParsedSession,
+        current: &ParsedSession,
+        owners: &[Option<usize>],
+    ) {
+        let db = occurrence_db();
+        db.upsert_session(old, 1, 1).unwrap();
+        let before = occurrence_rows(&db.conn);
+        let fresh = occurrence_db();
+        fresh.upsert_session(current, 1, 1).unwrap();
+        let fresh_rows = occurrence_rows(&fresh.conn);
+        let mut expected = before.clone();
+        for (source, owner) in fresh_rows.iter().zip(owners) {
+            if let Some(owner) = owner {
+                let (id, seq) = (before[*owner].id, before[*owner].seq);
+                expected[*owner] = source.clone();
+                expected[*owner].id = id;
+                expected[*owner].seq = seq;
+            } else {
+                let mut row = source.clone();
+                row.id = expected.len() as i64 + 1;
+                row.seq = expected.len() as i64;
+                expected.push(row);
+            }
+        }
+        for generation in [2, 3] {
+            db.upsert_session(current, generation, generation).unwrap();
+            assert_eq!(
+                occurrence_rows(&db.conn),
+                expected,
+                "ownership after refresh {generation}"
+            );
+        }
+    }
+
+    #[test]
+    fn occurrence_identityless_input_mirrors_keep_ownership() {
+        occurrence_input_mirror_ownership(false);
+    }
+
+    #[test]
+    fn occurrence_identified_input_repairs_legacy_mirror() {
+        occurrence_input_mirror_ownership(true);
+    }
+
+    fn occurrence_input_mirror_ownership(identified: bool) {
+        {
+            let records = [
+                occurrence_record("user", "synthetic request", 1, None, false),
+                occurrence_record("user", "synthetic request", 2, None, true),
+            ];
+            let mut old = occurrence_parse(&records);
+            old.session.parse_version = "claude-legacy".into();
+            let mut records = records.to_vec();
+            if identified {
+                records[1]["uuid"] = serde_json::json!("input-1");
+            }
+            assert_occurrence_refresh(&old, &occurrence_parse(&records), &[Some(0), Some(1)]);
+        }
+    }
+
+    #[test]
+    fn occurrence_tail_identityless_mirror_keeps_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("occurrences.jsonl");
+        let first =
+            occurrence_record("user", "synthetic request", 1, None, false).to_string() + "\n";
+        let second =
+            occurrence_record("user", "synthetic request", 2, None, true).to_string() + "\n";
+        std::fs::write(&path, &first).unwrap();
+        let adapter = crate::providers::claude::ClaudeAdapter::new(vec![]);
+        let parse = |text: &str| {
+            adapter
+                .parse_reader(std::io::Cursor::new(text), &path)
+                .unwrap()
+        };
+        let db = occurrence_db();
+        let mut initial = parse(&first);
+        let mut archive = occurrence_parse(&[occurrence_record(
+            "assistant",
+            "archive only",
+            0,
+            None,
+            false,
+        )])
+        .messages
+        .remove(0);
+        archive.seq = 1;
+        initial.messages.push(archive);
+        db.upsert_session(&initial, 1, 1).unwrap();
+        std::fs::write(&path, first.clone() + &second).unwrap();
+        let tail = crate::tail::tail_parse(&path, first.len() as i64, |reader, p| {
+            adapter.parse_reader(reader, p)
+        })
+        .unwrap()
+        .unwrap();
+        db.append_tail(&tail, 2, (first.len() + second.len()) as i64)
+            .unwrap();
+        let before = occurrence_rows(&db.conn);
+        assert_eq!(before.iter().filter(|r| r.relation == "mirror").count(), 1);
+        let current = parse(&(first + &second));
+        let fresh = occurrence_db();
+        fresh.upsert_session(&current, 1, 1).unwrap();
+        for generation in [3, 4] {
+            db.upsert_session(&current, generation, generation).unwrap();
+            assert_eq!(
+                occurrence_rows(&db.conn),
+                before,
+                "tail/full ownership after refresh {generation}"
+            );
+            let projection = |rows: Vec<OccurrenceRow>| {
+                rows.into_iter()
+                    .filter(|r| r.content != "archive only")
+                    .map(|r| (r.ts, r.identity, r.relation, r.content))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                projection(occurrence_rows(&db.conn)),
+                projection(occurrence_rows(&fresh.conn))
+            );
+        }
+    }
+
+    fn occurrence_result(text: &str, id: Option<&str>, replay: bool) -> serde_json::Value {
+        let mut record = occurrence_record("user", "", 1, id, replay);
+        record["message"]["content"] =
+            serde_json::json!([{"type":"tool_result","tool_use_id":"call-1","content":text}]);
+        record["toolUseResult"] = serde_json::json!({"toolName":"Write"});
+        record
+    }
+
+    #[test]
+    fn occurrence_ordinary_tool_mirror_repairs_in_place() {
+        let mut old = occurrence_parse(&[occurrence_result("synthetic result", None, true)]);
+        old.session.parse_version = "claude-legacy".into();
+        // No unique relation is needed for equal-text ordinary legacy matching.
+        old.messages[0].tool_call_id = None;
+        let mut current = occurrence_parse(&[occurrence_result("synthetic result", None, false)]);
+        current.messages[0].tool_call_id = None;
+        assert_occurrence_refresh(&old, &current, &[Some(0)]);
+    }
+
+    #[test]
+    fn occurrence_noninput_legacy_ownership_ignores_unrelated_replay() {
+        for replay in [false, true] {
+            let mut old = occurrence_parse(&[
+                occurrence_record("assistant", "synthetic answer", 1, None, false),
+                occurrence_record("assistant", "synthetic answer", 2, None, false),
+            ]);
+            old.session.parse_version = "claude-legacy".into();
+            let mut records = vec![occurrence_record(
+                "assistant",
+                "synthetic answer",
+                2,
+                None,
+                false,
+            )];
+            if replay {
+                records.push(occurrence_record(
+                    "user",
+                    "unrelated replay",
+                    3,
+                    Some("unrelated"),
+                    true,
+                ));
+            }
+            let owners = if replay {
+                vec![Some(0), None]
+            } else {
+                vec![Some(0)]
+            };
+            assert_occurrence_refresh(&old, &occurrence_parse(&records), &owners);
+        }
+    }
+
+    #[test]
+    fn occurrence_repeated_native_identity_keeps_legacy_counterparts() {
+        for distinct in [false, true] {
+            let current = occurrence_parse(&[
+                occurrence_record("assistant", "first answer", 0, Some("same-event"), false),
+                occurrence_record(
+                    "assistant",
+                    if distinct {
+                        "second answer"
+                    } else {
+                        "first answer"
+                    },
+                    2,
+                    Some("same-event"),
+                    false,
+                ),
+            ]);
+            let mut old = current.clone();
+            old.session.parse_version = "claude-legacy".into();
+            old.messages[0].provenance.correlation_identity = None;
+            let owners = if distinct {
+                [Some(0), Some(1)]
+            } else {
+                [Some(1), Some(0)]
+            };
+            assert_occurrence_refresh(&old, &current, &owners);
+        }
+    }
+
+    #[test]
+    fn occurrence_native_tool_mirror_repairs_changed_rendering() {
+        let mut old = occurrence_named_result("synthetic old result", Some("result-1"));
+        old.session.parse_version = "claude-legacy".into();
+        let current = occurrence_named_result("synthetic new result", Some("result-1"));
+        assert_occurrence_refresh(&old, &current, &[Some(0)]);
+    }
+
+    fn occurrence_named_result(text: &str, id: Option<&str>) -> ParsedSession {
+        // Tool-result names come from the preceding call, not toolUseResult metadata.
+        let call = serde_json::json!({"type":"assistant","sessionId":"synthetic-occurrences","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"Write","input":{}}]}});
+        let mut parsed = occurrence_parse(&[call, occurrence_result(text, id, true)]);
+        parsed
+            .messages
+            .retain(|m| m.kind == crate::models::MessageKind::ToolResult);
+        parsed.messages[0].seq = 0;
+        assert_eq!(parsed.messages[0].tool_name.as_deref(), Some("Write"));
+        parsed
+    }
+
+    #[test]
+    fn occurrence_same_parser_relation_does_not_prove_changed_rendering() {
+        let old = occurrence_named_result("synthetic old result", None);
+        let current = occurrence_named_result("synthetic new result", None);
+        assert_occurrence_refresh(&old, &current, &[None]);
+    }
+
+    #[test]
+    fn occurrence_same_parser_relation_acquires_separate_native_row() {
+        let old = occurrence_named_result("synthetic old result", None);
+        let current = occurrence_named_result("synthetic new result", Some("result-1"));
+        assert_occurrence_refresh(&old, &current, &[None]);
+    }
+
+    #[test]
+    fn occurrence_unique_relation_tool_mirror_repairs_changed_rendering() {
+        occurrence_relation_mirror_ownership(false);
+    }
+
+    #[test]
+    fn occurrence_unique_relation_tool_mirror_acquires_identity() {
+        occurrence_relation_mirror_ownership(true);
+    }
+
+    fn occurrence_relation_mirror_ownership(identified: bool) {
+        {
+            let mut old = occurrence_named_result("synthetic old result", None);
+            old.session.parse_version = "claude-legacy".into();
+            let current = occurrence_named_result(
+                "synthetic new result",
+                if identified { Some("result-1") } else { None },
+            );
+            assert!(old.messages[0].tool_call_id.is_some());
+            assert_occurrence_refresh(&old, &current, &[Some(0)]);
+        }
+    }
+
+    // Tiny deterministic corpora exercise the actual parser and shared storage owner.
+    // No clock or machine-dependent resource measurement participates in an assertion.
+    fn occurrence_generated_records(mut seed: u64) -> Vec<serde_json::Value> {
+        let inject_relations = seed.is_multiple_of(16);
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let len = (next() % 9) as usize;
+        let mut records = Vec::new();
+        for i in 0..len {
+            let word = if next() % 2 == 0 {
+                "repeated text"
+            } else {
+                "distinct text"
+            };
+            let id = match next() % 3 {
+                0 => None,
+                1 => Some("event-a"),
+                _ => Some("event-b"),
+            };
+            let time = (next() % 3) as usize;
+            let replay = next() % 3 == 0;
+            let mut record = match next() % 8 {
+                0..=2 => occurrence_record("user", word, time, id, replay),
+                3 => occurrence_record("assistant", word, time, id, false),
+                4 => {
+                    let mut r = occurrence_result(word, id, replay);
+                    r["message"]["content"][0]["tool_use_id"] =
+                        serde_json::json!(if next() % 2 == 0 {
+                            "call-0"
+                        } else {
+                            "shared-call"
+                        });
+                    if next() % 3 == 0 {
+                        r["message"]["content"][0]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("tool_use_id");
+                    }
+                    r
+                }
+                5 => {
+                    let mut r = occurrence_record("assistant", "", time, id, false);
+                    let call_id = if next() % 2 == 0 {
+                        format!("call-{i}")
+                    } else {
+                        "shared-call".into()
+                    };
+                    r["message"]["content"] = serde_json::json!([{"type":"tool_use","id":call_id,"name":"Write","input":{"file_path":"/synthetic/file","content":word}}]);
+                    r
+                }
+                6 => {
+                    serde_json::json!({"type":"attachment","sessionId":"synthetic-occurrences","attachment":{"type":"nested_memory","content":word}})
+                }
+                _ => {
+                    serde_json::json!({"type":"user","isMeta":true,"sessionId":"synthetic-occurrences","message":{"role":"user","content":format!("<local-command-stdout>{word}</local-command-stdout>")}})
+                }
+            };
+            if next() % 3 == 0 {
+                record.as_object_mut().unwrap().remove("timestamp");
+            }
+            // Reuse complete typed records as copies, not just their text or UUID.
+            if i > 0 && next() % 5 == 0 {
+                if let Some(original) = records.iter().find(|r: &&serde_json::Value| {
+                    r["type"] == "user"
+                        && r["message"]["content"].is_string()
+                        && r["isReplay"] != true
+                        && r["isMeta"] != true
+                }) {
+                    let mut copy = original.clone();
+                    copy["isReplay"] = serde_json::json!(true);
+                    if next() % 2 == 0 {
+                        records.insert(0, copy);
+                    } else {
+                        records.push(copy);
+                    }
+                    continue;
+                }
+            }
+            records.push(record);
+        }
+        if inject_relations && records.len() >= 3 {
+            records[0] = serde_json::json!({"type":"assistant","sessionId":"synthetic-occurrences","message":{"role":"assistant","content":[{"type":"tool_use","id":"call-1","name":"Write","input":{}}]}});
+            records[1] = occurrence_result("named result a", None, false);
+            records[2] = occurrence_result("named result b", None, false);
+        }
+        records
+    }
+
+    fn occurrence_typed(row: &OccurrenceRow) -> bool {
+        row.role == "user" && row.relation == "original" && row.columns.contains("\"human\"")
+    }
+
+    fn occurrence_projection(rows: &[OccurrenceRow]) -> Vec<(String, String, String)> {
+        let mut values = rows
+            .iter()
+            .map(|r| (r.role.clone(), r.content.clone(), r.relation.clone()))
+            .collect::<Vec<_>>();
+        values.sort();
+        values
+    }
+
+    // Each trial rolls back its own transaction, including FTS/part writes. Reusing one
+    // temporary schema keeps thousands of sessions cheap without bypassing row storage.
+    fn occurrence_trial(
+        db: &Db,
+        old: &ParsedSession,
+        current: &ParsedSession,
+    ) -> (Vec<OccurrenceRow>, Vec<OccurrenceRow>, Vec<OccurrenceRow>) {
+        let tx = db.conn.unchecked_transaction().unwrap();
+        insert_messages(&tx, &old.session, old.messages.iter().map(|m| (m.seq, m))).unwrap();
+        let before = occurrence_rows(&tx);
+        store_parsed_messages(
+            &tx,
+            current,
+            true,
+            old.session.parse_version == current.session.parse_version,
+            false,
+            false,
+        )
+        .unwrap();
+        let after = occurrence_rows(&tx);
+        store_parsed_messages(&tx, current, true, true, false, false).unwrap();
+        let twice = occurrence_rows(&tx);
+        tx.rollback().unwrap();
+        (before, after, twice)
+    }
+
+    fn occurrence_properties(
+        db: &Db,
+        records: &[serde_json::Value],
+        mode: usize,
+    ) -> Vec<(usize, String)> {
+        use crate::models::MessageKind;
+        let current = occurrence_parse(records);
+        let mut old = current.clone();
+        let mut archive_typed = 0;
+        match mode {
+            1 => {
+                old.session.parse_version = "claude-legacy".into();
+                for (i, m) in old.messages.iter_mut().enumerate() {
+                    if records.len().is_multiple_of(2) || i.is_multiple_of(2) {
+                        m.provenance.correlation_identity = None;
+                    }
+                }
+            }
+            2 => {
+                old.session.parse_version = "claude-legacy".into();
+                for m in &mut old.messages {
+                    if m.kind == MessageKind::ToolResult
+                        && !crate::providers::claude::is_attachment_message(m)
+                    {
+                        m.content.push_str(" old rendering");
+                    }
+                }
+            }
+            3 => {
+                old = occurrence_parse(&records[..records.len() / 2]);
+            }
+            4 => {
+                let archive = occurrence_parse(&[
+                    occurrence_record(
+                        "user",
+                        "archive typed input",
+                        0,
+                        Some("archive-input"),
+                        false,
+                    ),
+                    occurrence_record(
+                        "assistant",
+                        "archive answer",
+                        0,
+                        Some("archive-answer"),
+                        false,
+                    ),
+                ]);
+                for mut m in archive.messages {
+                    m.seq = old.messages.len() as i64;
+                    old.messages.push(m);
+                }
+                archive_typed = 1;
+            }
+            _ => {}
+        }
+        let empty = {
+            let mut p = current.clone();
+            p.messages.clear();
+            p
+        };
+        let (_, fresh, _) = occurrence_trial(db, &empty, &current);
+        let (before, after, twice) = occurrence_trial(db, &old, &current);
+        let mut failures = Vec::new();
+        let mut check = |property, ok: bool, expected: String, actual: String| {
+            if !ok {
+                let violation = match property {
+                    1 => "unchanged source changed rows on its second refresh",
+                    2 => "source-attributable rows grew or differ from fresh indexing",
+                    3 => "typed originals were added, lost or demoted without source evidence",
+                    4 => "stored row IDs disappeared without explicit retraction evidence",
+                    5 => "an unrelated replay changed non-input row ownership",
+                    _ => unreachable!(),
+                };
+                failures.push((
+                    property,
+                    format!(
+                        "{violation}\nstored={before:#?}\nexpected={expected}\nactual={actual}"
+                    ),
+                ));
+            }
+        };
+        check(
+            1,
+            after == twice,
+            format!("{after:#?}"),
+            format!("{twice:#?}"),
+        );
+        if mode != 4 {
+            let mut expected = fresh.clone();
+            if mode == 2 {
+                // Changed text without native identity or a unique named call relation
+                // cannot be distinguished from archive-only history. Requiring deletion
+                // would violate archive preservation; retain precisely these old renderings.
+                let old_keys = old
+                    .messages
+                    .iter()
+                    .map(parsed_message_keys)
+                    .collect::<Vec<_>>();
+                for (m, key) in old.messages.iter().zip(&old_keys) {
+                    let unique_relation = key.correlation.is_none()
+                        && key.tool_result_relation.is_some_and(|relation| {
+                            old_keys
+                                .iter()
+                                .filter(|k| k.tool_result_relation == Some(relation))
+                                .count()
+                                == 1
+                        });
+                    let unique_native = key.correlation.is_some_and(|identity| {
+                        old_keys
+                            .iter()
+                            .filter(|k| k.correlation == Some(identity) && k.role == key.role)
+                            .count()
+                            == 1
+                    });
+                    if m.kind == MessageKind::ToolResult
+                        && !crate::providers::claude::is_attachment_message(m)
+                        && !unique_native
+                        && !unique_relation
+                    {
+                        expected.push(before.iter().find(|r| r.seq == m.seq).unwrap().clone());
+                    }
+                }
+            }
+            check(
+                2,
+                occurrence_projection(&after) == occurrence_projection(&expected),
+                format!("{expected:#?}"),
+                format!("{after:#?}"),
+            );
+        }
+        let typed = |rows: &[OccurrenceRow]| rows.iter().filter(|r| occurrence_typed(r)).count();
+        check(
+            3,
+            typed(&after) == typed(&fresh) + archive_typed && typed(&after) >= typed(&before),
+            format!("{} typed originals", typed(&fresh) + archive_typed),
+            format!("{} typed originals; rows={after:#?}", typed(&after)),
+        );
+        // No generated record is intentionally retracted except parser-declined duplicate
+        // replays. Compute the explicit retraction rule on the unclaimed stored candidates
+        // separately through the same owning helper, never exempt arbitrary disappeared IDs.
+        let tx = db.conn.unchecked_transaction().unwrap();
+        insert_messages(&tx, &old.session, old.messages.iter().map(|m| (m.seq, m))).unwrap();
+        let stored =
+            stored_message_keys(&tx, &old.session.id, StoredMessageSelection::All).unwrap();
+        let keys = current
+            .messages
+            .iter()
+            .map(parsed_message_keys)
+            .collect::<Vec<_>>();
+        let mut retained = stored
+            .iter()
+            .map(|(id, _)| after.iter().any(|row| row.id == *id))
+            .collect::<Vec<_>>();
+        let retracted = take_retracted_rows(
+            current.session.provider,
+            &stored,
+            &mut retained,
+            &current.retracted.messages,
+            &keys,
+        );
+        tx.rollback().unwrap();
+        check(
+            4,
+            before
+                .iter()
+                .all(|r| after.iter().any(|a| a.id == r.id) || retracted.contains(&r.id)),
+            format!("retain IDs except explicit retractions {retracted:?}"),
+            format!("{after:#?}"),
+        );
+        // Compare identical stored candidates; the added replay cannot share any key.
+        let mut augmented = records.to_vec();
+        augmented.push(occurrence_record(
+            "user",
+            "unrelated replay sentinel",
+            7,
+            Some("unrelated-sentinel"),
+            true,
+        ));
+        let augmented = occurrence_parse(&augmented);
+        let (_, with_replay, _) = occurrence_trial(db, &old, &augmented);
+        let noninputs = |rows: &[OccurrenceRow]| {
+            rows.iter()
+                .filter(|r| {
+                    (r.role != "user" || r.columns.contains("\"harness_notice\""))
+                        && r.content != "unrelated replay sentinel"
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        check(
+            5,
+            noninputs(&after) == noninputs(&with_replay),
+            format!("{:#?}", noninputs(&after)),
+            format!("{:#?}", noninputs(&with_replay)),
+        );
+        failures
+    }
+
+    #[test]
+    fn occurrence_seeded_reconciliation_properties() {
+        let db = occurrence_db();
+        let mut empty = occurrence_parse(&[]);
+        empty.session.id = occurrence_parse(&[occurrence_record("user", "seed", 0, None, false)])
+            .session
+            .id;
+        db.upsert_session(&empty, 1, 1).unwrap();
+        let mut failures = std::collections::BTreeMap::new();
+        let mut sizes = std::collections::BTreeSet::new();
+        let mut kinds = std::collections::BTreeSet::new();
+        let mut cases = 0;
+        let mut unique_relations = 0;
+        let mut ambiguous_relations = 0;
+        for seed in 1..=512 {
+            let records = occurrence_generated_records(seed);
+            sizes.insert(records.len());
+            let parsed = occurrence_parse(&records);
+            let mut relations = HashMap::<RowDigest, usize>::new();
+            for message in &parsed.messages {
+                kinds.insert(message.kind.as_str().to_owned());
+                if let Some(relation) = parsed_message_keys(message).tool_result_relation {
+                    *relations.entry(relation).or_default() += 1;
+                }
+            }
+            unique_relations += relations.values().filter(|&&count| count == 1).count();
+            ambiguous_relations += relations.values().filter(|&&count| count > 1).count();
+            for mode in 0..5 {
+                cases += 1;
+                for (property, _) in occurrence_properties(&db, &records, mode) {
+                    if failures.contains_key(&property) {
+                        continue;
+                    }
+                    // Deletion minimization yields a 1-minimal source for this property
+                    // and stored-side construction, not a claim of globally shortest input.
+                    let mut minimal = records.clone();
+                    let mut i = 0;
+                    while i < minimal.len() {
+                        let mut candidate = minimal.clone();
+                        candidate.remove(i);
+                        if occurrence_properties(&db, &candidate, mode)
+                            .iter()
+                            .any(|(p, _)| *p == property)
+                        {
+                            minimal = candidate;
+                            i = 0;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    let detail = occurrence_properties(&db, &minimal, mode)
+                        .into_iter()
+                        .find(|(p, _)| *p == property)
+                        .unwrap()
+                        .1;
+                    failures.insert(
+                        property,
+                        format!(
+                            "P{property}: seed={seed}, mode={mode}, minimal session={}\n{detail}",
+                            serde_json::to_string(&minimal).unwrap()
+                        ),
+                    );
+                }
+            }
+        }
+        assert_eq!(cases, 2560);
+        assert!(
+            unique_relations > 0,
+            "generated corpus omitted unique named tool-result relations"
+        );
+        assert!(
+            ambiguous_relations > 0,
+            "generated corpus omitted ambiguous named tool-result relations"
+        );
+        assert_eq!(sizes, (0..=8).collect());
+        for kind in ["conversation", "tool_call", "tool_result", "harness_notice"] {
+            assert!(kinds.contains(kind), "generated corpus omitted kind={kind}");
+        }
+        for detail in failures.values() {
+            eprintln!("{detail}");
+        }
+        assert!(failures.is_empty(),"reconciliation properties failed: {:?}; reproduce with cargo test -p ai-session-search --lib occurrence_seeded_reconciliation_properties -- --nocapture",failures.keys().collect::<Vec<_>>());
     }
 
     #[test]
