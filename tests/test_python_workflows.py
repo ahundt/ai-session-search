@@ -233,6 +233,18 @@ def test_analysis_call_bounds_and_scopes(corpus):
     assert corpus.query_sql("select title from sessions", max_cell_chars=3)["rows"][0]["title"] == "ret... [truncated]"
 
 
+def test_repeat_candidate_and_group_bounds_are_independent(corpus):
+    all_groups = corpus.repeats(max_candidates=0, max_groups=0)["groups"]
+    assert len(all_groups) > 1
+    assert corpus.repeats(max_candidates=1, max_groups=0)["groups"] == []
+    assert len(corpus.repeats(max_candidates=0, max_groups=1)["groups"]) == 1
+    assert corpus.repeats(max_groups=0)["groups"] == all_groups
+    with pytest.raises(aise.InvalidArgumentError, match="max_candidates"):
+        corpus.repeats(max_candidates=-1)
+    with pytest.raises(TypeError, match="limit"):
+        corpus.repeats(**{"limit": 1})
+
+
 def test_sql_cell_truncation_retains_receipt(corpus):
     result = corpus.query_sql("select title from sessions", max_cell_chars=3)
     assert result["truncated_cell_char_limit"] == 3

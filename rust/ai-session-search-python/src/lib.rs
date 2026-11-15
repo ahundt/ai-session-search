@@ -4890,10 +4890,23 @@ impl SessionSearch {
     }
 
     /// Mine recurring phrases and return groups, examples, and unattributed-input counts.
-    /// Omitted bounds use analytics settings; 0 max_groups or max_examples_per_group means all.
-    /// query_mode accepts literal or regex. Scope filters intersect before mining.
+    /// query is a string (None by default selects all candidates); query_mode is literal (default)
+    /// or regex with a query. role accepts user, assistant, tool, slash, or compaction; None (default)
+    /// uses human input. scope accepts QueryScope; None (default) adds no scope filters.
+    /// max_candidates counts input messages: integers 0..2**63-1, default 0 examines all candidates.
+    /// max_groups counts returned groups: None (default) uses analytics.repeat_max_groups (50
+    /// without configuration); 0 returns all groups. max_examples_per_group similarly uses
+    /// analytics.repeat_max_examples_per_group (3), with 0 for all examples. Both accept integers
+    /// 0..2**63-1. min_matches and phrase_min_words accept integers 1..2**63-1; None (default)
+    /// uses analytics.repeat_min_matches (2) and analytics.repeat_phrase_min_words (2).
+    /// phrase_max_words accepts integers from phrase_min_words through 2**63-1; None (default)
+    /// uses analytics.repeat_phrase_max_words (5). Phrase widths count words.
+    /// include_unattributed_input is a bool, default False excludes unknown-sender queued input
+    /// but still counts it. context accepts integers 0..2**63-1, default 0, and sets only the
+    /// sequence-number radius in example follow-up commands, not retrieved rows.
+    /// Invalid values raise InvalidArgumentError; wrong argument types raise TypeError.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (query=None, *, scope=None, role=None, query_mode="literal", limit=0, include_unattributed_input=false, max_groups=None, max_examples_per_group=None, min_matches=None, phrase_min_words=None, phrase_max_words=None, context=0))]
+    #[pyo3(signature = (query=None, *, scope=None, role=None, query_mode="literal", max_candidates=0, include_unattributed_input=false, max_groups=None, max_examples_per_group=None, min_matches=None, phrase_min_words=None, phrase_max_words=None, context=0))]
     fn repeats<'py>(
         &self,
         py: Python<'py>,
@@ -4901,7 +4914,7 @@ impl SessionSearch {
         scope: Option<QueryScope>,
         role: Option<&str>,
         query_mode: &str,
-        limit: i64,
+        max_candidates: i64,
         include_unattributed_input: bool,
         max_groups: Option<i64>,
         max_examples_per_group: Option<i64>,
@@ -4943,7 +4956,7 @@ impl SessionSearch {
             .map(str::parse::<Role>)
             .transpose()
             .map_err(value_error)?;
-        let limit = paging_argument(PagingArgument::Limit, limit)?;
+        let limit = count("max_candidates", Some(max_candidates))?.unwrap_or_default();
         let report = py.detach(|| {
             let app = self.app()?;
             let scope = scope.unwrap_or_default().resolve(&app)?;
