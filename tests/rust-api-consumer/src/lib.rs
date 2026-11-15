@@ -875,10 +875,7 @@ mod tests {
         let app = fixture.indexed();
         let all: TranscriptWindow = app.catalog().transcript("claude:consumer-b", 0).unwrap();
         assert!(all.complete && all.total_lines == 2, "{all:?}");
-        assert_eq!(
-            (all.edge, all.lines_label.as_str()),
-            (TranscriptEdge::All, "all")
-        );
+        assert_eq!(all.edge, TranscriptEdge::All);
         assert_eq!(all.session.id, "claude:consumer-b");
 
         let head = app.catalog().transcript("claude:consumer-b", 1).unwrap();
@@ -887,7 +884,6 @@ mod tests {
             (TranscriptEdge::Head, 1, false)
         );
         assert_eq!(head.text, all.text.lines().next().unwrap());
-        assert!(head.lines_label.starts_with("first 1 (truncated"));
 
         let tail = app.catalog().transcript("claude:consumer-b", -1).unwrap();
         assert_eq!(tail.text, all.text.lines().last().unwrap());

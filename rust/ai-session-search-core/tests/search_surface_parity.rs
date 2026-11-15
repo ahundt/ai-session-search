@@ -1593,6 +1593,7 @@ fn show_json_preserves_the_shared_transcript_window() {
     assert_eq!(got["text"], read["expected"]);
     assert_eq!(got["total_lines"], read["total_lines"]);
     assert_eq!(got["lines_returned"], read["lines_returned"]);
+    assert!(got.get("lines_label").is_none(), "{got:#}");
     assert_eq!(got["edge"], "tail");
     assert_eq!(got["complete"], false);
     assert!(got["session"].get("raw_metadata_json").is_none());

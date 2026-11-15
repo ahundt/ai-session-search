@@ -2532,9 +2532,26 @@ pub struct TranscriptWindow {
     pub edge: TranscriptEdge,
     /// `true` when `text` is the whole transcript.
     pub complete: bool,
-    /// The count as `aise show` prints it after "Transcript lines returned:", for example `12`,
-    /// `all`, or `first 40 (truncated; 0 returns the entire transcript and may be very large)`.
-    pub lines_label: String,
+}
+
+impl TranscriptWindow {
+    pub(crate) fn lines_label(&self) -> String {
+        if self.edge == TranscriptEdge::All {
+            return "all".into();
+        }
+        if self.complete {
+            return self.lines_returned.to_string();
+        }
+        let edge = if self.edge == TranscriptEdge::Head {
+            "first"
+        } else {
+            "last"
+        };
+        format!(
+            "{edge} {} (truncated; 0 returns the entire transcript and may be very large)",
+            self.lines_returned
+        )
+    }
 }
 
 /// How to reopen one session in its provider's CLI, from [`CatalogService::resume_command`].
@@ -2758,8 +2775,7 @@ impl<'db> CatalogService<'db> {
     pub fn transcript(&self, id_or_prefix: &str, lines: i64) -> Result<TranscriptWindow> {
         self.db.ensure_refreshed_for_read()?;
         let full = self.db.resolve_session(id_or_prefix)?;
-        let (text, lines_label) =
-            crate::util::select_transcript_lines(&full.transcript_text, lines);
+        let (text, _) = crate::util::select_transcript_lines(&full.transcript_text, lines);
         let total_lines = full.transcript_text.lines().count();
         let lines_returned = text.lines().count();
         Ok(TranscriptWindow {
@@ -2773,7 +2789,6 @@ impl<'db> CatalogService<'db> {
             text,
             total_lines,
             lines_returned,
-            lines_label,
         })
     }
 

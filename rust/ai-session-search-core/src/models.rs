@@ -697,12 +697,6 @@ impl std::str::FromStr for InputDeliveryState {
     }
 }
 
-impl InputDeliveryState {
-    pub fn from_db_str(value: &str) -> Option<Self> {
-        value.parse().ok()
-    }
-}
-
 /// How the provider recorded user input, independent of sender attribution and delivery.
 /// `Queued` marks an input-queue enqueue; `InteractiveAnswer` marks a linked answer in a tool
 /// result. Neither origin proves that the model received the input.
@@ -722,10 +716,6 @@ impl MessageInputOrigin {
             Self::Queued => "queued",
             Self::InteractiveAnswer => "interactive_answer",
         }
-    }
-
-    pub fn from_db_str(value: &str) -> Option<Self> {
-        value.parse().ok()
     }
 }
 
