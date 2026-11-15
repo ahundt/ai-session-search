@@ -1100,11 +1100,19 @@ mod tests {
             ])),
         )
         .unwrap();
+        let mut message_args = args::<messages::MessageSearchArgs>(&[
+            "consumer",
+            "needle",
+            "--kinds",
+            "tool-call",
+            "--format",
+            "json",
+        ]);
+        // The released Rust field remains writable without creating a second CLI parameter.
+        message_args.kind = Some(ai_session_search::models::MessageKind::Conversation);
         messages::run(
             &db,
-            &messages::MessagesCmd::Search(Box::new(args::<messages::MessageSearchArgs>(&[
-                "consumer", "needle", "--format", "json",
-            ]))),
+            &messages::MessagesCmd::Search(Box::new(message_args)),
             &config,
         )
         .unwrap();

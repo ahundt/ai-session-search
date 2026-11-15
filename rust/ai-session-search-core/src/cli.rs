@@ -3487,6 +3487,52 @@ mod tests {
         assert_rejects(["aise", "corrections", "--when", "7d"]);
     }
 
+    #[test]
+    fn message_kind_spellings_combine_as_one_parameter() {
+        use crate::models::MessageKind;
+        let command = Cli::command();
+        let search = command
+            .find_subcommand("messages")
+            .unwrap()
+            .find_subcommand("search")
+            .unwrap();
+        assert_eq!(
+            search
+                .get_arguments()
+                .filter(|arg| arg.get_id() == "kinds")
+                .count(),
+            1
+        );
+        assert!(!search.get_arguments().any(|arg| arg.get_id() == "kind"));
+        assert!(search
+            .get_arguments()
+            .find(|arg| arg.get_id() == "kinds")
+            .unwrap()
+            .get_help()
+            .unwrap()
+            .to_string()
+            .contains("Alias: --kind"));
+        for values in [
+            vec!["--kinds", "conversation,tool-call"],
+            vec!["--kind", "conversation,tool-call"],
+            vec!["--kinds", "conversation", "tool-call"],
+            vec!["--kind", "conversation", "tool-call"],
+            vec!["--kind", "conversation", "--kinds", "tool-call"],
+        ] {
+            let mut args = vec!["aise", "messages", "search", "needle"];
+            args.extend(values);
+            let parsed = Cli::try_parse_from(args).unwrap();
+            let Commands::Messages(crate::messages::MessagesCmd::Search(args)) = parsed.command
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                args.kinds,
+                vec![MessageKind::Conversation, MessageKind::ToolCall]
+            );
+        }
+    }
+
     /// The session-class filter reaches every command that takes session filters, because it
     /// lives on the flattened `SessionFilterArgs` rather than on one subcommand.
     #[test]
