@@ -6118,6 +6118,19 @@ impl Db {
         unique_session_match(value, matches, |session| &session.session.id)
     }
 
+    /// Resolve an exact parent recorded by accessible children before trying session prefixes.
+    pub(crate) fn resolve_parent_session_id(&self, value: &str) -> Result<String> {
+        let filters = SearchFilters {
+            parent_session_id: Some(value.to_owned()),
+            limit: 1,
+            ..Default::default()
+        };
+        if !self.list_recent(&filters)?.is_empty() {
+            return Ok(value.to_owned());
+        }
+        self.resolve_session_record(value).map(|session| session.id)
+    }
+
     pub fn resolve_session_record(&self, value: &str) -> Result<SessionRecord> {
         let exact = self.session_resolution_matches(
             RESOLVE_SESSION_RECORD_EXACT_SQL,
@@ -13224,6 +13237,19 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, "allowed");
+        db.conn.execute("update sessions set parent_session_id = 'claude:hidden-parent' where id != 'allowed'", []).unwrap();
+        db.conn.execute("update sessions set parent_session_id = 'claude:orphan-parent' where id = 'allowed'", []).unwrap();
+        assert_eq!(
+            db.resolve_parent_session_id("claude:orphan-parent")
+                .unwrap(),
+            "claude:orphan-parent"
+        );
+        assert!(db
+            .resolve_parent_session_id("claude:hidden-parent")
+            .is_err());
+        assert!(db
+            .resolve_parent_session_id("claude:unknown-parent")
+            .is_err());
     }
 
     #[test]

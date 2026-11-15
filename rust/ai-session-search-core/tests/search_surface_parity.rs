@@ -440,6 +440,67 @@ fn message_session_classes_filter_before_paging_on_every_surface() {
         identities(&serde_json::from_slice(&alias.stdout).unwrap()).len(),
         6
     );
+    let mut orphan = SessionRecord::new(
+        "claude:surviving-child",
+        Provider::Claude,
+        "surviving-child",
+        "/synthetic/orphan",
+        "test",
+        "test",
+    );
+    orphan.parent_session_id = Some("claude:absent-parent".into());
+    db.upsert_session(
+        &ParsedSession::new(
+            orphan,
+            vec![Message::new(0, Role::Assistant, "class needle")],
+        ),
+        0,
+        0,
+    )
+    .unwrap();
+    assert_eq!(
+        service
+            .search(request("claude:absent-parent"))
+            .unwrap()
+            .hits()
+            .len(),
+        1
+    );
+    assert_eq!(
+        identities(
+            &mcp_calls(
+                &f,
+                &[(
+                    "search_messages",
+                    json!({"query":"class needle", "parent_session_id":"claude:absent-parent"})
+                )]
+            )
+            .remove(0)
+            .unwrap()
+        ),
+        vec![("claude:surviving-child".into(), 0)]
+    );
+    let orphan_cli = aise(&f)
+        .args([
+            "messages",
+            "search",
+            "class needle",
+            "--parent-session",
+            "claude:absent-parent",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        orphan_cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&orphan_cli.stderr)
+    );
+    assert_eq!(
+        identities(&serde_json::from_slice(&orphan_cli.stdout).unwrap()),
+        vec![("claude:surviving-child".into(), 0)]
+    );
     for (id, parent) in [
         ("claude:prefix-parent-long", None),
         ("claude:prefix-child", Some("claude:prefix-parent-long")),

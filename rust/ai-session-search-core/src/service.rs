@@ -2878,11 +2878,18 @@ impl<'db> MessageService<'db> {
             MessageTarget::content(),
         )
         .build()?;
-        let plan = Self::plan_with_session_resolver(config, surface, request, |_| {
-            bail!(
-                "configured message-search specification unexpectedly requires session resolution"
+        let unavailable = || {
+            crate::ServiceError::invalid_argument(
+                "configured message-search specification unexpectedly requires session resolution",
             )
-        })?;
+        };
+        let plan = Self::plan_with_session_resolver(
+            config,
+            surface,
+            request,
+            |_| Err(unavailable().into()),
+            |_| Err(unavailable().into()),
+        )?;
         Ok(MessageSearchSpecification::new(
             ResolvedMessageSearchRequest::from_plan(&plan)?,
         ))
@@ -2938,9 +2945,13 @@ impl<'db> MessageService<'db> {
     /// purpose, configuration, or surface default). A session prefix is resolved here.
     pub fn plan(&self, request: MessageSearchRequest) -> Result<MessageSearchPlan> {
         self.db.ensure_refreshed_for_read()?;
-        Self::plan_with_session_resolver(self.config, self.surface, request, |value| {
-            self.catalog().resolve_session(value)
-        })
+        Self::plan_with_session_resolver(
+            self.config,
+            self.surface,
+            request,
+            |value| self.catalog().resolve_session(value),
+            |value| self.db.resolve_parent_session_id(value),
+        )
     }
 
     fn plan_with_session_resolver(
@@ -2948,6 +2959,7 @@ impl<'db> MessageService<'db> {
         surface: SearchSurface,
         request: MessageSearchRequest,
         resolve_session: impl Fn(&str) -> Result<SessionRecord>,
+        resolve_parent: impl Fn(&str) -> Result<String>,
     ) -> Result<MessageSearchPlan> {
         let purpose = request
             .purpose()
@@ -3242,9 +3254,8 @@ impl<'db> MessageService<'db> {
         let resolved_session = predicates.session().map(&resolve_session).transpose()?;
         let parent_session_id = predicates
             .parent_session_id()
-            .map(&resolve_session)
-            .transpose()?
-            .map(|session| session.id);
+            .map(&resolve_parent)
+            .transpose()?;
         if let (Some(session), Some(providers)) = (&resolved_session, predicates.providers()) {
             if !providers.contains(&session.provider) {
                 let selected = providers
