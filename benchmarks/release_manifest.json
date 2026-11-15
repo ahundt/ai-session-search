@@ -549,9 +549,9 @@
       "accepted_results": [
         {
           "baseline_sha256": "96ec506abe243101e70b6a6e83e0396220044f4b0244b94dd3d022436262c43e",
-          "candidate_sha256": "923533169e2bd715f716a517aa9df8035fc4cc126868873b11d624df9b2d2a08",
+          "candidate_sha256": "642a2bba928a1e38614f98ee6c9b4390a195fbb553eef76afb2ef938f61883ae",
           "category": "documented_change",
-          "difference": "Schema and expected schema 5\u21926; expected parser versions: Claude/desktop v4\u2192v20, Codex v5\u2192v14, Cursor v4\u2192v6, Antigravity v3\u2192v8, Pi v3\u2192v7, Prime v1\u2192v5, AI Studio v3\u2192v5, Gemini v4\u2192v11 (in both provider lists); added parser_health.unrecognized_record_types=[], unknown_config_keys=[], config_file {path, origin, exists} and config_files_not_read=[].",
+          "difference": "Schema and expected schema 5\u21926; expected parser versions: Claude/desktop v4\u2192v20, Codex v5\u2192v14, Cursor v4\u2192v7, Antigravity v3\u2192v8, Pi v3\u2192v7, Prime v1\u2192v5, AI Studio v3\u2192v5, Gemini v4\u2192v11 (in both provider lists); added parser_health.unrecognized_record_types=[], unknown_config_keys=[], config_file {path, origin, exists} and config_files_not_read=[].",
           "changelog": "1.1.0 Upgrade notes 1; Added 1 and 7; Changed 5"
         }
       ],
