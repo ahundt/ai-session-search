@@ -946,7 +946,16 @@ fn split_referenced_files(
             && text(index + 1).is_some_and(|value| label.is_match(value));
         let end = header
             .then(|| {
-                ((index + 2)..parts.len()).find(|&i| text(i) == Some("\n--- End of content ---"))
+                // Labels and their following payloads are pairs. A payload can equal
+                // any marker; only the position after a complete pair can terminate.
+                let mut cursor = index + 1;
+                while cursor + 1 < parts.len()
+                    && text(cursor).is_some_and(|value| label.is_match(value))
+                {
+                    cursor += 2;
+                }
+                (cursor < parts.len() && text(cursor) == Some("\n--- End of content ---"))
+                    .then_some(cursor)
             })
             .flatten();
         if header && end.is_none() {
@@ -2710,6 +2719,76 @@ mod tests {
             assert!(attached.content.contains("attached"));
             assert!(!attached.content.contains("before"));
             assert!(!attached.content.contains("after"));
+        }
+    }
+
+    #[test]
+    fn reference_payload_markers_do_not_terminate_attachments() {
+        for body in [
+            "\n--- End of content ---",
+            "\nContent from @fake.txt:\n",
+            "\n--- Content from referenced files ---",
+        ] {
+            for multiple in [false, true] {
+                let mut parts = vec![
+                    json!({"text":"inspect @example.txt"}),
+                    json!({"text":"\n--- Content from referenced files ---"}),
+                    json!({"text":"\nContent from @example.txt:\n"}),
+                    json!({"text":body}),
+                ];
+                if multiple {
+                    parts.extend([
+                        json!({"text":"\nContent from @second.txt:\n"}),
+                        json!({"text":"\n--- End of content ---"}),
+                    ]);
+                }
+                parts.extend([
+                    json!({"text":"\n--- End of content ---"}),
+                    json!({"text":"after"}),
+                ]);
+                let expected_attachment = parts[1..parts.len() - 1]
+                    .iter()
+                    .map(|part| part["text"].as_str().unwrap())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                for parsed in parse_user_content_both_formats(json!(parts)) {
+                    assert_eq!(parsed.messages.len(), 2);
+                    let human = parsed
+                        .messages
+                        .iter()
+                        .filter(|m| m.provenance.is_whole_user_input())
+                        .collect::<Vec<_>>();
+                    assert_eq!(human.len(), 1);
+                    assert_eq!(human[0].content, "inspect @example.txt\nafter");
+                    let attached = parsed
+                        .messages
+                        .iter()
+                        .find(|m| m.kind == MessageKind::ToolResult)
+                        .unwrap();
+                    assert_eq!(
+                        attached.content,
+                        expected_attachment.strip_prefix('\n').unwrap()
+                    );
+                    assert_eq!(attached.provenance.authorship, MessageAuthorship::Harness);
+                    let dir = tempfile::tempdir().unwrap();
+                    let db = crate::db::Db::open(&dir.path().join("index.db")).unwrap();
+                    db.upsert_session(&parsed, 1, 1).unwrap();
+                    let filters = crate::models::MessageFilters {
+                        role: Some(Role::User),
+                        ..Default::default()
+                    };
+                    assert!(db
+                        .search_messages("--- End of content ---", &filters)
+                        .unwrap()
+                        .is_empty());
+                    assert_eq!(
+                        db.search_messages("inspect @example.txt", &filters)
+                            .unwrap()
+                            .len(),
+                        1
+                    );
+                }
+            }
         }
     }
 
