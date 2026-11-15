@@ -5355,7 +5355,7 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         .map_err(|e| format!("{e:#}"))?;
     let s = &window.session;
     let transcript = &window.text;
-    let returned_lines_label = &window.lines_label;
+    let returned_lines_label = window.lines_label();
     let (total_lines, returned_lines, complete) =
         (window.total_lines, window.lines_returned, window.complete);
     let selected_edge = window.edge;

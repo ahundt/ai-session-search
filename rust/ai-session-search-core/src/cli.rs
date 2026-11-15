@@ -1480,7 +1480,8 @@ fn execute(cli: Cli) -> Result<()> {
             )?;
             if args.format == OutputFormat::Table {
                 print_session_detail(&window.session);
-                let (transcript, returned_lines) = (window.text, window.lines_label);
+                let returned_lines = window.lines_label();
+                let transcript = window.text;
                 if args.raw {
                     println!("\n{transcript}");
                 } else {
