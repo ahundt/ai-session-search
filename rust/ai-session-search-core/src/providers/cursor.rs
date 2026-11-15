@@ -129,7 +129,8 @@ impl CursorAdapter {
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
-        let mut file_edit_seq: i64 = 0;
+        let mut pending_file_mutations = crate::files::PendingFileMutations::default();
+        let mut requires_full_parse_for_tail = false;
         // tool_use_id -> tool name. Cursor transcripts use the Anthropic content-block shape
         // (verified against the kenn-io/agentsview parser), so a tool_result can be tagged
         // with the tool it came from, the same way the claude adapter does.
@@ -161,12 +162,19 @@ impl CursorAdapter {
             // tag tool output. (Tool outputs are frequently absent from cursor transcripts on
             // disk; when present they are indexed as Role::Tool.)
             if let Some(message) = value.get("message") {
-                super::claude::collect_file_edits(
+                super::claude::stage_file_edits(message, updated_at, &mut pending_file_mutations);
+                super::claude::collect_file_edit_results(
                     message,
-                    updated_at,
-                    &mut file_edit_seq,
+                    &mut pending_file_mutations,
                     &mut file_edits,
                 );
+                // A result outside the retained prefix can close a call before the overlap.
+                // Ask the shared indexer to reparse rather than guessing its mutation bytes.
+                if context.is_some_and(|c| c.prefix_truncated && byte_offset >= c.new_bytes_start)
+                    && super::claude::is_tool_result(message)
+                {
+                    requires_full_parse_for_tail = true;
+                }
                 super::claude::collect_tool_use_names(message, &mut tool_use_names);
                 super::claude::append_tool_use_messages(message, updated_at, &mut messages);
                 if role == "user" {
@@ -243,6 +251,9 @@ impl CursorAdapter {
         });
         if malformed_line_count > 0 {
             raw_metadata["malformed_line_count"] = json!(malformed_line_count);
+        }
+        if requires_full_parse_for_tail {
+            raw_metadata["requires_full_parse_for_tail"] = json!(true);
         }
         unrecognized.publish(&mut raw_metadata);
         let raw_metadata_json = Some(serde_json::to_string(&raw_metadata)?);
@@ -499,7 +510,7 @@ fn decode_cursor_project_dir_with(
 mod tests {
     use super::{cursor_message_text, decode_cursor_project_dir, CursorAdapter};
     use crate::models::Provider;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::fs;
     use tempfile::tempdir;
 
@@ -728,6 +739,98 @@ mod tests {
     }
 
     #[test]
+    fn mutation_result_in_later_refresh_commits_and_truncated_prefix_requests_reparse() {
+        use std::io::Write;
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("synthetic.jsonl");
+        let adapter = CursorAdapter::new(vec![]);
+        let call = json!({"role":"assistant","message":{"content":[
+            {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"ok.txt","content":"exact bytes"}}
+        ]}});
+        let result = json!({"role":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"write","content":"done"}
+        ]}});
+        fs::write(&path, format!("{call}\n")).unwrap();
+        let before = adapter.parse_inner(&path).unwrap();
+        assert!(before.file_edits.is_empty());
+        let offset = crate::tail::complete_prefix_offset(&path).unwrap();
+        writeln!(
+            fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{result}"
+        )
+        .unwrap();
+        let crate::tail::TailParseRun::Complete(Some(tail)) = crate::tail::tail_parse_until(
+            &path,
+            offset,
+            None,
+            &|| false,
+            |reader, path, context| adapter.parse_reader_with_context(reader, path, Some(context)),
+        )
+        .unwrap() else {
+            panic!("a correlated append must remain tail-parseable")
+        };
+        assert_eq!(tail.new_file_edits.len(), 1);
+        assert_eq!(
+            tail.new_file_edits[0].new_content.as_deref(),
+            Some("exact bytes")
+        );
+        let full = adapter.parse_inner(&path).unwrap();
+        assert_eq!(tail.new_file_edits, full.file_edits);
+        let suffix = adapter
+            .parse_reader_with_context(
+                std::io::Cursor::new(result.to_string()),
+                &path,
+                Some(crate::tail::TailContext {
+                    prefix_truncated: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        assert!(suffix.file_edits.is_empty());
+        let metadata: Value =
+            serde_json::from_str(suffix.session.raw_metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["requires_full_parse_for_tail"], true);
+    }
+
+    #[test]
+    fn cursor_file_edits_require_correlated_success() {
+        let adapter = CursorAdapter::new(vec![]);
+        let records = [
+            json!({"role":"assistant","message":{"content":[
+                {"type":"tool_use","id":"failed","name":"Write","input":{"file_path":"failed.txt","content":"never written"}},
+                {"type":"tool_use","id":"pending","name":"Write","input":{"file_path":"pending.txt","content":"unproven"}},
+                {"type":"tool_use","id":"success","name":"Write","input":{"file_path":"success.txt","content":"proven bytes"}}
+            ]}}),
+            json!({"role":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"failed","is_error":true,"content":"denied"},
+                {"type":"tool_result","tool_use_id":"unrelated","content":"ok"},
+                {"type":"tool_result","tool_use_id":"success","is_error":false,"content":"ok"}
+            ]}}),
+        ];
+        let text = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let parsed = adapter
+            .parse_reader(
+                std::io::Cursor::new(text),
+                std::path::Path::new("synthetic.jsonl"),
+            )
+            .unwrap();
+        assert_eq!(parsed.file_edits.len(), 1);
+        assert_eq!(parsed.file_edits[0].file_path, "success.txt");
+        assert_eq!(
+            parsed.file_edits[0].new_content.as_deref(),
+            Some("proven bytes")
+        );
+        assert!(parsed
+            .messages
+            .iter()
+            .any(|m| m.content.contains("never written")));
+    }
+
+    #[test]
     fn indexes_cursor_tool_results_and_file_edits() {
         use crate::models::Role;
         let temp = tempdir().expect("tempdir");
@@ -756,17 +859,15 @@ mod tests {
         let sources = adapter.discover();
         let parsed = adapter.parse(&sources[0]);
 
-        // Both file-mutating tool calls are recorded (Edit replayable; ApplyPatch path-only).
+        // Only the Edit has a successful result; ApplyPatch remains attempted activity.
         let files: Vec<&str> = parsed
             .file_edits
             .iter()
             .map(|e| e.file_name.as_str())
             .collect();
         assert!(files.contains(&"app.ts"), "Edit file recorded: {files:?}");
-        assert!(
-            files.contains(&"x.ts"),
-            "ApplyPatch file recorded (path-only): {files:?}"
-        );
+        assert!(!files.contains(&"x.ts"));
+        assert_eq!(files.len(), 1);
         let tool_input = parsed
             .messages
             .iter()
@@ -1045,9 +1146,7 @@ mod tests {
         );
         let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
         assert_eq!(roles, vec!["user", "tool", "assistant", "user"]);
-        assert_eq!(parsed.file_edits.len(), 1);
-        assert_eq!(parsed.file_edits[0].file_path, "/p/a.rs");
-        assert_eq!(parsed.file_edits[0].new_content.as_deref(), Some("hello"));
+        assert!(parsed.file_edits.is_empty());
         assert_eq!(
             parsed.session.parse_warning.as_deref(),
             Some("skipped 1 malformed JSONL record")
