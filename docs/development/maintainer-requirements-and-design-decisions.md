@@ -760,8 +760,9 @@ construct a matching `Connection` without a separate dependency. Prefer
 directly from `cli.rs` through 1.0.0. In 1.1.0 both run through `AnalysisService::vocabulary`
 (`VocabularyQuery` to `TermFrequency` rows) and `AnalysisService::repeats` (`RepeatsQuery` to
 `RepeatsReport`), and the CLI functions only build the request and render. `aise repeats --format
-json` keeps its bare array of groups; `--report` prints the report object, which carries the
-unattributed-input count. The Rust vocabulary call refuses under an `allowed-roots` access scope
+json` and `jsonl` emit one report object with `groups`, `unattributed_input_count`, and
+`unattributed_input_included`; 1.0.0 emitted a bare array of groups for JSON and one group per
+JSONL line. Table and plain output retain their group rows. The Rust vocabulary call refuses under an `allowed-roots` access scope
 because full-text term counts span every session. The hidden compatibility command `aise vocab`
 retains historical index-wide counts even under an `allowed-roots` scope; it is omitted from
 root help. Library `vocabulary()` enforces the scope refusal. Python `vocabulary()` and `repeats()` call those services. Neither has an MCP analytics tool.

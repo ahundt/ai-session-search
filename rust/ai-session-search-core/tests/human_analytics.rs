@@ -87,7 +87,6 @@ fn cli_analytics_read_original_human_input_independent_of_stored_role() {
                 "--index-refresh",
                 "existing-only",
                 "repeats",
-                "--report",
                 "--format",
                 "json",
                 "--min-matches",
