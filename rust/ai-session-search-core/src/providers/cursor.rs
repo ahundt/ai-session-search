@@ -273,7 +273,7 @@ impl CursorAdapter {
             agent_label: spawned.as_ref().map(|origin| origin.run_suffix.clone()),
         };
 
-        let messages = crate::util::normalize_raw_messages_with_evidence(
+        let mut messages = crate::util::normalize_raw_messages_with_evidence(
             messages,
             None,
             if spawned.is_some() {
@@ -282,6 +282,9 @@ impl CursorAdapter {
                 UserRoleEvidence::HumanInputEvent
             },
         );
+        for message in &mut messages {
+            cursor_input_provenance(message);
+        }
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
@@ -301,10 +304,7 @@ fn cursor_message_text(value: &Value) -> String {
         collect_text_content(content, &mut parts);
     }
     let text = parts.join("\n");
-    extract_tag(&text, "user_query")
-        .unwrap_or(text)
-        .trim()
-        .to_string()
+    text.trim().to_string()
 }
 
 fn collect_text_content(value: &Value, out: &mut Vec<String>) {
@@ -329,12 +329,87 @@ fn collect_text_content(value: &Value, out: &mut Vec<String>) {
     }
 }
 
-fn extract_tag(text: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = text.find(&open)? + open.len();
-    let end = text[start..].find(&close)? + start;
-    Some(text[start..end].trim().to_string())
+// Retain the entire searchable text. Only a single whole-turn wrapper proves an
+// input region; inline, repeated, nested and incomplete tags are ambiguous.
+fn cursor_query_region(text: &str) -> Option<(usize, usize)> {
+    let body = text
+        .strip_prefix("<user_query>")?
+        .strip_suffix("</user_query>")?;
+    if body.contains("<user_query>") || body.contains("</user_query>") {
+        return None;
+    }
+    let start = "<user_query>".len() + body.len() - body.trim_start().len();
+    Some((start, start + body.trim().len()))
+}
+
+// O(message bytes) time and partition metadata; text is not copied into parts.
+fn cursor_input_provenance(message: &mut crate::models::Message) {
+    use crate::models::{
+        ContentPartAuthorship as A, ContentPartOrigin as O, MessageAuthorship, MessageContentPart,
+        Role,
+    };
+    if message.role != Role::User {
+        return;
+    }
+    let original = if message.provenance.content_parts.is_empty() {
+        vec![MessageContentPart::new(
+            0,
+            0,
+            message.content.chars().count(),
+            if message.provenance.authorship == MessageAuthorship::Agent {
+                A::Agent
+            } else {
+                A::Human
+            },
+            O::DirectInput,
+        )]
+    } else {
+        std::mem::take(&mut message.provenance.content_parts)
+    };
+    let mut parts = Vec::new();
+    let mut chars = message.content.char_indices().peekable();
+    let mut position = 0;
+    for part in original {
+        let start_byte = chars
+            .peek()
+            .map_or(message.content.len(), |(offset, _)| *offset);
+        while position < part.end_char {
+            chars.next();
+            position += 1;
+        }
+        let end_byte = chars
+            .peek()
+            .map_or(message.content.len(), |(offset, _)| *offset);
+        let text = &message.content[start_byte..end_byte];
+        let mut add = |start, end, authorship, origin| {
+            if start < end {
+                parts.push(MessageContentPart::new(
+                    parts.len() as u32,
+                    start,
+                    end,
+                    authorship,
+                    origin,
+                ));
+            }
+        };
+        if part.origin != O::DirectInput || !text.contains("user_query") {
+            add(part.start_char, part.end_char, part.authorship, part.origin);
+        } else if let Some((start, end)) = cursor_query_region(text) {
+            let end = part.start_char + text[..end].chars().count();
+            let start = part.start_char + text[..start].chars().count();
+            add(part.start_char, start, A::Harness, O::HarnessContext);
+            add(start, end, part.authorship, O::DirectInput);
+            add(end, part.end_char, A::Harness, O::HarnessContext);
+        } else {
+            add(part.start_char, part.end_char, A::Unknown, O::Unknown);
+        }
+    }
+    message.provenance.authorship = if parts.len() == 1 {
+        parts[0].authorship.into()
+    } else {
+        MessageAuthorship::Mixed
+    };
+    message.provenance.content_parts = parts;
 }
 
 fn file_modified_at(path: &Path) -> Option<DateTime<Utc>> {
@@ -422,7 +497,7 @@ fn decode_cursor_project_dir_with(
 
 #[cfg(test)]
 mod tests {
-    use super::{cursor_message_text, decode_cursor_project_dir, extract_tag, CursorAdapter};
+    use super::{cursor_message_text, decode_cursor_project_dir, CursorAdapter};
     use crate::models::Provider;
     use serde_json::json;
     use std::fs;
@@ -476,7 +551,7 @@ mod tests {
         );
         assert_eq!(
             parsed.session.summary.as_deref(),
-            Some("Make Cursor threads searchable")
+            Some("<timestamp>Tuesday</timestamp> <user_query> Make Cursor threads searchable </user_query>")
         );
         assert_eq!(parsed.session.message_count, Some(4));
         assert!(parsed
@@ -494,7 +569,7 @@ mod tests {
         }));
         assert_eq!(
             parsed.messages[0].provenance.authorship,
-            crate::models::MessageAuthorship::Human
+            crate::models::MessageAuthorship::Unknown
         );
         assert_eq!(
             parsed.messages[2].provenance.authorship,
@@ -568,6 +643,31 @@ mod tests {
     }
 
     #[test]
+    fn literal_query_tags_keep_all_text_and_do_not_prove_human_input() {
+        let adapter = CursorAdapter::new(vec![]);
+        for role in ["user", "assistant"] {
+            for text in [
+                "Explain <user_query>x</user_query> syntax",
+                "<user_query>x</user_query> after <user_query>y</user_query>",
+            ] {
+                let value = json!({"role":role,"message":{"content":text}});
+                assert_eq!(cursor_message_text(&value), text);
+                let parsed = adapter
+                    .parse_reader(
+                        std::io::Cursor::new(value.to_string()),
+                        std::path::Path::new("synthetic.jsonl"),
+                    )
+                    .unwrap();
+                assert_eq!(parsed.messages[0].content, text);
+                assert_ne!(
+                    parsed.messages[0].provenance.authorship,
+                    crate::models::MessageAuthorship::Human
+                );
+            }
+        }
+    }
+
+    #[test]
     fn extracts_user_query_from_cursor_message() {
         let value = json!({
             "role": "user",
@@ -578,7 +678,39 @@ mod tests {
                 }]
             }
         });
-        assert_eq!(cursor_message_text(&value), "Find the billing bug");
+        assert_eq!(
+            cursor_message_text(&value),
+            "<timestamp>Tuesday</timestamp>\n<user_query>\nFind the billing bug\n</user_query>"
+        );
+    }
+
+    #[test]
+    fn whole_query_wrapper_selects_only_its_unicode_body() {
+        let text = "<user_query>\nrequest 🦀\n</user_query>";
+        let adapter = CursorAdapter::new(vec![]);
+        let value = json!({"role":"user","message":{"content":text}});
+        let parsed = adapter
+            .parse_reader(
+                std::io::Cursor::new(value.to_string()),
+                std::path::Path::new("synthetic.jsonl"),
+            )
+            .unwrap();
+        let message = &parsed.messages[0];
+        assert_eq!(message.content, text);
+        message.provenance.validate(text).unwrap();
+        let human: String = message
+            .provenance
+            .content_parts
+            .iter()
+            .filter(|part| part.authorship == crate::models::ContentPartAuthorship::Human)
+            .flat_map(|part| {
+                text.chars()
+                    .skip(part.start_char)
+                    .take(part.end_char - part.start_char)
+            })
+            .collect();
+        assert_eq!(human, "request 🦀");
+        assert_eq!(message.provenance.content_parts.len(), 3);
     }
 
     #[test]
@@ -822,14 +954,6 @@ mod tests {
     }
 
     #[test]
-    fn extracts_tag_body() {
-        assert_eq!(
-            extract_tag("prefix <user_query>hello</user_query> suffix", "user_query"),
-            Some("hello".to_string())
-        );
-    }
-
-    #[test]
     fn workspace_candidates_have_a_fixed_bound() {
         for length in [4, 8, 12, 25, 50] {
             super::WORKSPACE_CANDIDATES.with(|count| count.set(0));
@@ -913,7 +1037,7 @@ mod tests {
         assert_eq!(
             contents,
             vec![
-                "first",
+                "<user_query>\nfirst\n</user_query>",
                 r#"{"args":{"content":"hello","file_path":"/p/a.rs"},"kind":"tool_call","tool_name":"Write"}"#,
                 "on it",
                 "second"
