@@ -5214,29 +5214,26 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             reject_present(args, name, &format!("{name} conflicts with summary, seq/message_seq, and transcript_lines; omit those selectors for a range read"))?;
         }
     }
-    let has_range = [
-        "seq_from", "seq_to", "role", "limit", "offset", "order", "since", "until", "when",
-    ]
-    .iter()
-    .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
+    let range_selectors = [
+        "seq_from", "seq_to", "role", "kinds", "limit", "offset", "order", "since", "until", "when",
+    ];
+    let has_range = range_selectors
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
 
     if message_seq.is_none() {
         for name in ["context_before", "context_after"] {
             reject_present(args, name, "asymmetric context only applies with seq")?;
         }
     }
-    if !has_range {
-        reject_present(
-            args,
-            "kinds",
-            "kinds only applies with seq_from/seq_to; focused context already includes every class",
-        )?;
-    }
     if !has_range && message_seq.is_none() {
         reject_present(
             args,
             "detail",
-            "detail only applies with message_seq or seq_from/seq_to",
+            &format!(
+                "detail requires seq/message_seq or a range selector: {}",
+                range_selectors.join(", ")
+            ),
         )?;
     }
     let selector_count = summary as usize
@@ -5244,10 +5241,10 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         + transcript_lines.is_some() as usize
         + has_range as usize;
     if selector_count > 1 {
-        return Err(
-            "Use only one get_session output selector: summary, transcript_lines, seq (or deprecated message_seq), or seq_from/seq_to."
-                .to_string(),
-        );
+        return Err(format!(
+            "Use only one get_session output selector: summary, transcript_lines, seq (or deprecated message_seq), or a range read enabled by {}.",
+            range_selectors.join(", ")
+        ));
     }
     if summary {
         let include = parse_string_array(args, "include")?;
@@ -7217,6 +7214,30 @@ mod tests {
             &db
         )
         .is_ok());
+    }
+
+    #[test]
+    fn kinds_alone_selects_a_session_range() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        for (kinds, expected) in [
+            (json!(["conversation"]), vec![0, 1, 2]),
+            (json!(["tool_call"]), vec![]),
+        ] {
+            let args = json!({"session_id":"claude:test1", "kinds":kinds});
+            let out = tool_get_session(&args, &config, &db)
+                .unwrap()
+                .structured_content
+                .unwrap();
+            assert_eq!(out["session_id"], "claude:test1");
+            let seqs: Vec<_> = out["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["seq"].as_i64().unwrap())
+                .collect();
+            assert_eq!(seqs, expected);
+        }
     }
 
     #[test]
@@ -9693,13 +9714,29 @@ mod tests {
         let selected =
             read(json!({"session_id":"notices", "seq_from":0, "kinds":["harness_notice"]}));
         assert_eq!(selected["messages"][0]["content"], "synthetic hook notice");
-        assert!(tool_get_session(
-            &json!({"session_id":"notices", "kinds":["harness_notice"]}),
+        let kinds_only = read(json!({"session_id":"notices", "kinds":["harness_notice"]}));
+        assert_eq!(kinds_only["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            kinds_only["messages"][0]["seq"],
+            selected["messages"][0]["seq"]
+        );
+        assert_eq!(kinds_only["messages"][0]["kind"], "harness_notice");
+        assert_eq!(
+            kinds_only["messages"][0]["content"],
+            "synthetic hook notice"
+        );
+        let error = tool_get_session(
+            &json!({"session_id":"notices", "seq":0, "kinds":["harness_notice"]}),
             &config,
-            &db
+            &db,
         )
-        .unwrap_err()
-        .contains("kinds only applies"));
+        .unwrap_err();
+        for selector in [
+            "seq_from", "seq_to", "role", "kinds", "limit", "offset", "order", "since", "until",
+            "when",
+        ] {
+            assert!(error.contains(selector), "{error}");
+        }
     }
 
     #[test]
