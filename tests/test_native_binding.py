@@ -2365,6 +2365,16 @@ def test_native_analysis_documents_page_indexed_user_text_with_typed_cursor(tmp_
     assert first.documents[0].message_count == 3
     assert first.documents[0].user_message_count == 2
     assert isinstance(first.next_cursor, native.AnalysisCursor)
+    token = first.next_cursor.to_token()
+    assert isinstance(token, str)
+    assert json.loads(json.dumps(token)) == token
+    assert first.to_dict()["next_cursor"] == token
+    assert first.next_cursor == search.analysis_documents(request).next_cursor
+    assert "AnalysisCursor" in repr(first.next_cursor)
+    assert not hasattr(first.next_cursor, "to_dict")
+    assert [doc.session.id for doc in second.documents] == [
+        doc.session.id for doc in search.analysis_documents(request, cursor=first.next_cursor).documents
+    ]
     assert len(second.documents) == 1
     assert second.documents[0].session.id == "claude:second"
     assert second.documents[0].user_text == ""
