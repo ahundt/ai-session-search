@@ -10,6 +10,11 @@ receipt. `SKILL.md` carries the plain cost order; this file holds the detail.
 `S` indexed sessions, `M` messages in one session, `K` a positive result limit, `A` query
 tokens, `F` discovered source files, `E` filtered file edits, `B` source bytes, `R` SQL rows, `D_W`/`D_K` returned context bytes for a page/all matches.
 
+For file history and extraction, `E` counts selected edit rows, including replay prerequisites
+outside the output date window; `H` is their retained payload bytes, `V` is peak live content
+bytes, and `J` is accumulated version-metadata bytes before output paging.
+`L` counts bytes scanned or copied during replay, line counting, and output cloning.
+
 ## Per operation
 
 | Operation | Time | Memory |
@@ -22,8 +27,15 @@ tokens, `F` discovered source files, `E` filtered file edits, `B` source bytes, 
 | Fuzzy `search_messages` | `O(T + N + W log W)`; every structurally eligible row is read and scored in bounded parallel batches | one batch plus its largest row, retained `W` text, per-worker matcher scratch |
 | `search_sessions` / `aise search` | `O(S + T*(A+1) + N + K log K)`; every eligible session's title, summary, paths, preview, and transcript are read | retained `K` records plus the batch budget and largest session |
 | `query_session_index` / `aise db query` | a predicate without a usable index scans `O(R)` rows | bounded by `limit`/`max_cell_chars` |
-| `files search`/`history`/`cross-ref`/`extract` | `O(E + K log K)` filtered edits/results | `O(K)` |
+| `files search` / `cross-ref` | SQL scans, groups, and sorts eligible edit metadata; a result limit does not bound rows examined | returned metadata bytes plus SQLite grouping, sort, and cache memory |
+| `files history` | after SQL selection, `O(E + L)` for replay and line counting | `O(E + H + V + J)` plus SQLite memory |
+| `files extract` / reconstruction iterator | after SQL selection, `O(E + L)` for snapshot lookup and consumed replay, including copies of yielded content | `O(E + H + V)` plus SQLite memory and content retained by the caller |
 | Refresh | incremental source reads `O(B_new + overlap)`; whole-source fallbacks `O(B_all)` | streaming reads; full parses retain one source |
+
+Repeated edits can scan or copy the whole content repeatedly, so `L` can grow with edit count
+times content size. SQL selection can scan the edit table and sort matching rows; history and
+extraction load selected edit payloads before applying the output limit.
+File queries default to `limit=0`, which returns all matching results.
 
 `B_new` is appended source bytes, `B_all` is all bytes in a source, and the backward overlap is
 bounded at 1 MiB. Growing transcripts need a full parse for an older build's checkpoint without
