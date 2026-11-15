@@ -86,7 +86,7 @@ writes an immutable bundle of reconstructable versions to a new directory.
 ### Analyse corrections and repeated phrases
 
 ```python
-corrections = search.classify_messages(skill="corrections", include_unattributed_input=True)
+corrections = search.run_skill(aise.SkillRunQuery(skill=aise.SkillSelector(name="corrections"), input=aise.MessageClassificationQuery(include_unattributed_input=True))).output.report.matches
 repeat_report = search.repeats(max_groups=10, include_unattributed_input=True)
 for correction in corrections:
     print(correction.session_id, correction.message_seq, correction.category)
@@ -203,9 +203,10 @@ eligible session/transcript bytes before retaining its top page. The
 states scan, replay, retained-memory, and output bounds for session and message retrieval,
 file recovery, and refresh.
 
-`classify_messages(skill="corrections", include_unattributed_input=True)` returns match rows
-directly. Pass `request=MessageClassificationQuery(...)` for filters and bounds; `run_skill()`
-continues to return the full report with policy receipts and unattributed-input counts.
+`search.run_skill(aise.SkillRunQuery(skill=aise.SkillSelector(name="corrections"), input=aise.MessageClassificationQuery(include_unattributed_input=True))).output.report.matches`
+returns classification rows. Pass filters and bounds through `MessageClassificationQuery`.
+Keep the `run_skill()` result when you need policy receipts or unattributed-input counts,
+including a nonzero count when no attributed messages match.
 
 `repeats()` returns the CLI report dictionary (`groups` with example message references,
 `unattributed_input_count`, and `unattributed_input_included`). Its bounds resolve from
