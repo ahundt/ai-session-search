@@ -26,9 +26,11 @@ use ai_session_search::{MessageFilters, SearchFilters, SessionSearch};
 
 `SessionSearch` owns the configuration, the SQLite connection, and the worker pool. Keep one
 instance for a related unit of work, then compose the filter and publication types
-re-exported beside it. Opening never reads your session files: call
-`app.index().prepare_for_read()` once to apply the configured refresh policy, or reads on a
-never-indexed database fail with `ServiceError::IndexNotRefreshed`.
+re-exported beside it. Opening never reads your session files. Call
+`app.index().prepare_for_read()` once to apply the configured refresh policy.
+`SessionSearch::load()` and `SessionSearch::open()` preserve empty reads before the first refresh.
+`SessionSearch::open_strict()` returns `ServiceError::IndexNotRefreshed` on reads until the index
+contains sessions or has completed a refresh.
 
 ```rust,no_run
 use ai_session_search::SessionSearch;
