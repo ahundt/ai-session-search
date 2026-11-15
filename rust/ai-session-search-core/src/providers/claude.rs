@@ -1142,32 +1142,32 @@ impl ClaudeAdapter {
             let system_notice = if record_type == Some("system") {
                 if let Some(subtype) = value.get("subtype").and_then(Value::as_str) {
                     let field = match subtype {
-                        "task_started" => "prompt",
-                        "task_notification" => "summary",
-                        "api_retry" => "error",
-                        "permission_denied" => "message",
-                        "model_refusal_fallback" => "content",
+                        "task_started" => Some("prompt"),
+                        "task_notification" => Some("summary"),
+                        "api_retry" => Some("error"),
+                        "permission_denied" => Some("message"),
+                        "model_refusal_fallback" => Some("content"),
                         subtype
                             if matches!(
                                 record_disposition("system/", subtype),
                                 Some(Ignored(_))
                             ) =>
                         {
-                            continue
+                            None
                         }
                         subtype => {
                             unrecognized.count(Some(&format!("system/{subtype}")));
-                            continue;
+                            None
                         }
                     };
-                    match value.get(field).and_then(Value::as_str) {
+                    field.and_then(|field| match value.get(field).and_then(Value::as_str) {
                         Some(text) => Some(text),
                         None => {
                             unrecognized
                                 .count(Some(&format!("system/{subtype} ({field} not string)")));
-                            continue;
+                            None
                         }
-                    }
+                    })
                 } else {
                     None
                 }
@@ -1411,9 +1411,7 @@ impl ClaudeAdapter {
             let mut tool_call_id: Option<String> = None;
             let mut mixed_user_content = None;
 
-            if let Some(notice) = system_notice {
-                text = notice.to_string();
-            } else if let Some(message) = value.get("message") {
+            if let Some(message) = value.get("message") {
                 // `message.role` refines a user or assistant record. It never makes a record of
                 // another type a turn; only the earlier rendering of a declined record used it.
                 if retract || matches!(record_type, Some("user" | "assistant")) {
@@ -1486,6 +1484,14 @@ impl ClaudeAdapter {
                 text = message.to_string();
             }
 
+            // Subtype metadata must not suppress the legacy message renderer: system
+            // records can carry explicit notices or tool calls even for ignored/unknown
+            // subtypes. SDK fields add notices only when no legacy notice text exists.
+            if let Some(notice) = system_notice {
+                if !is_harness_notice(&value, &text) || text.trim().is_empty() {
+                    text = notice.to_string();
+                }
+            }
             // Harness notices (Stop-hook feedback, PreToolUse blocks, local-command caveats,
             // task notifications) are the only record of what a hook told an agent and what it
             // did next, so they are stored and tagged rather than dropped. Every query excludes
@@ -5315,6 +5321,117 @@ mod tests {
             crate::db::CLAUDE_INPUT_WORK.with(|work| work.set(0));
             db.upsert_session(&replayed, 3, 3).unwrap();
             crate::db::CLAUDE_INPUT_WORK.with(|work| assert_eq!(work.get(), 3 * count));
+        }
+    }
+
+    #[test]
+    fn content_bearing_system_subtypes_preserve_legacy_notices() {
+        // The legacy renderer reads message content before top-level content, keeps
+        // isMeta/task-notification notices, and emits tool calls from message objects.
+        // Subtypes never constrained that path.
+        let mut subtypes: Vec<_> = super::RECORD_TYPES
+            .iter()
+            .filter_map(|(name, _)| name.strip_prefix("system/"))
+            .collect();
+        subtypes.push("synthetic_unknown");
+        for source in [
+            "synthetic.jsonl",
+            "local-agent-mode-sessions/synthetic/audit.jsonl",
+        ] {
+            for subtype in &subtypes {
+                for shape in 0..8 {
+                    let temp = tempdir().unwrap();
+                    let mut value =
+                        json!({"type":"system","subtype":subtype,"session_id":"synthetic"});
+                    let text = if shape == 6 {
+                        "<task-notification>synthetic diagnostic</task-notification>"
+                    } else {
+                        "synthetic diagnostic"
+                    };
+                    if shape & 1 == 0 {
+                        value["content"] = json!(text);
+                    } else {
+                        value["message"] = json!({"role":"assistant","content":text});
+                    }
+                    if matches!(shape, 2..=5) {
+                        value["isMeta"] = json!(true);
+                    }
+                    if shape == 4 {
+                        value["prompt"] = json!("synthetic SDK text");
+                        value["summary"] = json!("synthetic SDK text");
+                        value["error"] = json!("synthetic SDK text");
+                        // permission_denied's message string suppresses top-level content in the legacy renderer.
+                    }
+                    if shape == 5 {
+                        value["prompt"] = json!(42);
+                    }
+                    if shape == 7 {
+                        value["message"] = json!({"role":"assistant","content":[
+                            {"type":"tool_use","id":"call-1","name":"Read","input":{"file_path":"synthetic.txt"}}
+                        ]});
+                    }
+                    let parsed = ClaudeAdapter::new(vec![])
+                        .parse_reader(
+                            std::io::Cursor::new(value.to_string()),
+                            &temp.path().join(source),
+                        )
+                        .unwrap();
+                    let expected: Vec<&str> = if matches!(shape, 2..=6)
+                        || (shape == 0 && *subtype == "model_refusal_fallback")
+                    {
+                        vec![text]
+                    } else {
+                        vec![]
+                    };
+                    let notices: Vec<_> = parsed
+                        .messages
+                        .iter()
+                        .filter(|m| m.kind == crate::models::MessageKind::HarnessNotice)
+                        .map(|m| m.content.as_str())
+                        .collect();
+                    assert_eq!(
+                        notices, expected,
+                        "subtype={subtype}, shape={shape}, source={source}"
+                    );
+                    assert_eq!(
+                        parsed.messages.len(),
+                        expected.len() + usize::from(shape == 7),
+                        "subtype={subtype}, shape={shape}, source={source}"
+                    );
+                    if shape == 2 || shape == 3 {
+                        use crate::models::{MessageFilters, MessageKind};
+                        let mut legacy = parsed.clone();
+                        legacy.session.parse_version = "synthetic-earlier-parser".into();
+                        let upgraded =
+                            crate::db::Db::open(&temp.path().join("upgraded.db")).unwrap();
+                        let fresh = crate::db::Db::open(&temp.path().join("fresh.db")).unwrap();
+                        upgraded.upsert_session(&legacy, 1, 1).unwrap();
+                        upgraded.upsert_session(&parsed, 2, 2).unwrap();
+                        fresh.upsert_session(&parsed, 1, 1).unwrap();
+                        let filters = MessageFilters {
+                            kinds: Some(vec![MessageKind::HarnessNotice]),
+                            ..Default::default()
+                        };
+                        for db in [&upgraded, &fresh] {
+                            let hits = db
+                                .search_messages("synthetic diagnostic", &filters)
+                                .unwrap();
+                            assert_eq!(hits.len(), 1);
+                            assert_eq!(db.message_count().unwrap(), 1);
+                        }
+                    }
+                    if shape == 7 {
+                        let call = &parsed.messages[0];
+                        assert_eq!(call.role, crate::models::Role::Tool);
+                        assert_eq!(call.tool_name.as_deref(), Some("Read"));
+                        assert_eq!(call.tool_call_id.as_deref(), Some("call-1"));
+                        assert_eq!(
+                            serde_json::from_str::<Value>(&call.content).unwrap(),
+                            json!({"kind":"tool_call","tool_name":"Read","args":{"file_path":"synthetic.txt"}})
+                        );
+                    }
+                }
+            }
         }
     }
 
