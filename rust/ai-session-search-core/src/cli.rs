@@ -191,8 +191,9 @@ enum Commands {
     Vocab(crate::analytics::VocabArgs),
     /// Find recurring phrases in what people wrote.
     ///
-    /// User-role messages unless `--role` names another, so an assistant or tool phrase repeated
-    /// across sessions is not reported by default.
+    /// Source-attributable human input across stored roles, excluding generated text and mirrors
+    /// (provider-recorded copies of earlier input). An explicit non-user `--role` selects that
+    /// stored role instead.
     #[command(display_order = 31)]
     Repeats(crate::analytics::RepeatsArgs),
     /// Recover edited files: search/history/cross-ref/extract.

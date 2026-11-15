@@ -379,10 +379,47 @@ fn main() -> ai_session_search::anyhow::Result<()> {
 
 ### Deprecated Rust entry points
 
-Use the service handles above for new code. The [1.1.0 deprecation table](../../CHANGELOG.md#deprecated)
-lists retained low-level helpers, command-printing functions, compatibility search methods,
-and selector aliases with their replacements. `Db::purge_injected_messages` now reclassifies
-harness notices through `classify_injected_messages`; it preserves stored history.
+Use the service handles above for new code. These entry points remain callable in 1.1.0 with
+compiler warnings. `Db::purge_injected_messages` now reclassifies harness notices through
+`classify_injected_messages`; it preserves stored history.
+
+| Rust items | Replacement |
+| --- | --- |
+| `EffectiveAccessScope::allows_workspace_path` | CatalogService::list_sessions for authoritative scope-enforced reads |
+| `EffectiveAccessScope::is_unrestricted` | match EffectiveAccessScope for policy inspection; use CatalogService::list_sessions for scope-enforced reads |
+| `IndexService::reindex` | IndexService::reindex_report |
+| `MessageSearchBatch::into_parts` | MessageService::search, or borrow batch results, context_windows, and included |
+| `MessageSearchResponse::into_hits` | MessageService::search and MessageSearchResponse::results |
+| `MessageSearchResponse::into_rows` | MessageService::search and borrow results and context_windows |
+| `MessageService::search_legacy`, `MessageService::search_with_explain` | MessageService::search |
+| `SkillNameSelector` | SkillSelector::name |
+| `SkillPathSelector` | SkillSelector::path |
+| `dates::parse_bound`, `dates::parse_span` | DateRange::resolve and pass the result to CatalogService or MessageService |
+| `db::Db::clear_all` | no service deletes the archive; IndexService::reindex_report refreshes while preserving history |
+| `db::Db::counts_by_provider` | CatalogService::list_sessions and group its typed provider rows |
+| `db::Db::explain_message_search` | MessageService::plan or MessageService::search with a receipt level |
+| `db::Db::file_edit_count` | FileService::search for typed file summaries |
+| `db::Db::file_edits_for` | FileService::history or FileService::reconstruct for typed recovery |
+| `db::Db::file_edits_for_session_id` | FileService::history with a session-scoped FileQuery |
+| `db::Db::is_file_current` | IndexService::prepare_for_read for coordinated freshness checks |
+| `db::Db::messages_fts_count` | MaintenanceService::diagnostics for index health |
+| `db::Db::purge_injected_messages` | reclassifies instead of deleting; call `classify_injected_messages` |
+| `db::Db::replace_session` | IndexService::reindex_report for coordinated parser upgrades |
+| `files::run` | FileService::search, history, cross_reference, or reconstruct |
+| `indexer::auto_reindex` | IndexService::prepare_for_read or IndexService::refresh |
+| `mcp_schema_budget::LEDGER_STAGES` | run_cli_from for the schema-budget stage ledger; mcp_schema_budget::evaluate_all evaluates catalogue limits |
+| `mcp_schema_budget::ceiling_for`, `mcp_schema_budget::codex_strips_descriptions` | mcp_schema_budget::evaluate_all; run_cli_from exposes the schema-budget command |
+| `messages::run` | MessageService::search or read_session, or CatalogService::inspect |
+| `skills::SkillCategoryRow`, `skills::SkillDiagnostic`, `skills::SkillSummary` | run_cli_from for skill metadata or AnalysisService::run_skill for capability execution |
+| `skills::run` | run_cli_from for skill management or AnalysisService::run_skill for capability execution |
+| `sql_query::DbQueryArgs::resolve` | SqlService::query with SqlQuery, which resolves configured defaults |
+| `sql_query::run` | SessionSearch::sql or SqlService::new(&config) and render the QueryResult |
+| `tail::tail_parse` | IndexService::reindex_report for guarded incremental parsing |
+| `trigram::trigram_prefilter_all` | MessageService::search with MessageQuery::regex for verified results |
+| `trigram_index::base_max_id`, `trigram_index::build`, `trigram_index::build_in_current_transaction`, `trigram_index::candidates`, `trigram_index::ensure_schema`, `trigram_index::schema_is_compatible` | IndexService::reindex_report for index preparation and MessageService::search for verified queries |
+| `util::LegacyRawMessage`, `util::to_messages`, `util::to_messages_with_tools` | RawMessage constructors; IndexService::reindex_report owns provider normalization |
+| `util::UserRoleAuthorshipEvidence`, `util::apply_user_role_authorship` | RawMessage::with_authorship before normalization |
+| `util::to_messages_with_tools_in_scope` | RawMessage constructors; IndexService::reindex_report owns scoped provider normalization |
 
 ### Errors
 

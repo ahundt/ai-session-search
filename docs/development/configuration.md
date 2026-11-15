@@ -580,6 +580,10 @@ destination directory's inherited ACL on Windows. A handled failure rolls back u
 in reverse order. A crash, external edit, unreadable receipt, or durability-confirmation failure
 preserves evidence and prints a shell-independent executable/argv description plus the exact
 receipt path; recovery never overwrites content that differs from both recorded images.
+New receipts record resolved parent-directory locations. A changed location, including a
+parent replaced by a link, stops writes and retains the receipt for recovery. Older receipts
+without those locations cannot detect that replacement; a change between the check and the
+write is not detected.
 Successful publication or complete rollback removes the receipt. The adjacent advisory lock file
 remains because deleting a lock pathname can split concurrent waiters across different inodes.
 
