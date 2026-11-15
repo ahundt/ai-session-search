@@ -1156,7 +1156,7 @@ fn repeat_phrase_groups(
 
 #[cfg(test)]
 thread_local! {
-    static PHRASE_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PHRASE_PAIR_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Preserve input order while testing containment only among equal supports.
@@ -1170,7 +1170,7 @@ fn remove_equal_support_contained_phrases(candidates: &mut Vec<(String, BTreeSet
         let group = groups.entry(indices.clone()).or_default();
         let is_duplicate = group.iter().any(|&index| {
             #[cfg(test)]
-            PHRASE_COMPARISONS.with(|n| n.set(n.get() + 1));
+            PHRASE_PAIR_VISITS.with(|n| n.set(n.get() + 1));
             phrase_is_contiguous_subphrase_of(&phrase, &kept[index].0)
         });
         if !is_duplicate {
@@ -1395,23 +1395,25 @@ mod tests {
         assert!(!informative_phrase(&[]));
     }
 
-    fn reference_phrase_minimization(candidates: &mut Vec<(String, BTreeSet<usize>)>) {
+    fn reference_phrase_minimization(candidates: &mut Vec<(String, BTreeSet<usize>)>) -> usize {
+        let mut visits = 0;
         let mut kept: Vec<(String, BTreeSet<usize>)> = Vec::new();
         for (phrase, indices) in candidates.drain(..) {
-            if !kept
-                .iter()
-                .any(|(p, s)| s == &indices && phrase_is_contiguous_subphrase_of(&phrase, p))
-            {
+            if !kept.iter().any(|(p, s)| {
+                visits += 1;
+                s == &indices && phrase_is_contiguous_subphrase_of(&phrase, p)
+            }) {
                 kept.push((phrase, indices));
             }
         }
         *candidates = kept;
+        visits
     }
 
     #[test]
     fn phrase_minimization_work_growth() {
-        for size in [16, 32, 64] {
-            let mut candidates = (0..size)
+        for (size, reference_visits) in [(16, 120), (32, 496), (64, 2016)] {
+            let mut candidates: Vec<_> = (0..size)
                 .map(|i| {
                     (
                         format!("synthetic phrase {i}"),
@@ -1419,13 +1421,37 @@ mod tests {
                     )
                 })
                 .collect();
-            PHRASE_COMPARISONS.with(|n| n.set(0));
+            let mut expected = candidates.clone();
+            assert_eq!(
+                reference_phrase_minimization(&mut expected),
+                reference_visits
+            );
+            PHRASE_PAIR_VISITS.with(|n| n.set(0));
             remove_equal_support_contained_phrases(&mut candidates);
-            let comparisons = PHRASE_COMPARISONS.with(|n| n.get());
-            println!("phrases={size} comparisons={comparisons}");
+            let visits = PHRASE_PAIR_VISITS.with(|n| n.get());
+            println!(
+                "phrases={size} reference_visits={reference_visits} optimized_visits={visits}"
+            );
+            assert_eq!(candidates, expected);
             assert_eq!(candidates.len(), size);
-            assert_eq!(comparisons, 0);
+            assert!(
+                visits <= size,
+                "candidate pair visits {visits} exceed {size}"
+            );
         }
+        // Equal support must visit retained phrases, including a contained phrase.
+        let mut control = vec![
+            ("deploy service".into(), BTreeSet::from([0, 1])),
+            ("service".into(), BTreeSet::from([0, 1])),
+            ("check tests".into(), BTreeSet::from([0, 1])),
+        ];
+        let mut expected = control.clone();
+        assert_eq!(reference_phrase_minimization(&mut expected), 2);
+        PHRASE_PAIR_VISITS.with(|n| n.set(0));
+        remove_equal_support_contained_phrases(&mut control);
+        assert_eq!(PHRASE_PAIR_VISITS.with(|n| n.get()), 2);
+        assert_eq!(control, expected);
+        assert_eq!(control.len(), 2);
     }
 
     #[test]
