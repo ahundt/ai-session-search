@@ -194,9 +194,10 @@ compare each event's own timestamp.
 
 A finite session list limit bounds the records you get back; it does not bound the SQLite rows
 considered, and a zero limit returns all eligible sessions. Ranked session search also scores all
-eligible session/transcript bytes before retaining its top page. Runtime, memory, I/O, and
-output-growth bounds are recorded under `REQ010-protect-complexity-bounds` in the
-[maintainer requirements](maintainer-requirements-and-design-decisions.md).
+eligible session/transcript bytes before retaining its top page. The
+[search-cost reference](../../skills/ai-session-search/references/search-costs-and-receipts.md)
+states scan, replay, retained-memory, and output bounds for session and message retrieval,
+file recovery, and refresh.
 
 `classify_messages(skill="corrections", include_unattributed_input=True)` returns match rows
 directly. Pass `request=MessageClassificationQuery(...)` for filters and bounds; `run_skill()`
