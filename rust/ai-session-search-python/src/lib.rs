@@ -63,8 +63,9 @@ macro_rules! python_value {
         #[pymethods]
         impl $class {
             /// Return a detached JSON-ready dictionary using structured-output field names.
-            fn to_dict<'py>($slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyAny>> {
-                $value
+            fn to_dict<'py>($slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyDict>> {
+                let value: PyResult<Bound<'py, PyAny>> = $value;
+                Ok(value?.cast_into::<PyDict>()?)
             }
 
             fn __repr__(slf: &Bound<'_, Self>) -> PyResult<String> {
@@ -110,6 +111,9 @@ fn optional_value_fields<'py>(
 }
 
 fn value_json<'py>(value: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
+    if let Ok(cursor) = value.cast::<NativeAnalysisCursor>() {
+        return Ok(cursor.borrow().to_token().into_pyobject(value.py())?.into_any());
+    }
     if value.hasattr("to_dict")? {
         return value.call_method0("to_dict");
     }
@@ -5823,7 +5827,26 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
 
 python_value! { NativeSessionRecord, slf => value_fields(slf.as_any(), &["id","provider","provider_session_id","title","summary","cwd","repo_root","created_at","updated_at","last_message_at","preview_text","raw_metadata_json","source_path","message_count","parse_warning","parent_session_id","agent_label","discovery_source","parse_version"]); }
 
-python_value! { NativeAnalysisCursor, slf => json_compatible(slf.py(), &slf.borrow().inner); }
+#[pymethods]
+impl NativeAnalysisCursor {
+    /// Return the opaque continuation token as a string, not a dictionary.
+    /// Takes no arguments, has no defaults or bounds, and does not read the index.
+    /// Pass the cursor object, not this string, to analysis_documents(cursor=...).
+    fn to_token(&self) -> String {
+        self.inner.as_str().to_owned()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("AnalysisCursor({:?})", self.inner.as_str())
+    }
+
+    fn __eq__(slf: &Bound<'_, Self>, other: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if !slf.get_type().is(&other.get_type()) {
+            return Ok(false);
+        }
+        Ok(slf.borrow().inner.as_str() == other.extract::<PyRef<'_, Self>>()?.inner.as_str())
+    }
+}
 
 python_value! { NativeAnalysisDocument, slf => value_fields(slf.as_any(), &["session","user_text","first_user_text","message_count","user_message_count"]); }
 

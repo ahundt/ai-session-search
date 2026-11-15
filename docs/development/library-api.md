@@ -251,7 +251,9 @@ to explicit destinations. Render and reconstruction-iterator calls do not publis
 Request and result values compare by value, have readable `repr()` output, and expose
 `to_dict()` for a detached JSON-ready dictionary. Dictionaries use CLI field names, including
 `ts`; existing Python attributes keep `timestamp`. Resource owners and iterators retain
-identity semantics.
+identity semantics. `AnalysisCursor.to_token()` returns an opaque string; page dictionaries
+keep the same string representation under `next_cursor`. Continue analysis paging with the
+cursor object through `analysis_documents(cursor=page.next_cursor)`, not the serialized string.
 
 `ReconstructedFile.restore(output_dir=...)` writes a `.recovered` copy using only the recorded
 basename under your chosen directory. With no output_dir it writes beside the recorded original

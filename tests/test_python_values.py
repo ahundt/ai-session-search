@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Value semantics at the native Python boundary."""
 
+import ast
 import inspect
 import json
 from pathlib import Path
@@ -36,13 +37,36 @@ def test_request_equality_includes_every_parameter():
 
 
 def test_every_value_type_has_value_protocol():
-    resources = {"SessionSearch", "MessageSearchBatches", "ReconstructedFileVersions"}
+    resources = {"SessionSearch", "MessageSearchBatches", "ReconstructedFileVersions", "AnalysisCursor"}
     for name in native.__all__:
         cls = getattr(native, name)
         if inspect.isclass(cls) and name not in resources and not issubclass(cls, Exception):
             assert callable(getattr(cls, "to_dict", None)), name
             assert cls.__repr__ is not object.__repr__, name
             assert cls.__eq__ is not object.__eq__, name
+
+
+def test_every_public_to_dict_returns_dict():
+    root = Path(__file__).resolve().parents[1]
+    stub = ast.parse((root / "ai_session_search/_native.pyi").read_text())
+    classes = {node.name: node for node in stub.body if isinstance(node, ast.ClassDef)}
+    for name in native.__all__:
+        cls = getattr(native, name)
+        if not inspect.isclass(cls) or not hasattr(cls, "to_dict"):
+            continue
+        method = next(
+            node for node in classes[name].body
+            if isinstance(node, ast.FunctionDef) and node.name == "to_dict"
+        )
+        assert method.returns is not None
+        assert ast.unparse(method.returns) == "dict[str, Any]", name
+    # The sole native implementation converts every successful return to PyDict.
+    # This covers result types with no public constructor, not just request samples.
+    source = (root / "rust/ai-session-search-python/src/lib.rs").read_text()
+    assert source.count("fn to_dict") == 1
+    assert "fn to_dict<'py>($slf: &Bound<'py, Self>) -> PyResult<Bound<'py, PyDict>>" in source
+    assert "Ok(value?.cast_into::<PyDict>()?)" in source
+    assert not hasattr(native.AnalysisCursor, "to_dict")
 
 
 def test_results_are_inspectable_values(tmp_path: Path):

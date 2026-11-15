@@ -150,8 +150,11 @@ class SessionRecord:
 class AnalysisCursor:
     """Opaque keyset cursor for the next non-overlapping analysis document page."""
 
-    def to_dict(self) -> str:
-        """Return the serialized opaque cursor token."""
+    def to_token(self) -> str:
+        """Return the opaque continuation token as a string, not a dictionary.
+        Takes no arguments, has no defaults or bounds, and does not read the index.
+        Pass the cursor object, not this string, to analysis_documents(cursor=...).
+        """
     def __repr__(self) -> str: ...
     def __eq__(self, other: object, /) -> bool: ...
 
