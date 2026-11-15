@@ -64,6 +64,9 @@ NOTES_HEADINGS = (
 _FENCE = re.compile(r"^\s*(`{3,}|~{3,})")
 _BULLET = re.compile(r"^\s*[-*+] ")
 _LIST_ITEM = re.compile(r"^\s*(?:[-*+]|\d+[.)]) ")
+# A GitHub Release page resolves a relative link against /releases/tag/, not the repository root,
+# so a changelog link such as "docs/x.md#y" must become an absolute link to the tagged file.
+_RELATIVE_LINK = re.compile(r"\]\((?![a-zA-Z][a-zA-Z0-9+.-]*:|#)([^)\s#]+)(#[^)\s]*)?\)")
 
 
 class ReleaseMetadataError(ValueError):
@@ -204,6 +207,18 @@ def check_notes_shape(notes: str, version: str) -> None:
         )
 
 
+def absolute_links(notes: str, root: pathlib.Path, repository: str, version: str) -> str:
+    """Point each repository-relative link at the file in the tagged tree, rejecting missing files."""
+
+    def resolve(match: re.Match[str]) -> str:
+        path, anchor = match.group(1), match.group(2) or ""
+        if not (root / path).exists():
+            raise ReleaseMetadataError(f"{CHANGELOG} section '## [{version}]' links to missing {path!r}")
+        return f"]({repository}/blob/v{version}/{path}{anchor})"
+
+    return _RELATIVE_LINK.sub(resolve, notes)
+
+
 def release_body(root: pathlib.Path, version: str) -> str:
     """Return the GitHub Release body: the changelog section plus generated install guidance.
 
@@ -220,12 +235,25 @@ def release_body(root: pathlib.Path, version: str) -> str:
         if previous is not None
         else f"[v{version}]({repository}/tree/v{version})"
     )
+    notes = absolute_links(notes, root, repository, version)
+    if "-" in cargo_version:
+        # aise package update offers a stable install only stable releases (update.rs).
+        upgrade = (
+            "This is a release candidate. `aise package update` keeps a stable install on stable "
+            "releases, so install the candidate with a command below; from an earlier candidate of "
+            "this release, `aise package update` moves to it. For a native archive, rerun its "
+            "installer.\n\n"
+        )
+    else:
+        upgrade = (
+            "Upgrade with `aise package update`: it finds a uv, pip, pipx, Cargo, or Homebrew "
+            "install, runs that manager, and refreshes the installed skill. For a native archive, "
+            "rerun its installer.\n\n"
+        )
     return (
         f"{notes}\n"
         "---\n\n"
-        "Upgrade with `aise package update`: it finds a uv, pip, pipx, Cargo, or Homebrew install, "
-        "runs that manager, and refreshes the installed skill. For a native archive, rerun its "
-        "installer.\n\n"
+        f"{upgrade}"
         "Install:\n\n"
         "```bash\n"
         f"uv tool install ai-session-search=={version}\n"
