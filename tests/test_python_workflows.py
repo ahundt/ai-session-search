@@ -111,6 +111,14 @@ def test_message_dictionary_uses_cli_timestamp_name(corpus):
     assert corpus.search_messages("forgot").to_dict() == cli(corpus, "messages", "search", "forgot", "--format", "json")
 
 
+def test_session_dictionary_retains_present_raw_metadata(corpus):
+    with write_database(corpus.db_path) as db:
+        db.execute("UPDATE sessions SET raw_metadata_json = ?", ('{"synthetic": true}',))
+    row = corpus.list_sessions()[0]
+    assert row.to_dict()["raw_metadata_json"] == '{"synthetic": true}'
+    assert corpus.inspect_session(row.id).to_dict()["session"]["raw_metadata_json"] == '{"synthetic": true}'
+
+
 def test_service_errors_are_named_and_keep_runtime_handlers(corpus):
     from ai_session_search import native
 
