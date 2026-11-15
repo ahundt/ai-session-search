@@ -55,7 +55,8 @@ pub const DEFAULT_MCP_SEARCH_MESSAGES_LIMIT: usize = 15;
 ///   risk: its truncation behaviour is unverified.
 /// Measured over the serialized `CallToolResult`, not the JSON-RPC envelope around it: the
 /// dispatcher owns the former and not the latter, and they differ by 34 characters.
-pub const DEFAULT_MCP_MAX_TOOL_RESULT_CHARS: usize = 48_000;
+pub const DEFAULT_MCP_MAX_TOOL_RESULT_CHARS: usize =
+    crate::mcp_schema_budget::CODEX_TOOL_RESULT_CHARS;
 pub const DEFAULT_MCP_RUN_MESSAGE_CLASSIFICATION_LIMIT: usize = 20;
 /// Signed whole-transcript presentation window used by MCP `get_session` when omitted.
 pub const DEFAULT_MCP_GET_SESSION_TRANSCRIPT_LINE_WINDOW: i64 = -40;

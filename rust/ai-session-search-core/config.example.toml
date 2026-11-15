@@ -229,6 +229,16 @@ schema_summary_columns = 12
 # instead set its own in its `env` block:
 # AI_SESSION_SEARCH_CLIENT_LIMIT_CODEX_INPUT_SCHEMA_BYTES=6000
 #
+# Built-in client cap defaults (not overrides):
+# codex-input-schema-bytes = 5000
+# codex-input-schema-margin = 4750
+# claude-code-tool-description-chars = 2048
+# vscode-parameter-description-chars = 1024
+# anthropic-tool-name-charset = 64
+# codex-tool-result-chars = 48000
+# claude-code-tool-result-tokens = 25000
+# gemini-cli-tool-result-chars = 40000
+
 # [mcp.client_limits]
 # codex-input-schema-bytes = 6000
 

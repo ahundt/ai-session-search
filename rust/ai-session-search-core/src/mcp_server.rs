@@ -8104,17 +8104,7 @@ mod tests {
         )
         .into_iter()
         .filter(|finding| finding.status == Status::Fail)
-        .map(|finding| {
-            format!(
-                "{} [{}]: {} {} against {} ({})",
-                finding.limit.name,
-                finding.tool,
-                finding.measured,
-                finding.limit.unit,
-                finding.limit.budget,
-                finding.evidence
-            )
-        })
+        .map(|finding| finding.diagnostic())
         .collect();
         assert!(
             failures.is_empty(),
@@ -8133,17 +8123,28 @@ mod tests {
 
             let bytes = compact_len(&codex_measured_schema(&tool["inputSchema"]));
             assert!(
-                bytes <= byte_ceiling,
-                "{name} inputSchema grew to {bytes} B as Codex counts it after its sanitize \
-                 pass, above its recorded {byte_ceiling} B ceiling. Past 5,000 B Codex deletes \
-                 every parameter description with no marker to the model."
+                bytes == byte_ceiling,
+                "{}",
+                crate::mcp_schema_budget::describe_pin_change(
+                    name,
+                    "inputSchema",
+                    bytes,
+                    byte_ceiling,
+                    "bytes"
+                )
             );
 
             let depth = schema_depth(&tool["outputSchema"]);
             assert!(
-                depth <= depth_ceiling,
-                "{name} outputSchema nests {depth} deep, above its recorded {depth_ceiling} \
-                 ceiling; a conforming client may refuse it"
+                depth == depth_ceiling,
+                "{}",
+                crate::mcp_schema_budget::describe_pin_change(
+                    name,
+                    "outputSchema depth",
+                    depth,
+                    depth_ceiling,
+                    "levels"
+                )
             );
         }
     }
@@ -15965,6 +15966,13 @@ mod tests {
             serde_json::to_string(&delivered).unwrap(),
             serde_json::to_string(&full).unwrap(),
             "a result inside the ceiling must not be reshaped on the way out"
+        );
+
+        let exact = enforce_tool_result_ceiling(full.clone(), "search_messages", measured, paged)
+            .expect("equality with the serialized CallToolResult ceiling is inclusive");
+        assert_eq!(
+            serde_json::to_string(&exact).unwrap(),
+            serde_json::to_string(&full).unwrap()
         );
 
         // Over it, nothing is delivered at all.
