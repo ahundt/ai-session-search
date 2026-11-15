@@ -1672,6 +1672,13 @@ fn validate_tool_call(params: &Value, tools: &Value) -> Result<(), String> {
     } else {
         arguments
     };
+    if tool_name == "get_session" {
+        for name in ["since", "until", "when"] {
+            if let Some(given) = arguments.get(name) {
+                return Err(format!("unknown get_session parameter {name}={given}; accepted date filters belong to search_messages with session_id. Pass search_messages(session_id=..., {name}=...) without query for this session's messages in a date window, or omit {name} to read get_session without a date filter"));
+            }
+        }
+    }
     let schema = &tool["inputSchema"];
     validate_schema_value(arguments, schema, schema, tool_name, "arguments")
 }
@@ -4819,9 +4826,6 @@ fn handle_tools_list(id: Option<Value>, config: &Config) -> Value {
                             "limit": { "type": "integer", "minimum": 0, "description": "Range message count; omit for 0 (all)." },
                             "offset": { "type": "integer", "minimum": 0, "description": "Range messages to skip; omit for 0." },
                             "order": { "type": "string", "enum": ["oldest", "newest"], "description": "Range selection edge; omit for oldest. Newest selects last N; both return oldest-first." },
-                            "since": { "type": "string", "description": "Inclusive event start, RFC 3339 or period (7d, 2026-01); UTC unless offset/zone. Omit for unbounded." },
-                            "until": { "type": "string", "description": "Inclusive event end; same forms as since. Omit for unbounded." },
-                            "when": { "type": "string", "description": "Event period; conflicts with since/until. Omit for unbounded." },
                             "context_before": { "type": "integer", "minimum": 0, "description": "With seq: sequence-number radius before anchor, 0..9223372036854775807; all rows tied at each sequence included. Omit for context (default 0)." },
                             "context_after": { "type": "integer", "minimum": 0, "description": "With seq: sequence-number radius after anchor, 0..9223372036854775807; all rows tied at each sequence included. Omit for context (default 0)." },
                             "context": {
@@ -5205,11 +5209,9 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
     // numbers are session-local, which this per-session tool already scopes.
     let seq_from = args.get("seq_from").and_then(Value::as_i64);
     let seq_to = args.get("seq_to").and_then(Value::as_i64);
-    let has_range = [
-        "seq_from", "seq_to", "role", "limit", "offset", "order", "since", "until", "when",
-    ]
-    .iter()
-    .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
+    let has_range = ["seq_from", "seq_to", "role", "limit", "offset", "order"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
 
     if message_seq.is_none() {
         for name in ["context_before", "context_after"] {
@@ -5296,7 +5298,6 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             .resolve_session(session_id)
             .map_err(|e| format!("{e:#}"))?;
         let presentation = MessagePresentation::from_args(args, config)?;
-        let (since, until) = parse_date_bounds(args, chrono::Utc::now())?;
         let filters = MessageFilters {
             session_id: Some(session.id.clone()),
             seq_from,
@@ -5305,8 +5306,6 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
             role: parse_opt_enum::<Role>(args, "role")?,
             limit: mcp_nonnegative_usize_arg(args, "limit", 0)?,
             offset: mcp_nonnegative_usize_arg(args, "offset", 0)?,
-            since,
-            until,
             ..Default::default()
         };
         let order = match args
@@ -7218,7 +7217,7 @@ mod tests {
             (json!({"role":"user", "limit":1, "order":"newest"}), vec![2]),
             (json!({"role":"user", "offset":1}), vec![2]),
             (json!({"role":"assistant"}), vec![1]),
-            (json!({"since":"2030-01-01T00:00:00Z"}), vec![]),
+
         ] {
             let mut args = args;
             args["session_id"] = json!("claude:test1");
@@ -14853,7 +14852,7 @@ mod tests {
         assert!(get_session["inputSchema"]["properties"]["max_lines"].is_null());
         assert!(get_session["inputSchema"]["properties"]["view"].is_null());
         assert!(
-            get_session_prose("context").contains("(default 0)"),
+            get_session_prose("context").contains("Omit for 0 (anchor sequence only)"),
             "context defaults to 0 unless explicitly requested"
         );
         assert!(
