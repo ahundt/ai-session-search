@@ -545,11 +545,11 @@ client's source at a pinned version, recorded with their provenance in
 operator running a client that has since moved sets the new number here rather than waiting for
 a release built against it.
 
-Your settings change schema size because descriptions contain resolved values. With shipped
-defaults, `search_messages` measures 4,732 bytes after Codex normalization, leaving 268 bytes under
-its 5,000-byte limit. The server keeps `purpose` and `purpose_version` advertised when no bundles
-are configured, with guidance to omit them. Configured names add enum and description bytes; run
-`aise mcp schema-budget` after changing them. The server also checks its catalogue at startup and
+Your settings change schema size because descriptions contain resolved values. Run
+`aise mcp schema-budget` to measure the configured `search_messages` schema after Codex
+normalization and check its headroom under the 5,000-byte client limit. The server keeps `purpose`
+and `purpose_version` advertised when no bundles are configured, with guidance to omit them.
+Configured names add enum and description bytes; run `aise mcp schema-budget` after changing them. The server also checks its catalogue at startup and
 reports a breach on stderr. Over the Codex limit, the client removes every parameter description.
 
 ## Atomic configuration initialization
