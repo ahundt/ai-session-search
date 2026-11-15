@@ -375,7 +375,6 @@ fn service_file_dates_select_versions_after_causal_replay() {
     let (_dir, db) = indexed();
     let service = FileService::new(&db);
     let mut query = FileQuery::default();
-    query.session_id = Some("claude:sess-fr-1".into());
     query.since = Some("2026-06-02T10:01:00Z".parse().unwrap());
     query.until = Some("2026-06-02T10:02:00Z".parse().unwrap());
     let history = service.history("app.py", &query).unwrap();
@@ -460,8 +459,6 @@ fn cli_file_dates_replay_pre_interval_snapshot_and_preserve_versions() {
             .unwrap()
     };
     let common = [
-        "--session-id",
-        "claude:sess-fr-1",
         "--since",
         "2026-06-02T10:01:00Z",
         "--until",
@@ -550,6 +547,143 @@ fn cli_file_dates_replay_pre_interval_snapshot_and_preserve_versions() {
             );
         } else {
             assert!(!out.status.success());
+        }
+    }
+}
+
+#[test]
+fn dated_reconstruction_selects_only_sessions_with_eligible_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    let projects = dir.path().join("projects");
+    std::fs::create_dir_all(projects.join("fixture")).unwrap();
+    for (id, ts, content) in [
+        ("old", "2026-01-01T00:00:00Z", "old"),
+        ("new", "2026-11-14T10:00:00Z", "new"),
+    ] {
+        let record = serde_json::json!({
+            "type":"assistant", "sessionId":id, "timestamp":ts, "cwd":"/work",
+            "message":{"role":"assistant","content":[{
+                "type":"tool_use","id":"write","name":"Write",
+                "input":{"file_path":"/work/app.py","content":content}
+            }]}
+        });
+        let result = serde_json::json!({
+            "type":"user", "sessionId":id, "timestamp":ts,
+            "message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"write","content":"written","is_error":false}]}
+        });
+        std::fs::write(
+            projects.join("fixture").join(format!("{id}.jsonl")),
+            format!("{record}\n{result}\n"),
+        )
+        .unwrap();
+    }
+    let cfg = claude_only_config(dir.path(), &projects);
+    let db = Db::open(&cfg.db_path()).unwrap();
+    indexer::reindex(&cfg, &db, true, None).unwrap();
+    let service = FileService::new(&db);
+    let mut query = FileQuery::default();
+    query.since = Some("2026-11-14T00:00:00Z".parse().unwrap());
+    query.until = Some("2026-11-14T23:59:59Z".parse().unwrap());
+    let history = service.history("/work/app.py", &query).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].session_id, "claude:new");
+    let file = service.reconstruct("/work/app.py", &query, None).unwrap();
+    assert_eq!(
+        (
+            file.session_id.as_str(),
+            file.version,
+            file.content.as_str()
+        ),
+        ("claude:new", 1, "new")
+    );
+    let versions = service
+        .reconstruct_versions("/work/app.py", &query)
+        .unwrap()
+        .collect::<Vec<_>>();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].content, "new");
+
+    let run = |args: &[&str]| {
+        support::aise(dir.path())
+            .args(["--index-refresh", "existing-only"])
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    for bounds in [
+        vec!["--when", "2026-11-14"],
+        vec!["--since", "2026-11-14"],
+        vec!["--until", "2026-11-14", "--since", "2026-11-14"],
+    ] {
+        for mode in ["history", "single", "all"] {
+            let mut args = vec![
+                "files",
+                if mode == "history" {
+                    "history"
+                } else {
+                    "extract"
+                },
+                "/work/app.py",
+            ];
+            if mode == "history" {
+                args.extend(["--format", "json"]);
+            }
+            if mode == "all" {
+                args.extend(["--all", "--format", "jsonl"]);
+            }
+            args.extend(bounds.clone());
+            let out = run(&args);
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if mode == "single" {
+                assert_eq!(out.stdout, b"new\n");
+            } else {
+                let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                let row = if mode == "history" {
+                    assert_eq!(value.as_array().unwrap().len(), 1);
+                    &value[0]
+                } else {
+                    assert_eq!(value["content"], "new");
+                    &value
+                };
+                assert_eq!(row["session_id"], "claude:new");
+                assert_eq!(row["version"], 1);
+            }
+        }
+    }
+    for since in [None, Some("2026-01-01T00:00:00Z")] {
+        query.since = since.map(|ts| ts.parse().unwrap());
+        query.until = None;
+        let expected =
+            "file '/work/app.py' matched 2 sessions; set an exact session_id before reconstruction";
+        assert_eq!(
+            service
+                .reconstruct("/work/app.py", &query, None)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        assert_eq!(
+            service
+                .reconstruct_versions("/work/app.py", &query)
+                .unwrap_err()
+                .to_string(),
+            expected
+        );
+        for all in [false, true] {
+            let mut args = vec!["files", "extract", "/work/app.py"];
+            if all {
+                args.push("--all");
+            }
+            if since.is_some() {
+                args.extend(["--since", "2026-01-01"]);
+            }
+            let out = run(&args);
+            assert!(!out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr).contains(expected));
         }
     }
 }

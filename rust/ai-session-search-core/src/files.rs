@@ -554,7 +554,8 @@ fn reconstruct_query_with_count(
 ) -> Result<(ReconstructedFile, usize)> {
     anyhow::ensure!(query.limit == 0 && query.offset == 0,
         "single-version reconstruction does not accept paging (limit or offset); use reconstruct_versions");
-    let (session_id, provider, edits) = selected_edit_group(db, file, query)?;
+    let (session_id, provider, edits) = selected_edit_group(db, file, query)?
+        .ok_or_else(|| crate::ServiceError::file_not_found(file))?;
     let selected = match version {
         Some(version) => version,
         None => edits
@@ -592,10 +593,15 @@ fn selected_edit_group(
     db: &Db,
     file: &str,
     query: &FileQuery,
-) -> Result<(String, Provider, Vec<FileEdit>)> {
+) -> Result<Option<(String, Provider, Vec<FileEdit>)>> {
     let mut groups = group_by_session(db.file_edits_for_query(file, query)?);
     if groups.is_empty() {
         return Err(crate::ServiceError::file_not_found(file).into());
+    }
+    if query.since.is_some() || query.until.is_some() {
+        // Select sessions by eligible edits, but retain every predecessor for causal replay.
+        // This adds one O(E) pass and no retained rows beyond the existing edit groups.
+        groups.retain(|(_, _, edits)| edits.iter().any(|edit| edit_in_date_scope(edit, query)));
     }
     if groups.len() > 1 {
         bail!(
@@ -603,9 +609,7 @@ fn selected_edit_group(
             groups.len()
         );
     }
-    groups
-        .pop()
-        .ok_or_else(|| anyhow!("reconstruction selection unexpectedly became empty"))
+    Ok(groups.pop())
 }
 
 /// A lazy, causal reconstruction of every version with a complete replay path.
@@ -616,8 +620,7 @@ fn selected_edit_group(
 /// edit sequence and live content memory is proportional to one recovered version.
 #[derive(Debug)]
 pub struct ReconstructedFileVersions {
-    session_id: String,
-    provider: Provider,
+    session: Option<(String, Provider)>,
     edits: std::vec::IntoIter<FileEdit>,
     content: Option<String>,
     version: usize,
@@ -632,6 +635,7 @@ impl Iterator for ReconstructedFileVersions {
         if self.query.limit != 0 && self.yielded >= self.query.limit {
             return None;
         }
+        let (session_id, provider) = self.session.as_ref()?;
         for edit in self.edits.by_ref() {
             self.version += 1;
             advance_reconstruction(&mut self.content, &edit);
@@ -645,8 +649,8 @@ impl Iterator for ReconstructedFileVersions {
                 }
                 self.yielded += 1;
                 return Some(ReconstructedFile {
-                    session_id: self.session_id.clone(),
-                    provider: self.provider,
+                    session_id: session_id.clone(),
+                    provider: *provider,
                     version: self.version,
                     file_path: edit.file_path,
                     content: content.clone(),
@@ -669,15 +673,18 @@ pub fn reconstruct_versions_query(
     file: &str,
     query: &FileQuery,
 ) -> Result<ReconstructedFileVersions> {
-    let (session_id, provider, edits) = selected_edit_group(db, file, query)?;
-    if !edits.iter().any(|edit| edit.new_content.is_some()) {
+    let selected = selected_edit_group(db, file, query)?;
+    let (session, edits) = match selected {
+        Some((session_id, provider, edits)) => (Some((session_id, provider)), edits),
+        None => (None, Vec::new()),
+    };
+    if session.is_some() && !edits.iter().any(|edit| edit.new_content.is_some()) {
         bail!(
             "cannot reconstruct any version of '{file}': no full-content base exists in the selected edit history"
         );
     }
     Ok(ReconstructedFileVersions {
-        session_id,
-        provider,
+        session,
         edits: edits.into_iter(),
         content: None,
         version: 0,
@@ -1618,8 +1625,7 @@ mod tests {
             write(3, "reset"),
         ];
         let versions = ReconstructedFileVersions {
-            session_id: "claude:a".into(),
-            provider: Provider::Claude,
+            session: Some(("claude:a".into(), Provider::Claude)),
             edits: edits.into_iter(),
             content: None,
             version: 0,
@@ -1651,8 +1657,7 @@ mod tests {
         assert_eq!(reconstruct(&edits, 4).as_deref(), Some("reset"));
         assert_eq!(version_line_counts(&edits), [1, 0, 0, 1]);
         let versions = ReconstructedFileVersions {
-            session_id: "codex:a".into(),
-            provider: Provider::Codex,
+            session: Some(("codex:a".into(), Provider::Codex)),
             edits: edits.into_iter(),
             content: None,
             version: 0,
