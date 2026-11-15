@@ -1992,6 +1992,40 @@ mod tests {
     }
 
     #[test]
+    fn sql_cell_presentation_boundaries_count_unicode_scalars_and_mark_only_overflow() {
+        let (_dir, path) = fixture();
+        let cap = DEFAULT_MCP_MAX_CELL_CHARS;
+        for length in [cap - 1, cap, cap + 1] {
+            let text = "α".repeat(length);
+            let result =
+                query_path(&path, 100, &args(&format!("select '{text}' as value"))).unwrap();
+            let payload = query_result_payload(&result, 0, cap);
+            let actual = payload.value["rows"][0]["value"].as_str().unwrap();
+            let expected = if length > cap {
+                format!("{}... [truncated]", "α".repeat(cap))
+            } else {
+                text
+            };
+            assert_eq!(actual, expected,
+                "SQL MCP cell presentation: source {length} Unicode scalar characters, cap {cap}, excess {} characters. Internal presentation policy, not SQLite storage size. Reproduce: cargo test -p ai-session-search --lib sql_cell_presentation_boundaries --locked. Fix scalar counting/overflow marking in query_result_payload; set max_cell_chars=0 only for intentional complete cells.",
+                length.saturating_sub(cap));
+            assert_eq!(
+                payload.value["truncated_cell_char_limit"].is_number(),
+                length > cap
+            );
+            let unbounded = query_result_payload(&result, 0, 0);
+            assert_eq!(
+                unbounded.value["rows"][0]["value"]
+                    .as_str()
+                    .unwrap()
+                    .chars()
+                    .count(),
+                length
+            );
+        }
+    }
+
+    #[test]
     fn mcp_payload_shape_includes_columns_and_cell_truncation() {
         let (_dir, path) = fixture();
         let result = query_path(
