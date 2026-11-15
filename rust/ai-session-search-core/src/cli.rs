@@ -54,7 +54,7 @@ const GLOBAL_OPTIONS_HEADING: &str =
 const ROOT_COMMAND_GROUPS: &str = "\
 Start here (everyday):   search, messages, show, list, resume, files
 Export and maintenance:  export, reindex, doctor, integrations, package, config, dates
-Analytics:               stats, repeats, slash-commands, analyze, skills
+Analytics:               stats, repeats, vocab, slash-commands, analyze, skills
 Expert:                  db, migrate, compact, mcp, tui
 
 Typical path: `aise search \"<topic>\" --when 30d` or `aise list --path <dir> --when 7d` to find a
@@ -187,7 +187,7 @@ enum Commands {
     /// This counts the index itself, so unlike `aise stats` it counts every indexed message,
     /// harness notices included: hook and tool wording ranks here beside what people and models
     /// wrote. It reports how often, never which messages — `aise messages search` returns those.
-    #[command(display_order = 32, hide = true)]
+    #[command(display_order = 32)]
     Vocab(crate::analytics::VocabArgs),
     /// Find recurring phrases in what people wrote.
     ///
@@ -3225,13 +3225,12 @@ mod tests {
         );
     }
 
-    /// `aise vocab` is kept, with its own help and behavior, but left out of the root command list
-    /// and its group legend.
+    /// `aise vocab` keeps its released root-help entry and its own help and behavior.
     #[test]
-    fn vocab_is_hidden_from_the_root_help_and_keeps_its_own_help() {
+    fn vocab_is_visible_in_root_help_and_keeps_its_own_help() {
         let root_help = parse_cli_from(["aise", "--help"]).unwrap_err().to_string();
         assert!(
-            !root_help
+            root_help
                 .split_whitespace()
                 .any(|word| word.trim_end_matches(',') == "vocab"),
             "{root_help}"
