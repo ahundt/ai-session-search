@@ -223,7 +223,7 @@ aise resume SESSION_ID
 prints it in a terminal.
 
 Range reads omit harness notices by default; an explicit `--kinds` list can include them.
-For one session in a date window, call `search_messages(session_id="ID", when="2026-01")` without a query; `since`/`until` select inclusive event bounds instead of a period. Omit dates for every timestamp. These date filters belong to `search_messages`, not `get_session`.
+For a complete session date window, call `get_session(session_id="ID", when="2026-01")`; `since`/`until` select inclusive event timestamp bounds instead of a period. Omit dates for no bound. Dates compose with range filters and paging, not focused `seq`, summary, or transcript modes; `when` conflicts with `since`/`until`. Queryless `search_messages` is an alternative with search-hit output and a bounded default page.
 MCP `get_session` ranges accept `kinds=["conversation", "harness_notice"]`. Focused context
 already includes every class. Use MCP `seq` for a focused read. MCP focused/range reads use `detail="compact"|"full"`, like
 message search; `response_format="concise"|"detailed"` remains a deprecated alias.
