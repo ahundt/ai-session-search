@@ -2091,7 +2091,7 @@ fn parser_versions_pin_record_and_health_reconciliation() {
         (Provider::Claude, "claude-v20"),
         (Provider::ClaudeDesktop, "claude-desktop-local-agent-v20"),
         (Provider::Codex, "codex-v14"),
-        (Provider::Cursor, "cursor-v6"),
+        (Provider::Cursor, "cursor-v7"),
         (Provider::Antigravity, "antigravity-v8"),
         (Provider::Pi, "pi-v7"),
         (Provider::PrimeAgent, "prime-agent-v5"),
@@ -2107,7 +2107,7 @@ pub fn provider_parse_version(provider: Provider) -> &'static str {
         Provider::Claude => "claude-v20",
         Provider::ClaudeDesktop => "claude-desktop-local-agent-v20",
         Provider::Codex => "codex-v14",
-        Provider::Cursor => "cursor-v6",
+        Provider::Cursor => "cursor-v7",
         Provider::Antigravity => "antigravity-v8",
         Provider::Pi => "pi-v7",
         Provider::PrimeAgent => "prime-agent-v5",
@@ -2227,8 +2227,9 @@ fn fallback_event_time(session: &SessionRecord, mtime_ns: i64) -> Option<DateTim
         .or_else(|| datetime_from_mtime_ns(mtime_ns))
 }
 
-/// Guarantee date-filterable per-message / file-edit rows when a provider lacks
-/// per-event timestamps. Parser-provided event timestamps win; only missing values
+/// Backfill per-message / file-edit dates when a provider lacks
+/// per-event timestamps. Cursor leaves unknown event dates unset so appends cannot
+/// change them. For other providers, parser-provided timestamps win and missing values
 /// fall back to the session/file timestamp. This is O(messages + file_edits), in
 /// place, and runs once per parsed session or appended tail.
 pub fn backfill_event_dates(

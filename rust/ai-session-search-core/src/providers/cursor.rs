@@ -129,6 +129,9 @@ impl CursorAdapter {
         let mut messages = Vec::new();
         let mut transcript_lines = Vec::new();
         let mut file_edits: Vec<FileEdit> = Vec::new();
+        let mut retracted = crate::models::RetractedRows::default();
+        let mut legacy_messages = Vec::new();
+        let mut legacy_edit_seq = 0;
         let mut pending_file_mutations = crate::files::PendingFileMutations::default();
         let mut requires_full_parse_for_tail = false;
         // tool_use_id -> tool name. Cursor transcripts use the Anthropic content-block shape
@@ -170,6 +173,14 @@ impl CursorAdapter {
             // tag tool output. (Tool outputs are frequently absent from cursor transcripts on
             // disk; when present they are indexed as Role::Tool.)
             if let Some(message) = value.get("message") {
+                // Match only legacy versions derived from calls still present in this source.
+                // The archive keeps versions whose source records are no longer available.
+                super::claude::collect_file_edits(
+                    message,
+                    None,
+                    &mut legacy_edit_seq,
+                    &mut retracted.file_edits,
+                );
                 super::claude::stage_file_edits(message, timestamp, &mut pending_file_mutations);
                 super::claude::collect_file_edit_results(
                     message,
@@ -224,6 +235,19 @@ impl CursorAdapter {
             }
             if !substantive_text(&text) {
                 continue;
+            }
+            if let Some((_, remainder)) = text.split_once("<user_query>") {
+                if let Some((body, _)) = remainder.split_once("</user_query>") {
+                    let body = body.trim();
+                    if body != text && substantive_text(body) {
+                        legacy_messages.push(RawMessage::message(
+                            role,
+                            body.to_string(),
+                            None,
+                            None,
+                        ));
+                    }
+                }
             }
             // Unknown clocks remain None, including after the shared indexing fallback.
             messages.push(RawMessage::message(role, text.clone(), timestamp, None));
@@ -301,12 +325,21 @@ impl CursorAdapter {
         for message in &mut messages {
             cursor_input_provenance(message);
         }
+        retracted.messages = crate::util::normalize_raw_messages_with_evidence(
+            legacy_messages,
+            None,
+            if spawned.is_some() {
+                UserRoleEvidence::AgentDelegationEvent
+            } else {
+                UserRoleEvidence::HumanInputEvent
+            },
+        );
         Ok(ParsedSession {
             session,
             transcript_text: transcript_lines.join("\n\n"),
             messages,
             file_edits,
-            retracted: Default::default(),
+            retracted,
         })
     }
 }
@@ -415,7 +448,9 @@ fn cursor_input_provenance(message: &mut crate::models::Message) {
                 ));
             }
         };
-        if part.origin != O::DirectInput || !text.contains("user_query") {
+        if part.origin != O::DirectInput
+            || !text.contains("<user_query") && !text.contains("</user_query")
+        {
             add(part.start_char, part.end_char, part.authorship, part.origin);
         } else if let Some((start, end)) = cursor_query_region(text) {
             let end = part.start_char + text[..end].chars().count();
@@ -427,12 +462,19 @@ fn cursor_input_provenance(message: &mut crate::models::Message) {
             add(part.start_char, part.end_char, A::Unknown, O::Unknown);
         }
     }
-    message.provenance.authorship = if parts.len() == 1 {
+    if !parts.iter().any(|part| part.is_user_input()) {
+        message.provenance.input_origin = None;
+        message.provenance.legacy_input_origin = false;
+    }
+    let homogeneous = parts
+        .first()
+        .is_some_and(|first| parts.iter().all(|part| part.authorship == first.authorship));
+    message.provenance.authorship = if homogeneous {
         parts[0].authorship.into()
     } else {
         MessageAuthorship::Mixed
     };
-    message.provenance.content_parts = parts;
+    message.provenance.content_parts = if homogeneous { Vec::new() } else { parts };
 }
 
 // Native Cursor framing observed in public JSONL examples. O(text bytes), no I/O.
@@ -443,6 +485,8 @@ fn cursor_native_timestamp(text: &str) -> Option<(DateTime<Utc>, usize)> {
     Some(timestamp)
 }
 
+// Cursor stores an English weekday/date and a numeric UTC offset, not a local timezone.
+#[allow(clippy::disallowed_methods)]
 fn cursor_timestamp_prefix(text: &str) -> Option<(DateTime<Utc>, usize)> {
     let rest = text.strip_prefix("<timestamp>")?;
     let (date, _) = rest.split_once("</timestamp>")?;
@@ -724,6 +768,24 @@ mod tests {
                     parsed.messages[0].provenance.authorship,
                     crate::models::MessageAuthorship::Human
                 );
+                let temp = tempdir().unwrap();
+                let db = crate::db::Db::open(&temp.path().join("index.db")).unwrap();
+                db.mark_schema_current().unwrap();
+                db.upsert_session(&parsed, 0, 0).unwrap();
+                let config = crate::config::Config::default();
+                let service = crate::service::MessageService::new(
+                    &config,
+                    &db,
+                    crate::message_search::SearchSurface::Rust,
+                );
+                let request = crate::message_search::MessageSearchRequest::builder(
+                    crate::message_search::MessageQuery::literal("x").unwrap(),
+                    crate::message_search::MessageTarget::content(),
+                )
+                .role(crate::models::Role::User)
+                .build()
+                .unwrap();
+                assert_eq!(service.search(request).unwrap().hits().len(), 0);
             }
         }
     }
@@ -786,6 +848,154 @@ mod tests {
             }
         });
         assert_eq!(cursor_message_text(&value), "I found it.");
+    }
+
+    #[test]
+    fn indexed_tail_and_full_parse_agree_for_distant_mutation_results() {
+        use std::io::Write;
+        for distant in [false, true] {
+            let temp = tempdir().unwrap();
+            let root = temp.path().join("projects");
+            let dir = root.join("empty-window").join("agent-transcripts");
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("synthetic.jsonl");
+            let call = json!({"role":"assistant","message":{"content":[
+                {"type":"tool_use","id":"write","name":"Write","input":{"file_path":"ok.txt","content":"exact bytes"}}
+            ]}});
+            let mut initial = format!(
+                "{}\n{call}\n",
+                json!({"role":"user","message":{"content":"<timestamp>Monday, Nov 2, 2026, 3:04 PM (UTC+5:30)</timestamp>\n<user_query>request 🦀</user_query>"}})
+            );
+            let padding = format!(
+                "{}\n",
+                json!({"role":"assistant","message":{"content":"x".repeat(1024)}})
+            );
+            let minimum = if distant {
+                crate::tail::OVERLAP_BYTES as usize + 8192
+            } else {
+                8192
+            };
+            while initial.len() < minimum {
+                initial.push_str(&padding);
+            }
+            fs::write(&path, initial).unwrap();
+            let mut config = crate::config::Config::default();
+            config.providers.claude.enabled = false;
+            config.providers.claude_desktop.enabled = false;
+            config.providers.codex.enabled = false;
+            config.providers.antigravity.enabled = false;
+            config.providers.pi.enabled = false;
+            config.providers.prime_agent.enabled = false;
+            config.providers.aistudio.enabled = false;
+            config.providers.gemini_cli.enabled = false;
+            config.providers.cursor.paths = vec![crate::util::normalize_path(&root)];
+            let tail_path = temp.path().join("tail.db");
+            let tail_db = crate::db::Db::open(&tail_path).unwrap();
+            config.index.db_path = Some(crate::util::normalize_path(&tail_path));
+            crate::indexer::reindex(&config, &tail_db, false, None).unwrap();
+            assert_eq!(tail_db.file_edit_count().unwrap(), 0);
+            writeln!(fs::OpenOptions::new().append(true).open(&path).unwrap(), "{}", json!({
+                "role":"user","message":{"content":[{"type":"tool_result","tool_use_id":"write","content":"done"}]}
+            })).unwrap();
+            crate::indexer::reindex(&config, &tail_db, false, None).unwrap();
+            assert_eq!(tail_db.file_edit_count().unwrap(), 1);
+            let full_path = temp.path().join("full.db");
+            let full_db = crate::db::Db::open(&full_path).unwrap();
+            config.index.db_path = Some(crate::util::normalize_path(&full_path));
+            crate::indexer::reindex(&config, &full_db, false, None).unwrap();
+            let snapshot = |path: &std::path::Path, query: &str| {
+                let conn = rusqlite::Connection::open(path).unwrap();
+                let mut statement = conn.prepare(query).unwrap();
+                let rows = statement
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                rows
+            };
+            for query in [
+                "select json_array(seq,role,kind,content,ts,tool_name,tool_call_id,authorship,input_origin) from messages order by seq,id",
+                "select json_array(seq,ts,tool,file_path,new_content,edits_json) from file_edits order by seq,id",
+            ] {
+                assert_eq!(snapshot(&tail_path, query), snapshot(&full_path, query));
+            }
+        }
+    }
+
+    #[test]
+    fn parser_upgrade_replaces_derived_rows_but_keeps_archive_only_history() {
+        use crate::models::{MessageAuthorship, Role};
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("synthetic.jsonl");
+        let records = [
+            json!({"role":"user","message":{"content":"Explain <user_query>x</user_query> syntax"}}),
+            json!({"role":"assistant","message":{"content":[
+                {"type":"tool_use","id":"bad","name":"Write","input":{"file_path":"failed.txt","content":"failed bytes"}}
+            ]}}),
+            json!({"role":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"bad","is_error":true,"content":"denied"}
+            ]}}),
+        ];
+        let text = records
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let current = CursorAdapter::new(vec![])
+            .parse_reader(std::io::Cursor::new(text), &path)
+            .unwrap();
+        let mut old = current.clone();
+        old.session.parse_version = "cursor-v4".into();
+        old.retracted = Default::default();
+        old.messages[0].content = "x".into();
+        old.messages[0].provenance.content_parts.clear();
+        old.messages[0].provenance.authorship = MessageAuthorship::Human;
+        super::super::claude::collect_file_edits(
+            &records[1]["message"],
+            None,
+            &mut 0,
+            &mut old.file_edits,
+        );
+        let mut archived = old.messages[0].clone();
+        archived.seq = old.messages.len() as i64;
+        archived.content = "archive-only prompt".into();
+        old.messages.push(archived);
+        let mut archived_edit = old.file_edits[0].clone();
+        archived_edit.seq = 1;
+        archived_edit.file_path = "archived.txt".into();
+        archived_edit.file_name = "archived.txt".into();
+        old.file_edits.push(archived_edit);
+        let db_path = temp.path().join("index.db");
+        let db = crate::db::Db::open(&db_path).unwrap();
+        db.upsert_session(&old, 1, 1).unwrap();
+        db.upsert_session(&current, 2, 2).unwrap();
+        db.upsert_session(&current, 3, 3).unwrap();
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        let user_contents: Vec<String> = conn
+            .prepare("select content from messages where role='user' order by seq,id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(user_contents.len(), 2);
+        assert!(user_contents.contains(&"archive-only prompt".to_string()));
+        assert!(user_contents.contains(
+            &current
+                .messages
+                .iter()
+                .find(|m| m.role == Role::User)
+                .unwrap()
+                .content
+        ));
+        let paths: Vec<String> = conn
+            .prepare("select file_path from file_edits order by seq,id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(paths, ["archived.txt"]);
     }
 
     #[test]
@@ -1201,11 +1411,12 @@ mod tests {
 
     #[test]
     fn workspace_candidates_have_a_fixed_bound() {
-        for length in [4, 8, 12, 25, 50] {
+        for (length, expected) in [(4, 8), (8, 128), (9, 256), (12, 0), (25, 0), (50, 0)] {
             super::WORKSPACE_CANDIDATES.with(|count| count.set(0));
             let slug = format!("Users-{}", vec!["aisemissing"; length].join("-"));
-            assert!(decode_cursor_project_dir(&slug).is_none());
+            assert!(super::decode_cursor_project_dir_with(&slug, |_| false).is_none());
             let count = super::WORKSPACE_CANDIDATES.with(|count| count.get());
+            assert_eq!(count, expected);
             assert!(
                 count <= 256,
                 "{length} components examined {count} candidates, maximum 256"

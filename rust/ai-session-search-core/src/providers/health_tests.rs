@@ -273,8 +273,8 @@ fn codex_v14_upgrade_retains_history() {
     upgrade_retains_history(Provider::Codex, "codex-v13", "codex-v14");
 }
 #[test]
-fn cursor_v6_upgrade_retains_history() {
-    upgrade_retains_history(Provider::Cursor, "cursor-v5", "cursor-v6");
+fn cursor_v7_upgrade_retains_history() {
+    upgrade_retains_history(Provider::Cursor, "cursor-v6", "cursor-v7");
 }
 #[test]
 fn antigravity_v8_upgrade_retains_history() {
