@@ -251,12 +251,24 @@ def test_sql_cell_truncation_retains_receipt(corpus):
 
 
 @pytest.mark.integration
-def test_direct_classification_returns_cli_rows(corpus):
-    matches = corpus.classify_messages(skill="corrections", include_unattributed_input=True)
+def test_skill_classification_returns_cli_rows_and_typed_definition(corpus):
+    definition = aise.MessageClassificationDefinition(
+        categories=[{"name": "direct-rule", "patterns": ["forgot"]}],
+    )
+    run = corpus.run_skill(aise.SkillRunQuery(
+        skill=aise.SkillSelector(name="corrections"),
+        input=aise.MessageClassificationQuery(),
+        definition=definition,
+    ))
+    assert len(run.output.report.matches) == 9
+    assert {row.category for row in run.output.report.matches} == {"direct-rule"}
+    assert run.output.report.policies
+    assert not hasattr(aise.SessionSearch, "classify_messages")
+    matches = corpus.run_skill(aise.SkillRunQuery(skill=aise.SkillSelector(name="corrections"), input=aise.MessageClassificationQuery(include_unattributed_input=True))).output.report.matches
     expected = cli(corpus, "skills", "corrections", "--include-unattributed-input", "--format", "json")
     assert matches
     assert [row.to_dict() for row in matches] == expected["output"]["result"]["report"]["matches"]
-    scoped = corpus.classify_messages(request=aise.MessageClassificationQuery(scope=aise.QueryScope(session_id="synthetic-0")))
+    scoped = corpus.run_skill(aise.SkillRunQuery(skill=aise.SkillSelector(name="corrections"), input=aise.MessageClassificationQuery(scope=aise.QueryScope(session_id="synthetic-0")))).output.report.matches
     assert {row.session_id for row in scoped} == {"claude:synthetic-0"}
 
 
@@ -271,6 +283,20 @@ def test_session_limits_follow_configuration(corpus, tmp_path: Path):
     assert [row.to_dict() for row in search.list_sessions()] == cli(search, "list", "--config", str(config), "--format", "json")
     assert len(search.list_sessions(aise.SessionQuery(limit=0))) == 3
     assert len(search.search_sessions("retry", aise.SessionQuery(limit=1))) == 1
+
+
+def test_skill_classification_retains_counts_when_no_attributed_matches(corpus):
+    with write_database(corpus.db_path) as db:
+        db.execute("UPDATE messages SET authorship = 'unknown', input_origin = 'queued'")
+    run = corpus.run_skill(aise.SkillRunQuery(
+        skill=aise.SkillSelector(name="corrections"),
+        input=aise.MessageClassificationQuery(),
+    ))
+    report = run.output.report
+    assert report.matches == []
+    assert report.unattributed_input_count == 9
+    assert report.unattributed_input_included is False
+    assert report.policies == [run.output.receipt]
 
 
 def test_existing_index_mode_never_creates_missing_database(tmp_path: Path):

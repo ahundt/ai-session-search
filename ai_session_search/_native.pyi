@@ -1832,8 +1832,6 @@ class SessionSearch:
     def __exit__(self, exception_type: object, exception: object, traceback: object) -> bool: ...
     def prepare_for_read(self) -> RefreshOutcome | None:
         """Apply the configured refresh policy before reading; existing-only never refreshes."""
-    def classify_messages(self, *, skill: str = "corrections", request: MessageClassificationQuery | None = None, include_unattributed_input: bool | None = None, definition: MessageClassificationDefinition | None = None) -> list[MessageClassificationMatch]:
-        """Return classification match rows directly; run_skill also returns policy receipts."""
     def vocabulary(self, *, prefix: str | None = None, trigram: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
         """Report index-wide terms and counts; refused under allowed-roots."""
     def repeats(self, query: str | None = None, *, scope: QueryScope | None = None, role: str | None = None, query_mode: str = "literal", max_candidates: int = 0, include_unattributed_input: bool = False, max_groups: int | None = None, max_examples_per_group: int | None = None, min_matches: int | None = None, phrase_min_words: int | None = None, phrase_max_words: int | None = None, context: int = 0) -> dict[str, Any]:
