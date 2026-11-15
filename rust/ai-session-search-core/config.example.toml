@@ -428,6 +428,7 @@ color = "auto"
 # paths = [
 #   "~/.gemini/antigravity-cli/brain",
 #   "~/.gemini/antigravity/brain",
+#   "~/.gemini/antigravity-ide/brain",
 # ]
 #
 # [providers.pi]

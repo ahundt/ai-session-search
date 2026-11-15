@@ -40,6 +40,12 @@ named it: discovery falls back to defaults, while `--config` or `AI_SESSION_SEAR
 pointing at a path that does not exist fails with `explicit config file does not exist: PATH`, so
 a typo in that path cannot silently run on defaults.
 
+Antigravity default transcript roots are `~/.gemini/antigravity/brain`,
+`~/.gemini/antigravity-cli/brain`, and `~/.gemini/antigravity-ide/brain` for the App, CLI,
+and IDE respectively, as listed in the vendor's [hooks `transcriptPath` table](https://antigravity.google/docs/hooks?tab=ide).
+Explicit `[providers.antigravity].paths` replaces these defaults. With default paths, an upgrade
+indexes newly discovered IDE sessions on the next refresh.
+
 ## Precedence
 
 From highest to lowest precedence:
