@@ -71,7 +71,7 @@ overflow has different recovery behavior from one that drops content without a m
 ## Offline evidence and review
 
 `HarnessLimit.evidence` is the structured provenance used by the checker and its tests.
-The table below is checked byte-for-byte by
+The table below is checked byte-for-byte, after LF/CRLF normalization, by
 `evidence_document_and_config_defaults_match_the_owning_rows`. Its failure prints the replacement
 table and the matching config-example comments. Caps remain inclusive. `--ledger` includes the
 same records as `limit_evidence`, per-field normalized value byte costs, and pin-change reports.
@@ -79,9 +79,11 @@ A field cost excludes its property name, colon and map separators.
 
 The `checked` date records the last source check, not a claim about the client currently connected.
 Historical binary inspections retain their original dates; only the pinned Codex schema and Gemini
-constant were rechecked on 2026-11-14. The VS Code snapshot lacks an immutable commit: capture one on
-the next review. Closed-client package URLs identify the inspected release; the package page does
-not establish a constant without inspecting that release's binary.
+constant were rechecked on 2026-11-14. The VS Code normalizer was pinned and rechecked on
+2026-11-15; it deletes unsupported root keywords and calls its diagnostic callback, without
+dropping the tool. The zero-keyword guard protects the original schema semantics. Closed-client
+package URLs identify the inspected release; the package page does not establish a constant without
+inspecting that release's binary.
 
 After 30 days, `aise mcp schema-budget` prints a non-failing evidence notice;
 `--ledger` exposes these as `evidence_notices`. Tests inject the clock and never fetch sources.
@@ -95,8 +97,8 @@ cadence for other clients. Old evidence remains usable and visible; it does not 
 | `codex-input-schema-bytes` | 5000 bytes | Codex | rust-v0.146.0; blob 7c9edd08e167626cc524962884baa3ad626247a0 | 2026-08-04 | 2026-11-14 | https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/tools/src/json_schema.rs | MAX_COMPACT_TOOL_SCHEMA_BYTES; compact UTF-8 JSON after sanitize, inferred types and JsonSchema projection; first compaction pass strips all descriptions |
 | `codex-input-schema-margin` | 4750 bytes | Codex | rust-v0.146.0; blob 7c9edd08e167626cc524962884baa3ad626247a0 | 2026-08-04 | 2026-11-14 | https://github.com/openai/codex/blob/rust-v0.146.0/codex-rs/tools/src/json_schema.rs | MAX_COMPACT_TOOL_SCHEMA_BYTES; compact UTF-8 JSON after sanitize, inferred types and JsonSchema projection; first compaction pass strips all descriptions |
 | `claude-code-tool-description-chars` | 2048 UTF-16 units | Claude Code | 2.1.220 (corroborated by 2.1.88 source) | 2026-08-03 | 2026-08-03 | https://www.npmjs.com/package/@anthropic-ai/claude-code/v/2.1.220 | Recorded binary/source inspection: services/mcp/client.ts MAX_MCP_DESCRIPTION_LENGTH uses JS UTF-16 length; utils/mcpValidation.ts MAX_MCP_OUTPUT_TOKENS persists overflow. Reinspect that installed version; package page alone does not prove the constants. |
-| `vscode-parameter-description-chars` | 1024 UTF-16 units | VS Code / Copilot | 2026-08-02 source snapshot; immutable commit not recorded | 2026-08-02 | 2026-08-02 | https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/tools/common/toolSchemaNormalizer.ts | gpt4oMaxStringLength uses JS UTF-16 length for schema-internal descriptions on GPT-4 families; root combinators rejected for all families. Capture an immutable commit when rechecking. |
-| `vscode-no-root-combinator` | 0 root combinators | VS Code / Copilot | 2026-08-02 source snapshot; immutable commit not recorded | 2026-08-02 | 2026-08-02 | https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/tools/common/toolSchemaNormalizer.ts | gpt4oMaxStringLength uses JS UTF-16 length for schema-internal descriptions on GPT-4 families; root combinators rejected for all families. Capture an immutable commit when rechecking. |
+| `vscode-parameter-description-chars` | 1024 UTF-16 units | VS Code / Copilot | 2aad04ceb3bd240d6a022680b16d6119208e23d0 | 2026-08-02 | 2026-11-15 | https://github.com/microsoft/vscode-copilot-chat/blob/2aad04ceb3bd240d6a022680b16d6119208e23d0/src/extension/tools/common/toolSchemaNormalizer.ts | gpt4oMaxStringLength uses JS UTF-16 length for schema-internal descriptions on GPT-4 families; the normalizer deletes root combinators for all families and calls onFix, rather than dropping the tool. |
+| `vscode-no-root-combinator` | 0 root combinators | VS Code / Copilot | 2aad04ceb3bd240d6a022680b16d6119208e23d0 | 2026-08-02 | 2026-11-15 | https://github.com/microsoft/vscode-copilot-chat/blob/2aad04ceb3bd240d6a022680b16d6119208e23d0/src/extension/tools/common/toolSchemaNormalizer.ts | gpt4oMaxStringLength uses JS UTF-16 length for schema-internal descriptions on GPT-4 families; the normalizer deletes root combinators for all families and calls onFix, rather than dropping the tool. |
 | `mcp-output-schema-depth` | 10 levels | MCP specification / repository policy | MCP 2026-07-28; repository policy 1.1.0 | 2026-08-03 | 2026-08-03 | https://modelcontextprotocol.io/specification/2026-07-28/server/tools | Schema depth and subschema count are repository choices, NOT numeric MCP requirements; count actual JSON containers/schema positions. Local refs and described reachable definitions are repository guards. |
 | `mcp-output-schema-point-of-use-depth` | 6 levels | MCP specification / repository policy | MCP 2026-07-28; repository policy 1.1.0 | 2026-08-03 | 2026-08-03 | https://modelcontextprotocol.io/specification/2026-07-28/server/tools | Schema depth and subschema count are repository choices, NOT numeric MCP requirements; count actual JSON containers/schema positions. Local refs and described reachable definitions are repository guards. |
 | `style-named-definitions-are-described` | 0 undescribed definitions | MCP specification / repository policy | MCP 2026-07-28; repository policy 1.1.0 | 2026-08-03 | 2026-08-03 | https://modelcontextprotocol.io/specification/2026-07-28/server/tools | Schema depth and subschema count are repository choices, NOT numeric MCP requirements; count actual JSON containers/schema positions. Local refs and described reachable definitions are repository guards. |

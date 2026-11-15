@@ -47,7 +47,8 @@ const CODEX_SCALAR_KEYS: [&str; 6] = [
 const CODEX_MAP_KEYS: [&str; 3] = ["properties", "$defs", "definitions"];
 const CODEX_LIST_KEYS: [&str; 3] = ["anyOf", "oneOf", "allOf"];
 
-/// Root keywords VS Code rejects in an `inputSchema`, dropping the tool rather than degrading it.
+/// Root keywords the pinned VS Code normalizer removes from an `inputSchema`.
+/// The zero-keyword policy prevents advertising constraints that normalization would discard.
 pub const REJECTED_ROOT_COMBINATORS: [&str; 7] =
     ["anyOf", "oneOf", "allOf", "not", "if", "then", "else"];
 
@@ -65,6 +66,8 @@ pub enum FailureMode {
     Announced,
     /// The client refuses the artifact outright.
     Rejected,
+    /// The client removes schema constraints, potentially changing their meaning.
+    Transformed,
     /// Breaching it costs bytes or clarity but no client behaviour changes.
     NoClientEffect,
 }
@@ -136,11 +139,11 @@ const CLAUDE_EVIDENCE: LimitEvidence = LimitEvidence {
 };
 const VSCODE_EVIDENCE: LimitEvidence = LimitEvidence {
     client: "VS Code / Copilot",
-    revision: "2026-08-02 source snapshot; immutable commit not recorded",
-    source_url: "https://github.com/microsoft/vscode-copilot-chat/blob/main/src/extension/tools/common/toolSchemaNormalizer.ts",
+    revision: "2aad04ceb3bd240d6a022680b16d6119208e23d0",
+    source_url: "https://github.com/microsoft/vscode-copilot-chat/blob/2aad04ceb3bd240d6a022680b16d6119208e23d0/src/extension/tools/common/toolSchemaNormalizer.ts",
     observed: "2026-08-02",
-    checked: "2026-08-02",
-    measurement: "gpt4oMaxStringLength uses JS UTF-16 length for schema-internal descriptions on GPT-4 families; root combinators rejected for all families. Capture an immutable commit when rechecking.",
+    checked: "2026-11-15",
+    measurement: "gpt4oMaxStringLength uses JS UTF-16 length for schema-internal descriptions on GPT-4 families; the normalizer deletes root combinators for all families and calls onFix, rather than dropping the tool.",
 };
 const MCP_EVIDENCE: LimitEvidence = LimitEvidence {
     client: "MCP specification / repository policy",
@@ -344,17 +347,18 @@ pub const HARNESS_LIMITS: &[HarnessLimit] = &[
         artifact: "inputSchema root keywords",
         budget: 0,
         unit: "root combinators",
-        failure_mode: FailureMode::Rejected,
+        failure_mode: FailureMode::Transformed,
         applies_to: AppliesTo::InputSchema,
         fail_on_breach: true,
         planned_enforcement: "",
         notice_at: None,
         warning_only: false,
         overridable: false,
-        rationale: "VS Code rejects anyOf, oneOf, allOf, not, if, then and else at an inputSchema \
-                    root for every model family, and the tool disappears rather than degrading. The \
-                    Claude API rejects the first three at a root as well; Claude Code 2.1.195+ \
-                    flattens them and older versions skip the tool. Nest the union under a property.",
+        rationale: "VS Code removes anyOf, oneOf, allOf, not, if, then and else at an inputSchema \
+                    root for every model family and calls onFix. The tool remains with fewer \
+                    constraints, so the original shape can be misrepresented. Zero is this \
+                    repository compatibility guard, not a client size constant. Nest the union \
+                    under a property.",
         platform: "toolSchemaNormalizer.ts:118-125, fetched 2026-08-02; corroborated by current \
                    Claude Code MCP documentation.",
         raise_when: "Never. This is a structural rejection, not a budget.",
@@ -1701,6 +1705,7 @@ pub fn describe_breach(limit: &HarnessLimit, budget: usize, measured: usize) -> 
             };
             format!("{head}. {effect} {}", limit.rationale)
         }
+        FailureMode::Transformed => format!("{head}. The client normalizer removes schema constraints and calls its diagnostic callback; it does not drop the tool. {}", limit.rationale),
         FailureMode::NoClientEffect => format!("{head}. {}", limit.rationale),
     };
     let e = &limit.evidence;
@@ -2491,11 +2496,14 @@ mod tests {
                 defaults.push_str(&format!("# {} = {}\n", limit.name, limit.budget));
             }
         }
+        // These files are not forced to LF by .gitattributes. Windows autocrlf must not
+        // turn an identical evidence table into a cap change.
         let document =
-            include_str!("../../../docs/development/mcp-client-limits-and-measured-evidence.md");
+            include_str!("../../../docs/development/mcp-client-limits-and-measured-evidence.md")
+                .replace("\r\n", "\n");
         assert!(document.contains(&table),
             "Client cap evidence drifted. Keep the owning HarnessLimit row authoritative; replace the generated evidence table in {EVIDENCE_DOC} with:\n{table}\nThen run aise mcp schema-budget --ledger and re-pin intentional artifact changes in the same commit.");
-        assert!(crate::config::CONFIG_EXAMPLE_TOML.contains(&defaults),
+        assert!(crate::config::CONFIG_EXAMPLE_TOML.replace("\r\n", "\n").contains(&defaults),
             "config.example.toml lists stale client defaults. Replace its defaults comment block with:\n{defaults}\nDo not turn these comments into active overrides.");
     }
 
@@ -3539,6 +3547,10 @@ mod tests {
             "the breach is reported: {warnings:?}"
         );
         for warning in combinator {
+            assert!(
+                warning.contains("normalizer removes schema constraints"),
+                "{warning}"
+            );
             assert!(
                 !warning.contains("[mcp.client_limits]"),
                 "a structural rule advises fixing the schema, not the number: {warning}"
