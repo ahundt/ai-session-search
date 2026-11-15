@@ -5190,25 +5190,24 @@ fn tool_get_session(args: &Value, config: &Config, db: &Db) -> Result<ToolRespon
         )?;
         reject_present(args, "include", "include only applies with summary=true")?;
     }
-    let sequence_arg = |key: &str| {
-        args.get(key).filter(|value| !value.is_null()).map(|raw| {
-            mcp_nonnegative_i64_arg(args, key, 0).map_err(|_| format!(
-                "{key} must be an integer from 0 through {} (got {raw}); pass a session-local sequence as seq", i64::MAX
-            ))
-        }).transpose()
-    };
+    let sequence_arg = |key: &str| mcp_integer_arg::<i64>(args, key, 0, i128::from(i64::MAX));
     let old_seq = sequence_arg("message_seq")?;
     let seq = sequence_arg("seq")?;
     if seq.is_some() && old_seq.is_some() && seq != old_seq {
         return Err("seq conflicts with deprecated message_seq; pass seq only".to_string());
     }
     let message_seq = seq.or(old_seq);
-    let transcript_lines = args.get("transcript_lines").and_then(Value::as_i64);
+    let transcript_lines = mcp_integer_arg::<i64>(
+        args,
+        "transcript_lines",
+        i128::from(i64::MIN),
+        i128::from(i64::MAX),
+    )?;
     // Absolute message-range read: an alternative to a bigger transcript_lines head/tail that lets
     // the caller advance seq_from = last seq + 1 for deterministic, non-overlapping chunks. seq
     // numbers are session-local, which this per-session tool already scopes.
-    let seq_from = args.get("seq_from").and_then(Value::as_i64);
-    let seq_to = args.get("seq_to").and_then(Value::as_i64);
+    let seq_from = mcp_integer_arg(args, "seq_from", 0, i128::from(i64::MAX))?;
+    let seq_to = mcp_integer_arg(args, "seq_to", 0, i128::from(i64::MAX))?;
     for name in ["since", "until", "when"] {
         if summary || message_seq.is_some() || transcript_lines.is_some() {
             reject_present(args, name, &format!("{name} conflicts with summary, seq/message_seq, and transcript_lines; omit those selectors for a range read"))?;
@@ -5760,7 +5759,11 @@ fn tool_query_session_index_cancellable(
         config.db.query_limit,
     )?);
     query.offset = mcp_nonnegative_usize_arg(args, "offset", 0)?;
-    query.timeout_ms = Some(mcp_u64_arg(args, "timeout_ms", config.mcp.query_timeout_ms));
+    query.timeout_ms = Some(mcp_u64_arg(
+        args,
+        "timeout_ms",
+        config.mcp.query_timeout_ms,
+    )?);
     // Keep cell presentation here so the payload can report precisely which cells were cut.
     let result = service
         .query_cancellable(&query, cancellation, "query_session_index SQL")
@@ -5786,24 +5789,34 @@ fn mcp_bool_arg(args: &Value, key: &str, default: bool) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(default)
 }
 
-fn mcp_u64_arg(args: &Value, key: &str, default: u64) -> u64 {
-    args.get(key).and_then(Value::as_u64).unwrap_or(default)
+/// Parse present integers without treating conversion failure as omission.
+fn mcp_integer_arg<T: TryFrom<i128>>(
+    args: &Value,
+    key: &str,
+    minimum: i128,
+    maximum: i128,
+) -> Result<Option<T>, String> {
+    let Some(raw) = args.get(key).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let error = || format!("{key} must be an integer from {minimum} through {maximum} (got {raw})");
+    let value = raw
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| raw.as_u64().map(i128::from))
+        .ok_or_else(error)?;
+    if !(minimum..=maximum).contains(&value) {
+        return Err(error());
+    }
+    T::try_from(value).map(Some).map_err(|_| error())
+}
+
+fn mcp_u64_arg(args: &Value, key: &str, default: u64) -> Result<u64, String> {
+    Ok(mcp_integer_arg(args, key, 0, i128::from(u64::MAX))?.unwrap_or(default))
 }
 
 fn mcp_nonnegative_usize_arg(args: &Value, key: &str, default: usize) -> Result<usize, String> {
-    let Some(value) = args.get(key) else {
-        return Ok(default);
-    };
-    let value = value
-        .as_u64()
-        .ok_or_else(|| format!("{key} must be a non-negative integer"))?;
-    let maximum = max_mcp_numeric_usize();
-    let value = usize::try_from(value)
-        .map_err(|_| format!("{key} must be 0 through {maximum}, got {value}"))?;
-    if value > maximum {
-        return Err(format!("{key} must be 0 through {maximum}, got {value}"));
-    }
-    Ok(value)
+    Ok(mcp_integer_arg(args, key, 0, max_mcp_numeric_usize() as i128)?.unwrap_or(default))
 }
 
 fn max_mcp_numeric_usize() -> usize {
@@ -5841,11 +5854,11 @@ fn inspection_options_from_args(
             "preview_chars",
             config.mcp.preview_chars.max(1),
         )?,
-        evidence_window: crate::inspect::EvidenceWindow::from_signed_items(
-            args.get("summary_items")
-                .and_then(Value::as_i64)
-                .unwrap_or(config.mcp.summary_items),
-        )
+        evidence_window: crate::inspect::EvidenceWindow::from_signed_items(mcp_i64_arg(
+            args,
+            "summary_items",
+            config.mcp.summary_items,
+        )?)
         .map_err(|error| format!("{error:#}"))?,
         include_time_profile: false,
     })
@@ -5864,16 +5877,7 @@ fn reject_present(args: &Value, key: &str, message: &str) -> Result<(), String> 
 }
 
 fn mcp_nonnegative_i64_arg(args: &Value, key: &str, default: i64) -> Result<i64, String> {
-    let Some(raw) = args.get(key).filter(|value| !value.is_null()) else {
-        return Ok(default);
-    };
-    let value = raw
-        .as_i64()
-        .ok_or_else(|| format!("{key} must be a non-negative integer"))?;
-    if value < 0 {
-        return Err(format!("{key} must be non-negative; got {value}"));
-    }
-    Ok(value)
+    Ok(mcp_integer_arg(args, key, 0, i128::from(i64::MAX))?.unwrap_or(default))
 }
 
 /// Levenshtein edit distance, used only to name the likeliest intended parameter in an
@@ -5977,8 +5981,8 @@ fn unknown_tool_message(tool_name: &str, tools: &Value) -> String {
 }
 
 /// Signed line-count argument (`lines_per_message`): positive=head, negative=tail, 0=unlimited.
-fn mcp_i64_arg(args: &Value, key: &str, default: i64) -> i64 {
-    args.get(key).and_then(Value::as_i64).unwrap_or(default)
+fn mcp_i64_arg(args: &Value, key: &str, default: i64) -> Result<i64, String> {
+    Ok(mcp_integer_arg(args, key, i128::from(i64::MIN), i128::from(i64::MAX))?.unwrap_or(default))
 }
 
 /// Parse an optional enum argument (e.g. `role`, `provider`) via its `FromStr`. Absent →
@@ -6606,8 +6610,8 @@ fn tool_search_messages_cancellable(
             .exclude_session_id(session)
             .map_err(|error| error.to_string())?;
     }
-    let seq_from = args.get("seq_from").and_then(Value::as_i64);
-    let seq_to = args.get("seq_to").and_then(Value::as_i64);
+    let seq_from = mcp_integer_arg(args, "seq_from", 0, i128::from(i64::MAX))?;
+    let seq_to = mcp_integer_arg(args, "seq_to", 0, i128::from(i64::MAX))?;
     if seq_from.is_some() || seq_to.is_some() {
         builder = builder
             .sequence(SequenceRange::new(seq_from, seq_to).map_err(|error| error.to_string())?);
@@ -6643,10 +6647,8 @@ fn tool_search_messages_cancellable(
     if let Some(detail) = parse_message_search_detail(args)? {
         builder = builder.detail(detail);
     }
-    if let Some(value) = args.get("lines_per_message") {
-        let lines = value
-            .as_i64()
-            .ok_or_else(|| "lines_per_message must be an integer".to_string())?;
+    if args.get("lines_per_message").is_some() {
+        let lines = mcp_i64_arg(args, "lines_per_message", 0)?;
         builder = builder
             .message_lines(LineWindow::from_signed(lines).map_err(|error| error.to_string())?);
     }
@@ -6849,7 +6851,7 @@ impl MessagePresentation {
             args,
             "lines_per_message",
             config.mcp.lines_per_message,
-        ))
+        )?)
         .map_err(|error| error.to_string())?;
         Ok(Self {
             include_refs: mcp_bool_arg(args, "include_refs", false),
@@ -7666,6 +7668,135 @@ mod tests {
     }
 
     #[test]
+    fn mcp_integer_overflow_is_an_error_without_message_payload() {
+        let (dir, db) = fixture();
+        let config = config_for_fixture(&dir);
+        let tools = handle_tools_list(None, &config);
+        let overflow = json!(9223372036854775808_u64);
+        for (tool, base, keys) in [
+            (
+                "get_session",
+                json!({"session_id":"claude:test1"}),
+                vec![
+                    "seq",
+                    "message_seq",
+                    "seq_from",
+                    "seq_to",
+                    "transcript_lines",
+                ],
+            ),
+            (
+                "get_session",
+                json!({"session_id":"claude:test1", "seq":0}),
+                vec![
+                    "context",
+                    "context_before",
+                    "context_after",
+                    "lines_per_message",
+                ],
+            ),
+            (
+                "get_session",
+                json!({"session_id":"claude:test1", "summary":true}),
+                vec!["summary_items"],
+            ),
+            (
+                "search_messages",
+                json!({"query":"hello"}),
+                vec![
+                    "seq_from",
+                    "seq_to",
+                    "context",
+                    "context_before",
+                    "context_after",
+                    "lines_per_message",
+                    "limit",
+                    "offset",
+                ],
+            ),
+            (
+                "query_session_index",
+                json!({"sql":"SELECT 1"}),
+                vec!["limit", "offset", "max_cell_chars"],
+            ),
+            (
+                "search_sessions",
+                json!({"query":"hello"}),
+                vec!["limit", "offset"],
+            ),
+            ("list_sessions", json!({}), vec!["limit", "offset"]),
+            (
+                "get_session",
+                json!({"session_id":"claude:test1", "seq":0}),
+                vec!["preview_chars"],
+            ),
+        ] {
+            for key in keys {
+                let mut args = base.clone();
+                args[key] = overflow.clone();
+                validate_tool_call(
+                    &json!({"name":tool, "arguments":args}),
+                    &tools["result"]["tools"],
+                )
+                .unwrap();
+                let response = call_tool(tool, args, &config, &db);
+                assert_eq!(
+                    response["result"]["isError"], true,
+                    "{tool}.{key}: {response}"
+                );
+                assert!(
+                    response["result"].get("structuredContent").is_none(),
+                    "{response}"
+                );
+                let error = response["result"]["content"][0]["text"].as_str().unwrap();
+                assert!(error.contains(key), "{error}");
+                assert!(error.contains("9223372036854775808"), "{error}");
+                assert!(error.contains("9223372036854775807"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn mcp_checked_integers_preserve_unsigned_timeout_and_signed_windows() {
+        for raw in [json!(-1), json!(1.5), json!("10")] {
+            let error = mcp_u64_arg(&json!({"timeout_ms":raw}), "timeout_ms", 0).unwrap_err();
+            assert!(error.contains("timeout_ms"), "{error}");
+            assert!(error.contains(&raw.to_string()), "{error}");
+        }
+        assert_eq!(
+            mcp_u64_arg(&json!({"timeout_ms":u64::MAX}), "timeout_ms", 0).unwrap(),
+            u64::MAX
+        );
+        assert_eq!(
+            mcp_i64_arg(
+                &json!({"lines_per_message":i64::MIN}),
+                "lines_per_message",
+                0
+            )
+            .unwrap(),
+            i64::MIN
+        );
+        assert_eq!(
+            mcp_i64_arg(&json!({}), "lines_per_message", -10).unwrap(),
+            -10
+        );
+        assert_eq!(
+            mcp_integer_arg::<i64>(&json!({}), "seq_from", 0, i128::from(i64::MAX)).unwrap(),
+            None
+        );
+        assert_eq!(
+            mcp_integer_arg::<i64>(
+                &json!({"seq_from":i64::MAX}),
+                "seq_from",
+                0,
+                i128::from(i64::MAX)
+            )
+            .unwrap(),
+            Some(i64::MAX)
+        );
+    }
+
+    #[test]
     fn mcp_numeric_arguments_reject_out_of_range_values_instead_of_clamping() {
         let maximum = max_mcp_numeric_usize();
         let too_large = u64::try_from(maximum).unwrap().checked_add(1).unwrap();
@@ -7683,7 +7814,7 @@ mod tests {
 
         let error = mcp_nonnegative_i64_arg(&json!({ "context": -2 }), "context", 0).unwrap_err();
         assert!(error.contains("context"), "{error}");
-        assert!(error.contains("non-negative"), "{error}");
+        assert!(error.contains("from 0 through"), "{error}");
         assert!(error.contains("-2"), "{error}");
     }
 
