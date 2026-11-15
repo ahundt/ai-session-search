@@ -8334,7 +8334,8 @@ fn store_parsed_file_edits(
         insert_file_edits(tx, session, file_edits.iter().map(|e| (e.seq, *e)))?;
         return Ok(true);
     }
-    // Match occurrences monotonically within each path, not independently by content.
+    // Prefer the next compatible occurrence within each path. If source order changed,
+    // fall back to an earlier unclaimed occurrence rather than inserting a duplicate.
     // Search exact and known legacy representations together so an exact match cannot
     // consume a later occurrence before the current occurrence's legacy match.
     // For S stored and P parsed edits plus B content bytes: O((S + P) log S + B)
@@ -8361,18 +8362,19 @@ fn store_parsed_file_edits(
                         })
                 })
                 .flatten();
-            let (position, key) = std::iter::once(keys.edit)
+            let (_, position, key) = std::iter::once(keys.edit)
                 .chain(legacy_key)
                 .filter_map(|key| {
-                    positions
-                        .get(&key)?
+                    let available = positions.get(&key)?;
+                    available
                         .range(*next..)
                         .next()
-                        .map(|&pos| (pos, key))
+                        .or_else(|| available.first())
+                        .map(|&pos| (pos < *next, pos, key))
                 })
-                .min_by_key(|(pos, _)| *pos)?;
+                .min_by_key(|(before_cursor, pos, _)| (*before_cursor, *pos))?;
             positions.get_mut(&key).unwrap().remove(&position);
-            *next = position + 1;
+            *next = (*next).max(position + 1);
             Some(position)
         })
         .collect();
