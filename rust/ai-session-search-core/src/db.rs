@@ -3056,6 +3056,16 @@ impl Db {
         mtime_ns: i64,
         size_bytes: i64,
     ) -> Result<()> {
+        self.append_tail_with_context(tail, mtime_ns, size_bytes, None)
+    }
+
+    pub(crate) fn append_tail_with_context(
+        &self,
+        tail: &crate::tail::TailParse,
+        mtime_ns: i64,
+        size_bytes: i64,
+        validated_session: Option<&SessionRecord>,
+    ) -> Result<()> {
         self.require_write_compatibility()?;
         let session = &tail.session;
         // IMMEDIATE for the same reason as `upsert_session_with_mode`: the reads below precede
@@ -3130,6 +3140,17 @@ impl Db {
             .unwrap_or_default();
         let key = crate::providers::health::UNRECOGNIZED_RECORD_TYPES_KEY;
         let mut patch = serde_json::json!({key: metadata[key]});
+        let spawned_codex = validated_session.is_some_and(|stored| {
+            stored.provider == Provider::Codex
+                && stored.id == session.id
+                && (stored.parent_session_id.is_some() || stored.agent_label.is_some())
+        });
+        if spawned_codex {
+            // These cumulative counters were seeded alongside the immutable spawn context.
+            for key in ["line_count", "valid_record_count", "malformed_line_count"] {
+                patch[key] = metadata[key].clone();
+            }
+        }
         if matches!(session.provider, Provider::Claude | Provider::ClaudeDesktop) {
             // Null clears resolved lifecycle state while preserving unrelated metadata.
             patch["pending_direct_delivery"] = if metadata["pending_direct_delivery"]
@@ -3144,8 +3165,14 @@ impl Db {
         tx.execute(
             "update sessions set raw_metadata_json = json_patch(
                 case when json_valid(raw_metadata_json) then raw_metadata_json else '{}' end,
-                ?2) where id = ?1",
-            params![session.id, patch.to_string()],
+                ?2), parse_warning = case when ?3 then ?4 else parse_warning end
+                where id = ?1",
+            params![
+                session.id,
+                patch.to_string(),
+                spawned_codex,
+                session.parse_warning
+            ],
         )?;
 
         // Append the new conversation text to the transcript blob, then rebuild this session's FTS

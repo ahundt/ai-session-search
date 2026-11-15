@@ -840,7 +840,29 @@ impl CodexAdapter {
         let mut provider_session_id = self
             .extract_id(path)
             .unwrap_or_else(|| "unknown".to_string());
-        let mut session_is_agent = self
+        let stored_session = context
+            .and_then(|context| context.validated_session)
+            .filter(|session| session.provider_session_id == provider_session_id);
+        let stored_spawn = stored_session
+            .map(|session| {
+                (
+                    session.parent_session_id.clone(),
+                    session.agent_label.clone(),
+                )
+            })
+            .unwrap_or_default();
+        let mut session_is_agent = stored_spawn.0.is_some() || stored_spawn.1.is_some();
+        let seeded_counts = session_is_agent;
+        if seeded_counts {
+            let metadata: Value = stored_session
+                .and_then(|session| session.raw_metadata_json.as_deref())
+                .and_then(|raw| serde_json::from_str(raw).ok())
+                .unwrap_or_default();
+            line_count = metadata["line_count"].as_u64().unwrap_or(0) as usize;
+            valid_record_count = metadata["valid_record_count"].as_u64().unwrap_or(0) as usize;
+            malformed_line_count = metadata["malformed_line_count"].as_u64().unwrap_or(0) as usize;
+        }
+        session_is_agent |= self
             .metadata_for_path(path)
             .and_then(|metadata| metadata.threads.get(&provider_session_id))
             .map(|metadata| {
@@ -852,7 +874,7 @@ impl CodexAdapter {
         // A forked or resumed session emits a SECOND session_meta carrying the parent's id.
         // Only the first one identifies this file, so bind the id once. See the guard below.
         let mut session_id_bound = false;
-        let mut header_spawn_origin = (None, None);
+        let mut header_spawn_origin = stored_spawn;
         let mut cwd = None;
         let mut created_at = None;
         let mut updated_at = None;
@@ -882,18 +904,19 @@ impl CodexAdapter {
             let (byte_offset, line) = line?;
             unrecognized.record(context, byte_offset);
             let is_new = context.is_none_or(|c| byte_offset >= c.new_bytes_start);
-            line_count += 1;
+            let count_line = !seeded_counts || is_new;
+            line_count += usize::from(count_line);
             if line.trim().is_empty() {
                 continue;
             }
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
                 Err(_) => {
-                    malformed_line_count += 1;
+                    malformed_line_count += usize::from(count_line);
                     continue;
                 }
             };
-            valid_record_count += 1;
+            valid_record_count += usize::from(count_line);
             unrecognized.observe(Provider::Codex, &value);
             let timestamp = value
                 .get("timestamp")
@@ -1312,6 +1335,12 @@ impl CodexAdapter {
                 root_metadata
                     .and_then(|metadata| metadata.index_titles.get(&provider_session_id))
                     .cloned()
+            })
+            // The first prompt can be outside overlap just like the spawn header.
+            .or_else(|| {
+                stored_session
+                    .filter(|_| session_is_agent)
+                    .and_then(|s| s.title.clone())
             })
             .or_else(|| first_user.clone())
             .map(|text| truncate_for_display(&text, 100));

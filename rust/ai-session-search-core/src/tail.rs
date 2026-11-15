@@ -182,6 +182,8 @@ pub struct TailParse {
 pub(crate) struct TailContext<'a> {
     /// Persisted inventory seeds only the overlap+tail parse, never the overlap-only parse.
     pub health_seed: Option<&'a str>,
+    /// Immutable provenance from the indexer's validated source checkpoint.
+    pub validated_session: Option<&'a SessionRecord>,
     pub new_bytes_start: usize,
     pub prefix_truncated: bool,
     pub pending_direct_delivery: bool,
