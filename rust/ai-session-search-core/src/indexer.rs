@@ -1843,6 +1843,11 @@ where
                 .unwrap_or(false);
         }
     }
+    let validated_session = stored_session.as_ref().filter(|session| {
+        session.provider == source.provider
+            && session.source_path == source_path
+            && session.parse_version == crate::util::provider_parse_version(source.provider)
+    });
     match crate::tail::tail_parse_until(
         &source.path,
         offset,
@@ -1855,6 +1860,7 @@ where
                 crate::tail::TailContext {
                     pending_direct_delivery,
                     health_seed,
+                    validated_session,
                     new_bytes_start: context.new_bytes_start,
                     prefix_truncated: context.prefix_truncated,
                 },
@@ -1868,10 +1874,8 @@ where
             if expected_session_id != Some(tail.session.id.as_str()) {
                 return Ok(TailOutcome::FullParse);
             }
-            // Spawn metadata normally lives in the session header, which can be outside the
-            // bounded tail overlap. If the stored session is already known to be a subagent but
-            // this slice is not, a tail append would misclassify new Codex user records as root
-            // input. Re-read the source so attribution stays identical to a full parse.
+            // If validated provenance could not seed the parser, retain the full-source
+            // fallback rather than publishing root attribution for a spawned session.
             if source.provider == Provider::Codex {
                 let stored_spawned = db
                     .session_metadata(std::slice::from_ref(&tail.session.id))?
@@ -1881,7 +1885,13 @@ where
                     });
                 let tail_spawned =
                     tail.session.parent_session_id.is_some() || tail.session.agent_label.is_some();
-                if stored_spawned && !tail_spawned {
+                if stored_spawned
+                    && (!tail_spawned
+                        || stored_session.as_ref().is_some_and(|session| {
+                            session.summary.is_none() && tail.session.summary.is_some()
+                        }))
+                {
+                    // The first prompt also establishes immutable summary and creation metadata.
                     return Ok(TailOutcome::FullParse);
                 }
             }
@@ -1907,7 +1917,12 @@ where
                 return Ok(TailOutcome::FullParse);
             }
             tail.new_fingerprint = source_fingerprint(source, &tail.new_fingerprint);
-            db.append_tail(&tail, source.mtime_ns, source.size_bytes)?;
+            db.append_tail_with_context(
+                &tail,
+                source.mtime_ns,
+                source.size_bytes,
+                validated_session,
+            )?;
             Ok(TailOutcome::Appended)
         }
         Ok(crate::tail::TailParseRun::Complete(None)) => Ok(TailOutcome::NothingNew),
@@ -3593,7 +3608,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_spawn_metadata_beyond_overlap_forces_full_parse() {
+    fn codex_spawn_metadata_beyond_overlap_reuses_validated_context() {
         use std::io::Write as _;
 
         let dir = tempfile::tempdir().unwrap();
@@ -3611,12 +3626,18 @@ mod tests {
         });
         let mut initial = serde_json::json!({
             "type": "session_meta",
-            "payload": {"id": id, "source": spawn_source}
+            "timestamp": "2026-06-25T03:04:06Z",
+            "payload": {"id": id, "source": spawn_source, "timestamp": "2026-06-25T03:04:06Z"}
         })
         .to_string()
             + "\n";
+        initial.push_str(concat!(
+            r#"{"type":"response_item","timestamp":"2026-06-25T03:04:06Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"spawned tail prompt"}]}}"#,
+            "\n"
+        ));
         let padding = serde_json::json!({
             "type": "response_item",
+            "timestamp": "2026-06-25T03:04:06Z",
             "payload": {
                 "type": "message",
                 "role": "assistant",
@@ -3639,7 +3660,6 @@ mod tests {
         let db = Db::open(&db_path).unwrap();
         reindex(&config, &db, false, None).unwrap();
         let session_id = format!("codex:{id}");
-        let adapters = ProviderSet::new(&config);
         let stored = db
             .session_metadata(std::slice::from_ref(&session_id))
             .unwrap();
@@ -3648,34 +3668,74 @@ mod tests {
             Some("codex:root-session")
         );
 
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .unwrap()
-            .write_all(
-                br#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"spawned tail prompt"}],"internal_chat_message_metadata_passthrough":{"content_item_metadata":[{"provenance":{"type":"user"}}]}}}
-"#,
+        let mut outcomes = Vec::new();
+        for turn in 0..10 {
+            writeln!(
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap(),
+                "{}",
+                serde_json::json!({
+                    "type": "response_item",
+                    "timestamp": "2026-06-25T03:04:07Z",
+                    "payload": {"type": "message", "role": "user",
+                        "content": [{"type": "input_text",
+                            "text": format!("spawned tail prompt {turn}")}],
+                        "internal_chat_message_metadata_passthrough": {
+                            "content_item_metadata": [{"provenance": {"type": "user"}}]
+                        }}
+                })
             )
             .unwrap();
-        let source = adapters.discover_enabled(&config).sources.remove(0);
-        let outcome = try_tail(
-            &source,
-            &normalize_path(&source.path),
-            Some(&session_id),
-            &db,
-            &|| false,
-            |reader, path, context| {
-                adapters
-                    .codex
-                    .parse_reader_with_context(reader, path, Some(context))
-            },
-        )
-        .unwrap();
-        assert!(
-            matches!(outcome, TailOutcome::FullParse),
-            "tail parsing must not lose the stored spawned-session attribution"
-        );
-        reindex(&config, &db, false, None).unwrap();
+            if turn == 4 {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"{\n")
+                    .unwrap();
+            }
+            TEST_TAIL_OUTCOMES.with(|counts| counts.borrow_mut().clear());
+            reindex(&config, &db, false, None).unwrap();
+            TEST_TAIL_OUTCOMES.with(|counts| outcomes.extend(counts.borrow().iter().copied()));
+
+            let fresh_path = dir.path().join(format!("fresh-{turn}.db"));
+            let fresh = Db::open(&fresh_path).unwrap();
+            reindex(&config, &fresh, true, None).unwrap();
+            let snapshot = |path: &Path| {
+                let conn = rusqlite::Connection::open(path).unwrap();
+                [
+                    "select json_array(seq,role,kind,ts,content,authorship,input_origin,input_delivery_state,record_relation,correlation_id) from messages order by seq,id",
+                    "select json_array(parent_session_id,agent_label,title,summary,cwd,created_at,updated_at,last_message_at,preview_text,message_count,json(raw_metadata_json),parse_warning) from sessions order by id",
+                    "select transcript_text from transcripts order by session_id",
+                ].map(|sql| conn.prepare(sql).unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap())
+            };
+            assert_eq!(checkpoint_rows(&db_path), checkpoint_rows(&fresh_path));
+            for (section, (actual, expected)) in snapshot(&db_path)
+                .into_iter()
+                .zip(snapshot(&fresh_path))
+                .enumerate()
+            {
+                assert_eq!(actual.len(), expected.len(), "section {section}");
+                for (row, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    let equal = if section == 1 {
+                        serde_json::from_str::<serde_json::Value>(actual).unwrap()
+                            == serde_json::from_str::<serde_json::Value>(expected).unwrap()
+                    } else {
+                        actual == expected
+                    };
+                    assert!(
+                        equal,
+                        "section {section}, row {row}: actual={} expected={}",
+                        &actual[..actual.len().min(600)],
+                        &expected[..expected.len().min(600)]
+                    );
+                }
+            }
+        }
+        eprintln!("10 append outcomes: {outcomes:?}");
+        assert_eq!(outcomes, vec![TailOutcome::Appended; 10]);
         let filters = crate::models::MessageFilters {
             role: Some(crate::models::Role::User),
             session_id: Some(session_id),
@@ -3689,8 +3749,65 @@ mod tests {
             db.search_messages("spawned tail prompt", &Default::default())
                 .unwrap()
                 .len(),
-            1
+            11
         );
+
+        let assert_full_fallback = || {
+            let adapters = ProviderSet::new(&config);
+            let source = adapters.discover_enabled(&config).sources.remove(0);
+            let outcome = try_tail(
+                &source,
+                &normalize_path(&path),
+                Some(&format!("codex:{id}")),
+                &db,
+                &|| false,
+                |reader, path, context| {
+                    adapters
+                        .codex
+                        .parse_reader_with_context(reader, path, Some(context))
+                },
+            )
+            .unwrap();
+            assert_eq!(outcome, TailOutcome::FullParse);
+            reindex(&config, &db, false, None).unwrap();
+        };
+        let append_newline = || {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+        };
+        let rewritten = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("worker", "helper");
+        std::fs::write(&path, rewritten).unwrap();
+        append_newline();
+        assert_full_fallback();
+        assert_eq!(
+            db.session_metadata(std::slice::from_ref(&format!("codex:{id}")))
+                .unwrap()[&format!("codex:{id}")]
+                .agent_label
+                .as_deref(),
+            Some("helper")
+        );
+
+        let replacement = root.join("replacement.tmp");
+        std::fs::write(&replacement, std::fs::read(&path).unwrap()).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        append_newline();
+        assert_full_fallback();
+
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute(
+                "update files_seen set parse_version = 'stale' where provider = 'codex'",
+                [],
+            )
+            .unwrap();
+        append_newline();
+        assert_full_fallback();
     }
 
     #[test]
