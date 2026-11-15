@@ -53,16 +53,22 @@ pub fn lines_replacing_invalid_utf8<R: io::BufRead>(
 pub(crate) fn lines_with_byte_offsets<R: io::BufRead>(
     reader: R,
 ) -> impl Iterator<Item = io::Result<(usize, String)>> {
+    lines_with_source_bytes(reader).map(|line| line.map(|(offset, _, text)| (offset, text)))
+}
+
+// Retain original record bytes when a checkpoint must hash the source rather than
+// the decoded text. LF is excluded; CR remains in the bytes but not the text.
+pub(crate) fn lines_with_source_bytes<R: io::BufRead>(
+    reader: R,
+) -> impl Iterator<Item = io::Result<(usize, Vec<u8>, String)>> {
     let mut offset = 0;
     reader.split(b'\n').map(move |line| {
-        line.map(|mut bytes| {
+        line.map(|bytes| {
             let start = offset;
             offset += bytes.len() + 1;
-            // `BufRead::split` keeps the `\r` of a `\r\n` ending; drop it to match `lines`.
-            if bytes.last() == Some(&b'\r') {
-                bytes.pop();
-            }
-            (start, String::from_utf8_lossy(&bytes).into_owned())
+            let text =
+                String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(&bytes)).into_owned();
+            (start, bytes, text)
         })
     })
 }
