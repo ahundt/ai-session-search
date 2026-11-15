@@ -285,6 +285,41 @@ def test_release_body_appends_install_guidance_for_the_exact_version(tmp_path: P
     assert "After a first install, run `aise integrations install`" in body
 
 
+def test_release_body_makes_relative_links_absolute_to_the_tag(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0", "1.0.0")
+    _write_changelog(
+        tmp_path,
+        "1.0.0",
+        body="See [steps](docs/a.md#b), [web](https://x.test/y) and [here](#c).\n\n### Fixed\n\n1. A change.\n",
+    )
+    (tmp_path / "docs").mkdir(exist_ok=True)
+    (tmp_path / "docs/a.md").write_text("# a\n", encoding="utf-8")
+
+    body = release_body(tmp_path, "1.0.0")
+
+    assert "[steps](https://github.com/example/aise/blob/v1.0.0/docs/a.md#b)" in body
+    assert "[web](https://x.test/y)" in body
+    assert "[here](#c)" in body
+    assert "Upgrade with `aise package update`" in body
+
+
+def test_release_body_rejects_a_link_to_a_missing_file(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0", "1.0.0")
+    _write_changelog(tmp_path, "1.0.0", body="See [gone](docs/gone.md).\n\n### Fixed\n\n1. A change.\n")
+
+    with pytest.raises(ReleaseMetadataError, match=r"docs/gone\.md"):
+        release_body(tmp_path, "1.0.0")
+
+
+def test_candidate_body_says_package_update_keeps_stable_installs_on_stable(tmp_path: Path) -> None:
+    _write_manifests(tmp_path, "1.0.0rc2", "1.0.0-rc.2")
+
+    body = release_body(tmp_path, "1.0.0rc2")
+
+    assert "keeps a stable install on stable releases" in body
+    assert "Upgrade with `aise package update`" not in body
+
+
 def test_notes_only_renders_a_published_tag_without_the_version_checks(tmp_path: Path) -> None:
     # Revising an earlier release's body happens after the manifests moved to the next version,
     # which the full gate would reject.
