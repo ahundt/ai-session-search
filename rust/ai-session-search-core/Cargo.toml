@@ -36,10 +36,16 @@ fd-lock = "4.0"
 file-id = { version = "0.2.3", features = ["serde"] }
 fuzzy-matcher = "0.3"
 ignore = "0.4"
-interim = { version = "0.2.1", features = ["chrono_0_4", "jiff_0_2"] }
+interim = { version = "0.2.1", features = ["jiff_0_2"] }
 # IANA time zones for date input without an offset: reads the system tz database (TZ env,
 # /etc/localtime; bundled on Windows) and resolves daylight-saving gaps and folds with RFC 5545's
 # "compatible" rule. chrono leaves gaps to the caller and chrono-tz embeds a database snapshot.
+#
+# jiff 1.0 (released 2026-11-15) waits on interim: interim 0.2.2 supports only jiff 0.1 and 0.2,
+# and its jiff_1 feature exists only on upstream main (commit cb70edba0771). Upgrade as soon as
+# an interim release after 0.2.2 ships jiff_1: set `jiff = "1"`, switch interim to `jiff_1`, and
+# rename Zoned -> ZonedDateTime and to_zoned -> to_zoned_datetime in dates.rs and clippy.toml.
+# No jiff type is public, so the upgrade needs no breaking change.
 jiff = "0.2.38"
 # Edits JSONC client configs (Zed settings.json, VS Code mcp.json, kilo.jsonc) without dropping
 # their comments; `serde` reads them into serde_json values for status checks.
