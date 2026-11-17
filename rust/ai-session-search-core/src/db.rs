@@ -2448,6 +2448,25 @@ impl Db {
         Ok(rows)
     }
 
+    /// Source paths whose `files_seen` receipt for `provider` was recorded under `parse_version`.
+    ///
+    /// The indexer writes a receipt in the same transaction as the session rows its parse produced,
+    /// so a current receipt says this file's content reached a session at this parser version. It
+    /// does not say which session; callers pair it with an identity they can prove another way.
+    pub(crate) fn receipt_paths_at_parse_version(
+        &self,
+        provider: Provider,
+        parse_version: &str,
+    ) -> Result<Vec<String>> {
+        let mut statement = self.conn.prepare(
+            "select source_path from files_seen where provider = ?1 and parse_version = ?2",
+        )?;
+        let paths = statement
+            .query_map(params![provider.as_str(), parse_version], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(paths)
+    }
+
     /// Load canonical sessions for all recorded Gemini family members once per reindex.
     /// Family receipts intentionally outlive a removed native member, so ordinary source-path
     /// reconciliation cannot discover this relationship. Conflicting session IDs for one path
