@@ -13,8 +13,8 @@ all-features = true
 # yanked notices are recorded here individually so that adding a dependency
 # cannot silently inherit one.
 ignore = [
-    # chrono is unmaintained (no vulnerability). rmcp, rusqlite, schemars and edtf also depend on
-    # it, so it cannot leave the dependency graph yet; aise's own date handling is moving to jiff.
+    # chrono is unmaintained (no vulnerability). aise's own date types use it, and rmcp, rusqlite,
+    # schemars and edtf depend on it, so it cannot leave the dependency graph yet.
     "RUSTSEC-2026-0543",
 ]
 
