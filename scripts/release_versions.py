@@ -6,12 +6,21 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
+
+_PHASES = [
+    line.split()
+    for line in (Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/src/release-phases.txt")
+    .read_text(encoding="utf-8")
+    .splitlines()
+    if line and not line.startswith("#")
+]
+_CARGO_PHASE = {python: cargo for cargo, python in _PHASES}
 
 PYTHON_RELEASE_VERSION = re.compile(
     r"(?P<release>(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))"
-    r"(?:(?P<phase>a|b|rc)(?P<number>0|[1-9][0-9]*))?"
+    rf"(?:(?P<phase>{'|'.join(re.escape(phase) for phase in _CARGO_PHASE)})(?P<number>0|[1-9][0-9]*))?"
 )
-_CARGO_PHASE = {"a": "alpha", "b": "beta", "rc": "rc"}
 
 
 def cargo_version_for_python(python_version: str) -> str:
@@ -28,7 +37,8 @@ def cargo_version_for_python(python_version: str) -> str:
     return f'{match.group("release")}-{_CARGO_PHASE[phase]}.{match.group("number")}'
 
 
-_PHASE_ORDER = {"a": 0, "b": 1, "rc": 2, None: 3}
+_PHASE_ORDER: dict[str | None, int] = {python: index for index, (_, python) in enumerate(_PHASES)}
+_PHASE_ORDER[None] = len(_PHASES)
 
 
 def release_sort_key(python_version: str) -> tuple[int, int, int, int, int]:
