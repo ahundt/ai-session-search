@@ -12,7 +12,11 @@ all-features = true
 # Security vulnerabilities deny the build with no exceptions. Unmaintained and
 # yanked notices are recorded here individually so that adding a dependency
 # cannot silently inherit one.
-ignore = []
+ignore = [
+    # chrono is unmaintained (no vulnerability). rmcp, rusqlite, schemars and edtf also depend on
+    # it, so it cannot leave the dependency graph yet; aise's own date handling is moving to jiff.
+    "RUSTSEC-2026-0543",
+]
 
 [licenses]
 confidence-threshold = 0.8
