@@ -37,6 +37,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    version exists to move to. aise's own date types and `rmcp` use `chrono`, so it stays a
    dependency, and `deny.toml` records the advisory.
 
+### For contributors
+
+1. Codex fork descendants are parsed before the SQLite write transaction and revalidated inside
+   it, so that transaction is no longer open while those files are read. The `aise` CLI, MCP
+   server, TUI and Python package already serialize index writes with the cross-process index
+   writer lock, so they behave as before; only a Rust caller that writes through a second
+   connection without that lock waits less. A descendant that changed after preparation, or that
+   preparation did not cover, is parsed or invalidated inside the transaction. Pi and Prime Agent
+   descendants are still parsed inside it.
+
 ## [1.1.0rc1] - 2026-11-15
 
 1.1.0 preserves indexed history when transcripts are shortened or rewritten, finds human input
