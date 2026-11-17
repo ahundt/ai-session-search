@@ -13,19 +13,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-1. Rust callers of deprecated `trigram_index` helpers now use rusqlite 0.43 connections through
-   `ai_session_search::rusqlite`; bundled SQLite remains 3.54.1.
-2. Rust `dates::local_time_zone()`, public only in 1.1.0rc1, is now crate-private, so no `jiff`
-   type is part of the public API. Callers that read the system zone use
-   `jiff::tz::TimeZone::try_system()`.
-3. The README and library guide state that the Rust and Python APIs are beta and may change in a
-   minor release; the CLI and MCP server are stable.
+1. rusqlite moves from 0.41 to 0.43; bundled SQLite stays at 3.54.1. Rust callers of the
+   deprecated `trigram_index` helpers must pass 0.43 connections, available through
+   `ai_session_search::rusqlite`.
+2. Rust `dates::local_time_zone()` is no longer public. It was added in 1.1.0rc1 and was the only
+   public signature that named a `jiff` type. To read the system zone with the same UTC fallback,
+   call `jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)`.
+3. The Rust and Python APIs are beta and may change in a minor release; the CLI and MCP server
+   are stable. The README, the library guide, and the crate README now say so.
 
 ### Security
 
-1. `deny.toml` records RUSTSEC-2026-0543, which reports `chrono` as unmaintained with no
-   vulnerability and no patched version. aise's own date types and `rmcp` use `chrono`, so it
-   stays in the dependency graph.
+1. RUSTSEC-2026-0543 reports `chrono` as unmaintained. It names no vulnerability, and no patched
+   version exists to move to. aise's own date types and `rmcp` use `chrono`, so it stays a
+   dependency, and `deny.toml` records the advisory.
 
 ## [1.1.0rc1] - 2026-11-15
 
