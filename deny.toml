@@ -30,6 +30,13 @@ allow = [
     "Zlib",
 ]
 
+# zstd-sys 2.1.3 declares the legacy decoders' BSD-2-Clause terms in addition to
+# BSD-3-Clause. Both require retaining their copyright notices and disclaimers.
+[[licenses.exceptions]]
+name = "zstd-sys"
+version = "=2.1.3"
+allow = ["BSD-2-Clause"]
+
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
