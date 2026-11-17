@@ -10303,6 +10303,13 @@ mod tests {
         fork_preparation_case("unlink");
     }
 
+    #[test]
+    fn fork_preparation_detects_write_through_the_publishing_connection() {
+        // SQLite's data_version does not change for the connection that writes, so only the
+        // connection's own change count can reveal this write.
+        fork_preparation_case("own");
+    }
+
     fn fork_preparation_case(mode: &'static str) {
         for full in [false, true] {
             if mode == "unlink" && !full {
@@ -10361,6 +10368,9 @@ mod tests {
                     .unwrap();
                 fs::write(&parent, format!("{header}\n")).unwrap();
             }
+            if mode == "source" {
+                fork_set_stale_tail_receipt(&db, "child.jsonl");
+            }
             let parsed = parse(&parent);
             FORK_SOURCE_READS.with(|count| count.set(0));
             FORK_FALLBACKS.with(|count| count.set(0));
@@ -10390,7 +10400,7 @@ mod tests {
                 .replace("+content", "+later content");
             let mut first = true;
             FORK_AFTER_PREPARATION.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move |_| {
+                *hook.borrow_mut() = Some(Box::new(move |publishing: &Db| {
                     phase_count.set(phase_count.get() + 1);
                     if !first && mode != "fallback" {
                         return;
@@ -10406,7 +10416,7 @@ mod tests {
                                 .write_all(later_edit.as_bytes())
                                 .unwrap();
                         }
-                        "peer" => {
+                        "peer" | "own" => {
                             let sibling = child_path.with_file_name("sibling.jsonl");
                             let body = fs::read_to_string(&child_path)
                                 .unwrap()
@@ -10422,10 +10432,15 @@ mod tests {
                                 .unwrap();
                             let (mtime, size) = fork_source_stamp(&sibling).unwrap();
                             crate::util::backfill_parsed_dates(&mut parsed, mtime);
-                            Db::open(&db_path)
-                                .unwrap()
-                                .upsert_session(&parsed, mtime, size)
-                                .unwrap();
+                            // "own" writes through the connection that is publishing.
+                            let peer;
+                            let writer = if mode == "own" {
+                                publishing
+                            } else {
+                                peer = Db::open(&db_path).unwrap();
+                                &peer
+                            };
+                            writer.upsert_session(&parsed, mtime, size).unwrap();
                         }
                         "fallback" => {
                             let mut parsed = archive_session(Vec::new(), Vec::new());
@@ -10476,7 +10491,7 @@ mod tests {
             FORK_BEFORE_SOURCE_READ.with(|hook| hook.set(None));
             let (reads, fallbacks, attempts) = match mode {
                 "source" => (2, 0, 2),
-                "peer" => (3, 0, 2),
+                "peer" | "own" => (3, 0, 2),
                 "fallback" => (4, 1, 3),
                 "unlink" => (0, 0, 1),
                 _ => (1, 0, 1),
@@ -10487,7 +10502,7 @@ mod tests {
             assert_eq!(phases.get(), attempts);
             assert_eq!(
                 db.file_edit_count().unwrap(),
-                if mode == "source" || mode == "peer" || mode == "unlink" {
+                if matches!(mode, "source" | "peer" | "own" | "unlink") {
                     2
                 } else {
                     1
@@ -10501,7 +10516,7 @@ mod tests {
                 let (mtime, size) = fork_source_stamp(path).unwrap();
                 fresh.upsert_session(&parse(path), mtime, size).unwrap();
             }
-            if mode == "peer" {
+            if mode == "peer" || mode == "own" {
                 let sibling = child.with_file_name("sibling.jsonl");
                 let (mtime, size) = fork_source_stamp(&sibling).unwrap();
                 fresh.upsert_session(&parse(&sibling), mtime, size).unwrap();
@@ -10514,6 +10529,22 @@ mod tests {
                     .unwrap();
             }
             assert_eq!(rows(&db), rows(&fresh));
+            if mode == "source" {
+                // The child was reparsed after it changed, so its checkpoint no longer describes
+                // the file: the receipt is reset until a later reindex of the child.
+                assert_eq!(
+                    fork_receipt(&db, "child.jsonl"),
+                    (String::new(), None, None)
+                );
+                let (mtime, size) = fork_source_stamp(&child).unwrap();
+                let reparsed = parse(&child);
+                db.upsert_session(&reparsed, mtime, size).unwrap();
+                assert_eq!(
+                    fork_receipt(&db, "child.jsonl").0,
+                    reparsed.session.parse_version
+                );
+                assert_eq!(rows(&db), rows(&fresh));
+            }
         }
     }
 
@@ -10691,6 +10722,31 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap()
+    }
+
+    fn fork_receipt(db: &Db, file_name: &str) -> (String, Option<i64>, Option<String>) {
+        db.conn
+            .query_row(
+                "select parse_version, tail_byte_offset, prefix_fingerprint from files_seen
+                 where source_path like ?1",
+                [format!("%{file_name}")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    }
+
+    /// Give a source a checkpoint, so that a reset receipt is distinguishable from a new one.
+    fn fork_set_stale_tail_receipt(db: &Db, file_name: &str) {
+        db.conn
+            .execute(
+                "update files_seen set tail_byte_offset = 7, prefix_fingerprint = 'stale'
+                 where source_path like ?1",
+                [format!("%{file_name}")],
+            )
+            .unwrap();
+        let (version, offset, fingerprint) = fork_receipt(db, file_name);
+        assert_ne!(version, "");
+        assert_eq!((offset, fingerprint.as_deref()), (Some(7), Some("stale")));
     }
 
     fn fork_header(provider: Provider, id: &str, parent: Option<&str>) -> String {
@@ -11030,6 +11086,125 @@ mod tests {
             fork_index(&fresh, Provider::Codex, path);
         }
         assert_eq!(fork_rows(&db), fork_rows(&fresh));
+    }
+
+    #[test]
+    fn fork_publication_commits_when_changed_child_is_deleted_before_retry() {
+        let family = ForkFamily::new(Provider::Codex);
+        fork_set_stale_tail_receipt(&family.db, "child.jsonl");
+        let parsed = family.parent_with_shared_edit();
+        fork_start_counting();
+        let phases = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = phases.clone();
+        let child = family.child.clone();
+        FORK_AFTER_PREPARATION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_: &Db| {
+                counted.set(counted.get() + 1);
+                // The first preparation read the child; the file is gone before the retry.
+                let _ = fs::remove_file(&child);
+            }))
+        });
+        family.db.upsert_session(&parsed, 2, 2).unwrap();
+        fork_stop_preparations();
+        // Attempt one read the child; attempt two finds nothing to read.
+        assert_eq!(fork_stop_counting(), (1, 0, 0));
+        assert_eq!(phases.get(), 2);
+        assert_eq!(fork_edit_count_of(&family.db, "codex:parent"), 1);
+        // The child could not be reconciled: it keeps its edit and its receipt is reset.
+        assert_eq!(fork_edit_count_of(&family.db, "codex:child"), 1);
+        assert_eq!(
+            fork_receipt(&family.db, "child.jsonl"),
+            (String::new(), None, None)
+        );
+    }
+
+    #[test]
+    fn fork_publication_resets_receipt_of_child_deleted_after_lock() {
+        fork_deleted_after_lock_case(false);
+    }
+
+    #[test]
+    fn fork_tail_publication_resets_receipt_of_child_deleted_after_lock() {
+        fork_deleted_after_lock_case(true);
+    }
+
+    fn fork_deleted_after_lock_case(tail: bool) {
+        let family = ForkFamily::new(Provider::Codex);
+        fork_set_stale_tail_receipt(&family.db, "child.jsonl");
+        let parsed = family.parent_with_shared_edit();
+        fork_start_counting();
+        let phases = fork_count_preparations();
+        // The child is read during preparation and deleted once the writer lock is held.
+        FORK_BEFORE_RECONCILE.with(|hook| {
+            hook.set(Some(|path| {
+                fs::remove_file(path.with_file_name("child.jsonl")).unwrap();
+            }))
+        });
+        fork_publish(&family.db, &parsed, tail);
+        fork_stop_preparations();
+        assert!(FORK_BEFORE_RECONCILE.with(|hook| hook.take()).is_none());
+        // One read, made during preparation. The prepared parse is discarded, and the locked
+        // path finds the source gone without reading it.
+        assert_eq!(fork_stop_counting(), (1, 1, 0), "tail {tail}");
+        assert_eq!(phases.get(), 1);
+        assert_eq!(fork_edit_count_of(&family.db, "codex:parent"), 1);
+        assert_eq!(fork_edit_count_of(&family.db, "codex:child"), 1);
+        assert_eq!(
+            fork_receipt(&family.db, "child.jsonl"),
+            (String::new(), None, None)
+        );
+    }
+
+    #[test]
+    fn fork_publication_discards_child_whose_identity_changed_under_a_stored_stamp() {
+        fork_identity_case("\"child\"", "\"chilx\"");
+    }
+
+    #[test]
+    fn fork_publication_discards_child_whose_parent_changed_under_a_stored_stamp() {
+        fork_identity_case("\"parent\"", "\"parenx\"");
+    }
+
+    /// The child's bytes are rewritten with the same length and modification time, so its stamp
+    /// still equals the stored one while its header names another session or another parent.
+    fn fork_identity_case(from: &str, to: &str) {
+        let family = ForkFamily::new(Provider::Codex);
+        fork_set_stale_tail_receipt(&family.db, "child.jsonl");
+        let stamp = fork_source_stamp(&family.child).unwrap();
+        let modified = fs::metadata(&family.child).unwrap().modified().unwrap();
+        let rewritten = fs::read_to_string(&family.child).unwrap().replace(from, to);
+        fs::write(&family.child, rewritten).unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&family.child)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(fork_source_stamp(&family.child), Some(stamp));
+        let parsed = family.parent_with_shared_edit();
+        fork_start_counting();
+        let phases = fork_count_preparations();
+        family.db.upsert_session(&parsed, 2, 2).unwrap();
+        fork_stop_preparations();
+        // The source was read once, before the transaction, and rejected.
+        assert_eq!(fork_stop_counting(), (1, 0, 0), "{from}");
+        assert_eq!(phases.get(), 1);
+        assert_eq!(fork_edit_count_of(&family.db, "codex:parent"), 1);
+        // Nothing was stored from the mismatched parse; the child keeps what it held.
+        assert_eq!(
+            family
+                .db
+                .conn
+                .query_row("select count(*) from file_edits", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(fork_edit_count_of(&family.db, "codex:child"), 1);
+        assert_eq!(
+            fork_receipt(&family.db, "child.jsonl"),
+            (String::new(), None, None)
+        );
     }
 
     #[test]
