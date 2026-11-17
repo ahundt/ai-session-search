@@ -10,6 +10,8 @@ crate, and the Python package, so either library answers a query the way the CLI
 does. For command-line use see the [README](../../README.md); for settings see
 the [configuration guide](configuration.md).
 
+Both libraries are beta and may change in a minor release; the CLI and MCP server are stable.
+
 ## Python
 
 Call `refresh()` before the first read: opening an index does not read transcripts. These five

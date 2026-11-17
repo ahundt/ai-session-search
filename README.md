@@ -292,6 +292,7 @@ so an interruption leaves no half-written bundle.
 ## Python and Rust APIs
 
 Use these to build on the index instead of shelling out to `aise` and parsing its output.
+The APIs are beta and may change in a minor release; the CLI and MCP server are stable.
 
 ```python
 import ai_session_search as aise

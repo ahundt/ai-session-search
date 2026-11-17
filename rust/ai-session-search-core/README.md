@@ -18,6 +18,8 @@ cargo install ai-session-search --locked
 
 ## Library use
 
+The library API is beta and may change in a minor release; the CLI and MCP server are stable.
+
 The supported application API is available directly from the crate root:
 
 ```rust
