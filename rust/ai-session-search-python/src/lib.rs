@@ -1986,8 +1986,7 @@ struct NativeReconstructedFileVersions {
 #[pyclass(
     name = "PublishedFileVersion",
     module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
+    frozen
 )]
 #[derive(Clone)]
 struct NativePublishedFileVersion {
@@ -2446,7 +2445,7 @@ struct DateRange {
 
 #[derive(Clone)]
 /// Concrete inclusive UTC bounds produced by resolving a DateRange.
-#[pyclass(module = "ai_session_search._native", frozen, skip_from_py_object)]
+#[pyclass(module = "ai_session_search._native", frozen)]
 struct ResolvedDateRange {
     #[pyo3(get)]
     since: Option<String>,
@@ -4320,8 +4319,7 @@ struct NativeReindexOutcome {
 #[pyclass(
     name = "ProviderParserHealth",
     module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
+    frozen
 )]
 struct NativeProviderParserHealth {
     #[pyo3(get)]
@@ -4341,8 +4339,7 @@ struct NativeProviderParserHealth {
 #[pyclass(
     name = "UnrecognizedRecordType",
     module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
+    frozen
 )]
 struct NativeUnrecognizedRecordType {
     #[pyo3(get)]
@@ -4380,12 +4377,7 @@ impl From<ProviderParserHealth> for NativeProviderParserHealth {
 
 #[derive(Clone)]
 /// Aggregate schema and parser-version freshness across indexed sessions.
-#[pyclass(
-    name = "ParserHealth",
-    module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
-)]
+#[pyclass(name = "ParserHealth", module = "ai_session_search._native", frozen)]
 struct NativeParserHealth {
     #[pyo3(get)]
     schema_version: i64,
@@ -4429,12 +4421,7 @@ impl From<ParserHealth> for NativeParserHealth {
 
 #[derive(Clone)]
 /// Parser/schema freshness and applicable repair commands for the index.
-#[pyclass(
-    name = "IndexStatus",
-    module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
-)]
+#[pyclass(name = "IndexStatus", module = "ai_session_search._native", frozen)]
 struct NativeIndexStatus {
     #[pyo3(get)]
     unindexed_files: i64,
@@ -4455,8 +4442,7 @@ struct NativeIndexStatus {
 #[pyclass(
     name = "IndexReadinessStatus",
     module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
+    frozen
 )]
 struct NativeIndexReadinessStatus {
     #[pyo3(get)]
@@ -4472,8 +4458,7 @@ struct NativeIndexReadinessStatus {
 #[pyclass(
     name = "IndexRefreshStatus",
     module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
+    frozen
 )]
 struct NativeIndexRefreshStatus {
     #[pyo3(get)]
@@ -4549,12 +4534,7 @@ impl From<IndexStatus> for NativeIndexStatus {
 
 #[derive(Clone)]
 /// Discovery, parser, index, CLI, and resume status for one provider.
-#[pyclass(
-    name = "ProviderHealth",
-    module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
-)]
+#[pyclass(name = "ProviderHealth", module = "ai_session_search._native", frozen)]
 struct NativeProviderHealth {
     #[pyo3(get)]
     unindexed_files: i64,
@@ -4609,8 +4589,7 @@ impl From<ProviderHealth> for NativeProviderHealth {
 #[pyclass(
     name = "UnknownConfigKey",
     module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
+    frozen
 )]
 struct NativeUnknownConfigKey {
     #[pyo3(get)]
@@ -4643,8 +4622,7 @@ struct NativeDiagnosticStatus {
 #[pyclass(
     name = "ProviderDiscoveryWarning",
     module = "ai_session_search._native",
-    frozen,
-    skip_from_py_object
+    frozen
 )]
 struct NativeProviderDiscoveryWarning {
     #[pyo3(get)]
