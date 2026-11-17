@@ -24,8 +24,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Security
 
 1. `deny.toml` records RUSTSEC-2026-0543, which reports `chrono` as unmaintained with no
-   vulnerability and no patched version. `rmcp` and `rusqlite` require `chrono`, so it stays in
-   the dependency graph.
+   vulnerability and no patched version. aise's own date types and `rmcp` use `chrono`, so it
+   stays in the dependency graph.
 
 ## [1.1.0rc1] - 2026-11-15
 

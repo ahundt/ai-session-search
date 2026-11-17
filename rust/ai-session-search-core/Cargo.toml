@@ -44,8 +44,8 @@ interim = { version = "0.2.1", features = ["jiff_0_2"] }
 # jiff 1.0 (released 2026-11-15) waits on interim: interim 0.2.2 supports only jiff 0.1 and 0.2,
 # and its jiff_1 feature exists only on upstream main (commit cb70edba0771). Upgrade as soon as
 # an interim release after 0.2.2 ships jiff_1: set `jiff = "1"`, switch interim to `jiff_1`, and
-# rename Zoned -> ZonedDateTime and to_zoned -> to_zoned_datetime in dates.rs and clippy.toml.
-# No jiff type is public, so the upgrade needs no breaking change.
+# rename Zoned -> ZonedDateTime in dates.rs and clippy.toml and to_zoned -> to_zoned_datetime in
+# dates.rs. No public signature names a jiff type, so the upgrade needs no breaking change.
 jiff = "0.2.38"
 # Edits JSONC client configs (Zed settings.json, VS Code mcp.json, kilo.jsonc) without dropping
 # their comments; `serde` reads them into serde_json values for status checks.
