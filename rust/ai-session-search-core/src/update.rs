@@ -642,8 +642,16 @@ fn update_action_for_release(
 fn release_phases() -> impl Iterator<Item = (&'static str, &'static str)> {
     include_str!("release-phases.txt")
         .lines()
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| line.split_once(' '))
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next(), fields.next()) {
+                (Some(cargo), Some(python), None) => (cargo, python),
+                _ => panic!(
+                    "release-phases.txt row {line:?} must be \"<cargo phase> <python phase>\""
+                ),
+            }
+        })
 }
 
 fn python_version(version: &Version) -> Result<String> {
@@ -1506,6 +1514,15 @@ fn unix_seconds() -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn release_phase_table_rows_all_parse() {
+        // A malformed row panics instead of silently dropping a phase.
+        assert_eq!(
+            release_phases().collect::<Vec<_>>(),
+            [("alpha", "a"), ("beta", "b"), ("rc", "rc")]
+        );
+    }
+
     use super::*;
     use tempfile::TempDir;
 
