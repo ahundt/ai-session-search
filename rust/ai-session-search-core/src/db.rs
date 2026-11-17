@@ -2612,6 +2612,123 @@ impl Db {
         )
     }
 
+    fn begin_fork_publication(
+        &self,
+        session: &SessionRecord,
+        full: Option<&ParsedSession>,
+        new_edits: Option<&[FileEdit]>,
+        aliases: &[String],
+    ) -> Result<(Transaction<'_>, Option<HashMap<String, PreparedFork>>)> {
+        // Three speculative preparations bound wasted I/O under contention. The fourth
+        // attempt uses the original locked reconciliation instead of retrying indefinitely.
+        // Pi-family parsing also depends on parent source files, so it retains the locked path.
+        let mut changed_sources = std::collections::HashSet::new();
+        for _ in 0..3 {
+            if session.provider != Provider::Codex
+                || new_edits.is_some_and(|edits| edits.is_empty())
+            {
+                break;
+            }
+            let version: i64 = self
+                .conn
+                .query_row("pragma data_version", [], |r| r.get(0))?;
+            let changes = self.conn.total_changes();
+            let read =
+                Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Deferred)?;
+            let mut extra_keys = std::collections::HashSet::new();
+            let has_children = read
+                .prepare_cached(CODEX_FORK_CHILDREN_SQL)?
+                .exists([&session.id])?;
+            if let Some(parsed) = full.filter(|_| has_children) {
+                // A retracted publisher key is either recovered locally or still held by
+                // an ancestor. Thus this union describes its post-publication key set even
+                // when counted reconciliation removes local copies. Follow pending ancestry,
+                // not the stored link that this publication may replace.
+                for edit in parsed.file_edits.iter().chain(&parsed.retracted.file_edits) {
+                    extra_keys.insert(parsed_file_edit_keys(edit)?.edit);
+                }
+                let mut retired = std::collections::HashSet::new();
+                for path in std::iter::once(&session.source_path).chain(aliases) {
+                    let ids = read
+                        .prepare_cached(SESSION_RETIREMENT_SQL)?
+                        .query_map(params![session.provider.as_str(), path, session.id], |r| {
+                            r.get::<_, String>(0)
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    retired.extend(ids);
+                }
+                for id in std::iter::once(&session.id).chain(&retired) {
+                    let mut statement = read.prepare_cached(CODEX_FORK_CHILD_EDITS_SQL)?;
+                    let mut rows = statement.query([id])?;
+                    while let Some(row) = rows.next()? {
+                        extra_keys.insert(fork_probe_edit_key(row)?);
+                    }
+                }
+                extra_keys.extend(fork_ancestor_edit_counts(&read, session, &retired)?.into_keys());
+            }
+            let probe_edits = if full.is_some() {
+                Some(&[][..])
+            } else {
+                new_edits
+            };
+            let sources = select_fork_sources(&read, session, probe_edits, &extra_keys)?;
+            read.commit()?;
+            let mut prepared = HashMap::new();
+            for (id, parent, mut source) in sources {
+                let invalidate = changed_sources.contains(&source.path);
+                if invalidate {
+                    if let Some((mtime, size)) = fork_source_stamp(&source.path) {
+                        source.mtime_ns = mtime;
+                        source.size_bytes = size;
+                    }
+                }
+                let parsed = parse_fork_source(&id, &parent, &source);
+                let stamp = if parsed.is_some() {
+                    Some((source.mtime_ns, source.size_bytes))
+                } else {
+                    fork_source_stamp(&source.path)
+                };
+                prepared.insert(
+                    id,
+                    PreparedFork {
+                        source,
+                        stamp,
+                        parsed,
+                        invalidate,
+                    },
+                );
+            }
+            #[cfg(test)]
+            FORK_AFTER_PREPARATION.with(|hook| {
+                let after = hook.borrow_mut().take();
+                if let Some(mut after) = after {
+                    after(self);
+                    *hook.borrow_mut() = Some(after);
+                }
+            });
+            let tx =
+                Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+            require_index_write_compatibility(&tx)?;
+            let current: i64 = tx.query_row("pragma data_version", [], |r| r.get(0))?;
+            let mut valid = current == version && self.conn.total_changes() == changes;
+            for fork in prepared.values() {
+                if fork_source_stamp(&fork.source.path) != fork.stamp {
+                    changed_sources.insert(fork.source.path.clone());
+                    valid = false;
+                }
+            }
+            if valid {
+                return Ok((tx, Some(prepared)));
+            }
+            tx.rollback()?;
+        }
+        #[cfg(test)]
+        FORK_FALLBACKS.with(|count| count.set(count.get() + 1));
+        let tx = Transaction::new_unchecked(&self.conn, rusqlite::TransactionBehavior::Immediate)?;
+        require_index_write_compatibility(&tx)?;
+        Ok((tx, None))
+    }
+
     fn upsert_session_with_mode(
         &self,
         parsed: &ParsedSession,
@@ -2622,15 +2739,9 @@ impl Db {
         family_members: &[SourceFamilyStamp],
     ) -> Result<()> {
         self.require_write_compatibility()?;
-        // IMMEDIATE takes the write lock before the first read, so another writer committing
-        // between this transaction's reads and its first write cannot fail the upgrade with
-        // SQLITE_BUSY, which the busy handler does not retry for a deferred transaction.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
-        require_index_write_compatibility(&tx)?;
         let session = &parsed.session;
+        let (tx, prepared) =
+            self.begin_fork_publication(session, Some(parsed), None, source_aliases)?;
         // Every path this source may have been indexed under: its own and its verified aliases.
         let source_paths: Vec<&str> = std::iter::once(session.source_path.as_str())
             .chain(
@@ -2876,7 +2987,7 @@ impl Db {
         )?;
         store_parsed_file_edits(&tx, parsed, same_parser)?;
         // A repaired ancestry link can change descendants even without changing these edits.
-        reconcile_codex_fork_edits(&tx, session, None)?;
+        reconcile_codex_fork_edits(&tx, session, None, prepared.as_ref())?;
         if kept_messages_missing_from_parse {
             // The session holds rows this parse lacks, so its text, span and count describe the
             // union rather than the parse alone.
@@ -3087,14 +3198,8 @@ impl Db {
     ) -> Result<()> {
         self.require_write_compatibility()?;
         let session = &tail.session;
-        // IMMEDIATE for the same reason as `upsert_session_with_mode`: the reads below precede
-        // the first write.
-        let tx = rusqlite::Transaction::new_unchecked(
-            &self.conn,
-            rusqlite::TransactionBehavior::Immediate,
-        )?;
-
-        require_index_write_compatibility(&tx)?;
+        let (tx, prepared) =
+            self.begin_fork_publication(session, None, Some(&tail.new_file_edits), &[])?;
         // New messages and edits continue after the highest stored seq. Stored seqs can have
         // gaps (rows deleted without renumbering), so the row count is not the next free seq:
         // numbering from it reused existing seqs and left one (session_id, seq) naming two
@@ -3116,7 +3221,12 @@ impl Db {
         )?;
 
         if !tail.new_file_edits.is_empty() {
-            reconcile_codex_fork_edits(&tx, session, Some(&tail.new_file_edits))?;
+            reconcile_codex_fork_edits(
+                &tx,
+                session,
+                Some(&tail.new_file_edits),
+                prepared.as_ref(),
+            )?;
         }
 
         // Advance volatile session metadata; updated_at/last_message_at only move forward,
@@ -8287,31 +8397,11 @@ fn store_parsed_file_edits(
     let session = &parsed.session;
     let mut file_edits: Vec<&FileEdit> = parsed.file_edits.iter().collect();
     let mut retracted_file_edits = Vec::new();
-    let mut parent = codex_fork_parent(session).filter(|_| !parsed.retracted.file_edits.is_empty());
-    // Only indexed copies prove recovery safety; consume each ancestor occurrence once.
-    // For depth D, S sessions, F indexed edits, E ancestor edits and B ancestor bytes:
-    // O(D(log S + log F) + E log E + B) time; O(D + E) keys plus the largest edit body.
-    let mut parent_edits = HashMap::new();
-    let mut visited = std::collections::HashSet::new();
-    while let Some(id) = parent {
-        if id == session.id || !visited.insert(id.clone()) {
-            break;
-        }
-        for (_, _, keys) in stored_file_edit_keys(tx, &id)? {
-            *parent_edits.entry(keys.edit).or_insert(0) += 1;
-        }
-        parent = tx
-            .query_row(
-                "select case when json_valid(raw_metadata_json) then
-                    case when json_type(raw_metadata_json, '$.forked_from_id') = 'text'
-                    then provider || ':' || json_extract(raw_metadata_json, '$.forked_from_id') end
-                 end from sessions where id = ?1 and provider in ('codex', 'pi', 'prime-agent')",
-                [&id],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()?
-            .flatten();
-    }
+    let mut parent_edits = if parsed.retracted.file_edits.is_empty() {
+        HashMap::new()
+    } else {
+        fork_ancestor_edit_counts(tx, session, &Default::default())?
+    };
     for edit in &parsed.retracted.file_edits {
         if matches!(
             session.provider,
@@ -8480,8 +8570,16 @@ fn store_parsed_file_edits(
 }
 
 #[cfg(test)]
+type ForkPreparationHook = Box<dyn FnMut(&Db)>;
+
+#[cfg(test)]
 thread_local! {
     pub(crate) static CODEX_FORK_AFTER_READ: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+    static FORK_AFTER_PREPARATION: std::cell::RefCell<Option<ForkPreparationHook>> = const { std::cell::RefCell::new(None) };
+    static FORK_BEFORE_SOURCE_READ: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+    static FORK_LOCKED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FORK_SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FORK_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 const CODEX_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f.size_bytes
@@ -8528,6 +8626,41 @@ pub(crate) const CODEX_FORK_CHILD_EDITS_SQL: &str =
     "select tool, file_path, new_content, edits_json
      from file_edits indexed by idx_file_edits_session where session_id = ?1";
 
+fn fork_ancestor_edit_counts(
+    tx: &Connection,
+    session: &SessionRecord,
+    retired: &std::collections::HashSet<String>,
+) -> Result<HashMap<RowDigest, usize>> {
+    let mut parent = codex_fork_parent(session);
+    // Only indexed copies prove recovery safety; consume each ancestor occurrence once.
+    // For depth D, S sessions, F indexed edits, E ancestor edits and B ancestor bytes:
+    // O(D(log S + log F) + E log E + B) time; O(D + E) keys plus the largest edit body.
+    let mut parent_edits = HashMap::new();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(id) = parent {
+        if id == session.id || retired.contains(&id) || !visited.insert(id.clone()) {
+            break;
+        }
+        let mut statement = tx.prepare_cached(CODEX_FORK_CHILD_EDITS_SQL)?;
+        let mut rows = statement.query([&id])?;
+        while let Some(row) = rows.next()? {
+            *parent_edits.entry(fork_probe_edit_key(row)?).or_insert(0) += 1;
+        }
+        parent = tx
+            .query_row(
+                "select case when json_valid(raw_metadata_json) then
+                    case when json_type(raw_metadata_json, '$.forked_from_id') = 'text'
+                    then provider || ':' || json_extract(raw_metadata_json, '$.forked_from_id') end
+                 end from sessions where id = ?1 and provider in ('codex', 'pi', 'prime-agent')",
+                [&id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+    }
+    Ok(parent_edits)
+}
+
 fn fork_probe_edit_key(row: &rusqlite::Row<'_>) -> Result<RowDigest> {
     Ok(file_edit_content_key(
         row.get_ref(0)?.as_str()?,
@@ -8547,21 +8680,23 @@ fn fork_probe_edit_key(row: &rusqlite::Row<'_>) -> Result<RowDigest> {
 /// it never reads the publisher's stored edits. Child rows use the session edit index, so
 /// unrelated edits to the same paths are never visited. Hash matches only authorize a reparse;
 /// the existing ancestry reconciliation still decides whether an edit may be retired.
-/// No candidate means no child source bytes are read. Each candidate is parsed at most once
-/// and reads its ancestry (bounded by chain depth, stopping at cycles). Memory adds one parsed
-/// fork, its stored/parsed keys and ancestor keys, plus visited ancestor identities and the
-/// largest stored edit body.
-/// This work extends the writer transaction; providers without copied fork entries skip it.
-fn reconcile_codex_fork_edits(
-    tx: &Transaction<'_>,
+/// No candidate means no child source bytes are read. Preparation retains candidate paths and
+/// parsed edit rows, discarding conversation bodies after each parse. Retained memory adds the
+/// sum of candidate edit bytes and session metadata; peak parser memory adds one source's parsed
+/// rows. Publication repeats exact selection under the writer lock and applies cached edits
+/// against current ancestry. Codex opens descendant sources under the write lock only after
+/// exhausting preparation retries; Pi-family publications retain their original locked path.
+fn select_fork_sources(
+    tx: &Connection,
     session: &SessionRecord,
     new_edits: Option<&[FileEdit]>,
-) -> Result<()> {
+    extra_keys: &std::collections::HashSet<RowDigest>,
+) -> Result<Vec<(String, String, SourceFile)>> {
     if !matches!(
         session.provider,
         Provider::Codex | Provider::Pi | Provider::PrimeAgent
     ) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut statement = tx.prepare_cached(if session.provider == Provider::Codex {
         CODEX_FORK_CHILDREN_SQL
@@ -8569,7 +8704,7 @@ fn reconcile_codex_fork_edits(
         PI_FORK_CHILDREN_SQL
     })?;
     if !statement.exists([&session.id])? {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut publisher_keys = std::collections::HashSet::new();
     if let Some(edits) = new_edits {
@@ -8587,11 +8722,12 @@ fn reconcile_codex_fork_edits(
             publisher_keys.insert(fork_probe_edit_key(row)?);
         }
     }
+    publisher_keys.extend(extra_keys);
     if publisher_keys.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
+    let mut selected = Vec::new();
     let mut child_edits = tx.prepare_cached(CODEX_FORK_CHILD_EDITS_SQL)?;
-    let mut adapter = None;
     let mut pending = vec![session.id.clone()];
     let mut visited = std::collections::HashSet::from([session.id.clone()]);
     while let Some(parent) = pending.pop() {
@@ -8629,59 +8765,116 @@ fn reconcile_codex_fork_edits(
             if !matching {
                 continue;
             }
-            let adapter = adapter
-                .get_or_insert_with(|| crate::providers::codex::CodexAdapter::new(Vec::new()));
-            let current = || {
-                fs::metadata(&source.path).ok().is_some_and(|metadata| {
-                    metadata.len() as i64 == source.size_bytes
-                        && metadata
-                            .modified()
-                            .ok()
-                            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                            .is_some_and(|time| time.as_nanos() as i64 == source.mtime_ns)
-                })
-            };
-            let parsed = (|| {
-                if !current() {
-                    return None;
-                }
-                let reader = crate::source::open_source_reader(&source.path).ok()?;
-                let reader = std::io::BufReader::new(reader);
-                let parsed = match session.provider {
-                    Provider::Pi => crate::providers::pi::PiAdapter::new(Vec::new())
-                        .parse_reader(reader, &source.path),
-                    Provider::PrimeAgent => {
-                        crate::providers::pi::PiAdapter::prime_agent(Vec::new())
-                            .parse_reader(reader, &source.path)
-                    }
-                    _ => adapter.parse_reader(reader, &source.path),
-                }
-                .ok()?;
-                #[cfg(test)]
-                CODEX_FORK_AFTER_READ.with(|hook| {
-                    if let Some(after_read) = hook.take() {
-                        after_read(&source.path);
-                    }
-                });
-                (current()
-                    && parsed.session.id == id
-                    && codex_fork_parent(&parsed.session).as_deref() == Some(&parent))
-                .then_some(parsed)
-            })();
-            let Some(mut parsed) = parsed else {
-                // Keep the archive and retry even if the source returns with an identical stamp.
-                tx.execute(
-                    "update files_seen set parse_version = '', tail_byte_offset = null,
-                        prefix_fingerprint = null where provider = ?2 and source_path = ?1",
-                    params![
-                        crate::util::normalize_path(&source.path),
-                        session.provider.as_str()
-                    ],
-                )?;
-                continue;
-            };
-            crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
+            selected.push((id, parent.clone(), source));
+        }
+    }
+    Ok(selected)
+}
+
+fn fork_source_stamp(path: &Path) -> Option<(i64, i64)> {
+    let metadata = fs::metadata(path).ok()?;
+    let mtime = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    Some((mtime, metadata.len() as i64))
+}
+
+fn parse_fork_source(id: &str, parent: &str, source: &SourceFile) -> Option<ParsedSession> {
+    let current = || fork_source_stamp(&source.path) == Some((source.mtime_ns, source.size_bytes));
+    if !current() {
+        return None;
+    }
+    #[cfg(test)]
+    {
+        FORK_SOURCE_READS.with(|count| count.set(count.get() + 1));
+        FORK_BEFORE_SOURCE_READ.with(|hook| {
+            if let Some(before) = hook.get() {
+                before(&source.path);
+            }
+        });
+    }
+    let reader = std::io::BufReader::new(crate::source::open_source_reader(&source.path).ok()?);
+    let mut parsed = match source.provider {
+        Provider::Pi => {
+            crate::providers::pi::PiAdapter::new(Vec::new()).parse_reader(reader, &source.path)
+        }
+        Provider::PrimeAgent => crate::providers::pi::PiAdapter::prime_agent(Vec::new())
+            .parse_reader(reader, &source.path),
+        _ => crate::providers::codex::CodexAdapter::new(Vec::new())
+            .parse_reader(reader, &source.path),
+    }
+    .ok()?;
+    #[cfg(test)]
+    CODEX_FORK_AFTER_READ.with(|hook| {
+        if let Some(after_read) = hook.take() {
+            after_read(&source.path);
+        }
+    });
+    if !current()
+        || parsed.session.id != id
+        || codex_fork_parent(&parsed.session).as_deref() != Some(parent)
+    {
+        return None;
+    }
+    crate::util::backfill_parsed_dates(&mut parsed, source.mtime_ns);
+    // Reconciliation retains only edits, not descendant conversation bodies.
+    parsed.messages = Vec::new();
+    parsed.transcript_text = String::new();
+    parsed.retracted.messages = Vec::new();
+    parsed.retracted.transcript = Vec::new();
+    Some(parsed)
+}
+
+struct PreparedFork {
+    source: SourceFile,
+    stamp: Option<(i64, i64)>,
+    parsed: Option<ParsedSession>,
+    invalidate: bool,
+}
+
+fn invalidate_fork_source(tx: &Transaction<'_>, source: &SourceFile) -> Result<()> {
+    tx.execute(
+        "update files_seen set parse_version = '', tail_byte_offset = null,
+            prefix_fingerprint = null where provider = ?2 and source_path = ?1",
+        params![
+            crate::util::normalize_path(&source.path),
+            source.provider.as_str()
+        ],
+    )?;
+    Ok(())
+}
+
+fn reconcile_codex_fork_edits(
+    tx: &Transaction<'_>,
+    session: &SessionRecord,
+    new_edits: Option<&[FileEdit]>,
+    prepared: Option<&HashMap<String, PreparedFork>>,
+) -> Result<()> {
+    for (id, parent, source) in select_fork_sources(tx, session, new_edits, &Default::default())? {
+        if let Some(prepared) = prepared {
+            let fork = prepared.get(&id).ok_or_else(|| {
+                anyhow::anyhow!("fork preparation omitted selected descendant {id}; retry indexing")
+            })?;
+            anyhow::ensure!(
+                fork_source_stamp(&fork.source.path) == fork.stamp,
+                "fork source {} changed after preparation; retry indexing",
+                fork.source.path.display()
+            );
+            if fork.invalidate {
+                invalidate_fork_source(tx, &source)?;
+            }
+            if let Some(parsed) = &fork.parsed {
+                store_parsed_file_edits(tx, parsed, true)?;
+            } else {
+                invalidate_fork_source(tx, &source)?;
+            }
+        } else if let Some(parsed) = parse_fork_source(&id, &parent, &source) {
             store_parsed_file_edits(tx, &parsed, true)?;
+        } else {
+            invalidate_fork_source(tx, &source)?;
         }
     }
     Ok(())
@@ -10062,6 +10255,245 @@ mod tests {
 
     include!("db/publication_benchmark.rs");
     include!("db/fork_publication_benchmark.rs");
+
+    #[test]
+    fn fork_preparation_releases_writer_lock() {
+        fork_preparation_case("lock");
+    }
+
+    #[test]
+    fn fork_preparation_rereads_changed_source() {
+        fork_preparation_case("source");
+    }
+
+    #[test]
+    fn fork_preparation_detects_peer_publication() {
+        fork_preparation_case("peer");
+    }
+
+    #[test]
+    fn fork_preparation_falls_back_after_three_conflicts() {
+        fork_preparation_case("fallback");
+    }
+
+    #[test]
+    fn fork_preparation_dropped_ancestry_reads_no_sources() {
+        fork_preparation_case("unlink");
+    }
+
+    fn fork_preparation_case(mode: &'static str) {
+        for full in [false, true] {
+            if mode == "unlink" && !full {
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db::open(&dir.path().join("index.db")).unwrap();
+            let adapter = crate::providers::codex::CodexAdapter::new(Vec::new());
+            let mutation = format!(
+                "{}\n{}\n",
+                serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":"edit","name":"apply_patch","input":"*** Begin Patch\n*** Add File: /synthetic/shared.rs\n+content\n*** End Patch"}}),
+                serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"edit","output":"Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/shared.rs\n"}})
+            );
+            let child = dir.path().join("child.jsonl");
+            fs::write(&child, format!("{}\n{mutation}{}\n",
+                serde_json::json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"parent"}}),
+                serde_json::json!({"type":"event_msg","payload":{"type":"thread_settings_applied"}}))).unwrap();
+            let parse = |path: &Path| {
+                let mut parsed = adapter
+                    .parse_reader(std::io::BufReader::new(fs::File::open(path).unwrap()), path)
+                    .unwrap();
+                crate::util::backfill_parsed_dates(&mut parsed, fork_source_stamp(path).unwrap().0);
+                parsed
+            };
+            let parsed = parse(&child);
+            let meta = fs::metadata(&child).unwrap();
+            let mtime = meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as i64;
+            db.upsert_session(&parsed, mtime, meta.len() as i64)
+                .unwrap();
+            let parent = dir.path().join("parent.jsonl");
+            let header = serde_json::json!({"type":"session_meta","payload":{"id":"parent"}});
+            fs::write(&parent, format!("{header}\n")).unwrap();
+            db.upsert_session(&parse(&parent), 1, 1).unwrap();
+            fs::write(&parent, format!("{header}\n{mutation}")).unwrap();
+            if mode == "unlink" {
+                let ancestor = dir.path().join("ancestor.jsonl");
+                fs::write(
+                    &ancestor,
+                    fs::read_to_string(&parent)
+                        .unwrap()
+                        .replace("\"parent\"", "\"ancestor\""),
+                )
+                .unwrap();
+                let (mtime, size) = fork_source_stamp(&ancestor).unwrap();
+                db.upsert_session(&parse(&ancestor), mtime, size).unwrap();
+                db.conn
+                    .execute(
+                        "update sessions set raw_metadata_json = ?1 where id = 'codex:parent'",
+                        [r#"{"forked_from_id":"ancestor"}"#],
+                    )
+                    .unwrap();
+                fs::write(&parent, format!("{header}\n")).unwrap();
+            }
+            let parsed = parse(&parent);
+            FORK_SOURCE_READS.with(|count| count.set(0));
+            FORK_FALLBACKS.with(|count| count.set(0));
+            FORK_LOCKED_READS.with(|count| count.set(0));
+            FORK_BEFORE_SOURCE_READ.with(|hook| {
+                hook.set(Some(|path| {
+                    let peer = Connection::open(path.parent().unwrap().join("index.db")).unwrap();
+                    peer.busy_timeout(std::time::Duration::ZERO).unwrap();
+                    match peer.execute_batch("begin immediate") {
+                        Ok(()) => peer.execute_batch("rollback").unwrap(),
+                        Err(error) => {
+                            assert_eq!(
+                                error.sqlite_error_code(),
+                                Some(rusqlite::ErrorCode::DatabaseBusy)
+                            );
+                            FORK_LOCKED_READS.with(|count| count.set(count.get() + 1));
+                        }
+                    }
+                }))
+            });
+            let phases = std::rc::Rc::new(std::cell::Cell::new(0));
+            let phase_count = phases.clone();
+            let child_path = child.clone();
+            let db_path = dir.path().join("index.db");
+            let later_edit = mutation
+                .replace("shared.rs", "later.rs")
+                .replace("+content", "+later content");
+            let mut first = true;
+            FORK_AFTER_PREPARATION.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |_| {
+                    phase_count.set(phase_count.get() + 1);
+                    if !first && mode != "fallback" {
+                        return;
+                    }
+                    first = false;
+                    match mode {
+                        "source" => {
+                            use std::io::Write as _;
+                            fs::OpenOptions::new()
+                                .append(true)
+                                .open(&child_path)
+                                .unwrap()
+                                .write_all(later_edit.as_bytes())
+                                .unwrap();
+                        }
+                        "peer" => {
+                            let sibling = child_path.with_file_name("sibling.jsonl");
+                            let body = fs::read_to_string(&child_path)
+                                .unwrap()
+                                .replace("\"child\"", "\"sibling\"")
+                                + &later_edit;
+                            fs::write(&sibling, body).unwrap();
+                            let adapter = crate::providers::codex::CodexAdapter::new(Vec::new());
+                            let mut parsed = adapter
+                                .parse_reader(
+                                    std::io::BufReader::new(fs::File::open(&sibling).unwrap()),
+                                    &sibling,
+                                )
+                                .unwrap();
+                            let (mtime, size) = fork_source_stamp(&sibling).unwrap();
+                            crate::util::backfill_parsed_dates(&mut parsed, mtime);
+                            Db::open(&db_path)
+                                .unwrap()
+                                .upsert_session(&parsed, mtime, size)
+                                .unwrap();
+                        }
+                        "fallback" => {
+                            let mut parsed = archive_session(Vec::new(), Vec::new());
+                            parsed.session.id = "codex:peer".into();
+                            parsed.session.provider_session_id = "peer".into();
+                            parsed.session.source_path = child_path
+                                .with_file_name("peer.jsonl")
+                                .to_string_lossy()
+                                .into_owned();
+                            Db::open(&db_path)
+                                .unwrap()
+                                .upsert_session(&parsed, 1, 1)
+                                .unwrap();
+                        }
+                        _ => {}
+                    }
+                }))
+            });
+            CODEX_FORK_AFTER_READ.with(|hook| {
+                hook.set(Some(|path| {
+                    let peer = Connection::open(path.parent().unwrap().join("index.db")).unwrap();
+                    peer.busy_timeout(std::time::Duration::ZERO).unwrap();
+                    peer.execute_batch("begin immediate; rollback;").unwrap();
+                }))
+            });
+            if full {
+                db.upsert_session(&parsed, 2, 2).unwrap();
+            } else {
+                let tail = crate::tail::TailParse {
+                    session: parsed.session,
+                    new_messages: Vec::new(),
+                    new_file_edits: parsed.file_edits,
+                    new_transcript: String::new(),
+                    new_tail_offset: 2,
+                    new_fingerprint: String::new(),
+                    overlap_digest: String::new(),
+                    new_overlap_digest: String::new(),
+                };
+                db.append_tail(&tail, 2, 2).unwrap();
+            }
+            assert_eq!(
+                CODEX_FORK_AFTER_READ.with(|hook| hook.take()).is_none(),
+                mode != "unlink"
+            );
+            FORK_AFTER_PREPARATION.with(|hook| {
+                hook.borrow_mut().take();
+            });
+            FORK_BEFORE_SOURCE_READ.with(|hook| hook.set(None));
+            let (reads, fallbacks, attempts) = match mode {
+                "source" => (2, 0, 2),
+                "peer" => (3, 0, 2),
+                "fallback" => (4, 1, 3),
+                "unlink" => (0, 0, 1),
+                _ => (1, 0, 1),
+            };
+            assert_eq!(FORK_SOURCE_READS.with(|count| count.get()), reads);
+            assert_eq!(FORK_FALLBACKS.with(|count| count.get()), fallbacks);
+            assert_eq!(FORK_LOCKED_READS.with(|count| count.get()), fallbacks);
+            assert_eq!(phases.get(), attempts);
+            assert_eq!(
+                db.file_edit_count().unwrap(),
+                if mode == "source" || mode == "peer" || mode == "unlink" {
+                    2
+                } else {
+                    1
+                }
+            );
+            let rows = |db: &Db| {
+                db.conn.prepare("select json_array(session_id,provider,seq,ts,tool,file_path,file_name,new_content,edits_json) from file_edits order by session_id,seq,id").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+            };
+            let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+            for path in [&parent, &child] {
+                let (mtime, size) = fork_source_stamp(path).unwrap();
+                fresh.upsert_session(&parse(path), mtime, size).unwrap();
+            }
+            if mode == "peer" {
+                let sibling = child.with_file_name("sibling.jsonl");
+                let (mtime, size) = fork_source_stamp(&sibling).unwrap();
+                fresh.upsert_session(&parse(&sibling), mtime, size).unwrap();
+            }
+            if mode == "unlink" {
+                let ancestor = dir.path().join("ancestor.jsonl");
+                let (mtime, size) = fork_source_stamp(&ancestor).unwrap();
+                fresh
+                    .upsert_session(&parse(&ancestor), mtime, size)
+                    .unwrap();
+            }
+            assert_eq!(rows(&db), rows(&fresh));
+        }
+    }
 
     #[test]
     fn codex_fork_matching_edit_uses_family_session_indexes() {
