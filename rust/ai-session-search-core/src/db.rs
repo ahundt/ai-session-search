@@ -8576,11 +8576,21 @@ type ForkPreparationHook = Box<dyn FnMut(&Db)>;
 thread_local! {
     pub(crate) static CODEX_FORK_AFTER_READ: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
     static FORK_AFTER_PREPARATION: std::cell::RefCell<Option<ForkPreparationHook>> = const { std::cell::RefCell::new(None) };
-    static FORK_BEFORE_SOURCE_READ: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
-    static FORK_LOCKED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static FORK_SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static FORK_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FORK_BEFORE_SOURCE_READ: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+    pub(crate) static FORK_LOCKED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FORK_SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static FORK_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FORK_BEFORE_RECONCILE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Count one descendant source read made while another connection cannot take the writer lock.
+#[cfg(test)]
+pub(crate) fn probe_fork_writer_lock(db_path: &Path) {
+    let peer = Connection::open(db_path).unwrap();
+    peer.busy_timeout(std::time::Duration::ZERO).unwrap();
+    if peer.execute_batch("begin immediate; rollback;").is_err() {
+        FORK_LOCKED_READS.with(|count| count.set(count.get() + 1));
+    }
 }
 
 const CODEX_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f.size_bytes
@@ -10641,6 +10651,414 @@ mod tests {
         index(&fresh, &parent);
         index(&fresh, &child);
         assert_eq!(rows(&db), rows(&fresh));
+    }
+
+    // Fixtures for fork publication across providers. A Codex descendant replays its parent's
+    // edits before `thread_settings_applied`; a Pi-family descendant repeats the parent's records
+    // byte for byte while the parent file holds them.
+
+    fn fork_parse(provider: Provider, path: &Path) -> ParsedSession {
+        let reader = std::io::BufReader::new(fs::File::open(path).unwrap());
+        let mut parsed = match provider {
+            Provider::Pi => {
+                crate::providers::pi::PiAdapter::new(Vec::new()).parse_reader(reader, path)
+            }
+            Provider::PrimeAgent => {
+                crate::providers::pi::PiAdapter::prime_agent(Vec::new()).parse_reader(reader, path)
+            }
+            _ => crate::providers::codex::CodexAdapter::new(Vec::new()).parse_reader(reader, path),
+        }
+        .unwrap();
+        crate::util::backfill_parsed_dates(&mut parsed, fork_source_stamp(path).unwrap().0);
+        parsed
+    }
+
+    fn fork_index(db: &Db, provider: Provider, path: &Path) {
+        let (mtime, size) = fork_source_stamp(path).unwrap();
+        db.upsert_session(&fork_parse(provider, path), mtime, size)
+            .unwrap();
+    }
+
+    fn fork_rows(db: &Db) -> Vec<String> {
+        db.conn.prepare("select json_array(session_id,provider,seq,ts,tool,file_path,file_name,new_content,edits_json) from file_edits order by session_id,seq,id").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    }
+
+    fn fork_edit_count_of(db: &Db, session_id: &str) -> i64 {
+        db.conn
+            .query_row(
+                "select count(*) from file_edits where session_id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn fork_header(provider: Provider, id: &str, parent: Option<&str>) -> String {
+        match (provider, parent) {
+            (Provider::Codex, None) => {
+                serde_json::json!({"type":"session_meta","payload":{"id":id}})
+            }
+            (Provider::Codex, Some(parent)) => {
+                serde_json::json!({"type":"session_meta","payload":{"id":id,"forked_from_id":parent}})
+            }
+            (_, None) => serde_json::json!({"type":"session","id":id}),
+            (_, Some(parent)) => {
+                serde_json::json!({"type":"session","id":id,"parentSession":format!("{parent}.jsonl")})
+            }
+        }
+        .to_string()
+    }
+
+    /// One file edit as its provider records it: a patch and its result, or a write call and its result.
+    fn fork_edit(provider: Provider, name: &str) -> String {
+        if provider == Provider::Codex {
+            return fork_edit_text(name);
+        }
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"message","id":format!("call-{name}"),"message":{"role":"assistant","content":[{"type":"toolCall","id":name,"name":"write","arguments":{"path":format!("/synthetic/{name}.rs"),"content":"content"}}]}}),
+            serde_json::json!({"type":"message","id":format!("result-{name}"),"message":{"role":"toolResult","toolCallId":name,"toolName":"write","isError":false,"content":[{"type":"text","text":"ok"}]}})
+        )
+    }
+
+    /// A record every Pi-family fork repeats from its parent, which makes it a recognised fork.
+    fn fork_pi_shared_record() -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"message","id":"copied","message":{"role":"user","content":"ancestor input"}})
+        )
+    }
+
+    fn fork_parent_text(provider: Provider, id: &str, edits: &[&str]) -> String {
+        let mut text = format!("{}\n", fork_header(provider, id, None));
+        if provider != Provider::Codex {
+            text.push_str(&fork_pi_shared_record());
+        }
+        for name in edits {
+            text.push_str(&fork_edit(provider, name));
+        }
+        text
+    }
+
+    fn fork_child_text(
+        provider: Provider,
+        id: &str,
+        parent: &str,
+        replayed: &[&str],
+        own: &[&str],
+    ) -> String {
+        let mut text = format!("{}\n", fork_header(provider, id, Some(parent)));
+        if provider != Provider::Codex {
+            text.push_str(&fork_pi_shared_record());
+        }
+        for name in replayed {
+            text.push_str(&fork_edit(provider, name));
+        }
+        if provider == Provider::Codex {
+            text.push_str(
+                "{\"type\":\"event_msg\",\"payload\":{\"type\":\"thread_settings_applied\"}}\n",
+            );
+        }
+        for name in own {
+            text.push_str(&fork_edit(provider, name));
+        }
+        text
+    }
+
+    fn fork_start_counting() {
+        FORK_SOURCE_READS.with(|count| count.set(0));
+        FORK_FALLBACKS.with(|count| count.set(0));
+        FORK_LOCKED_READS.with(|count| count.set(0));
+        FORK_BEFORE_SOURCE_READ.with(|hook| {
+            hook.set(Some(|path| {
+                probe_fork_writer_lock(&path.parent().unwrap().join("index.db"))
+            }))
+        });
+    }
+
+    /// Descendant source reads, locked-path fallbacks, and reads made while the writer lock was held.
+    fn fork_stop_counting() -> (usize, usize, usize) {
+        FORK_BEFORE_SOURCE_READ.with(|hook| hook.set(None));
+        (
+            FORK_SOURCE_READS.with(|count| count.get()),
+            FORK_FALLBACKS.with(|count| count.get()),
+            FORK_LOCKED_READS.with(|count| count.get()),
+        )
+    }
+
+    /// The number of preparation phases that ran before a write transaction opened.
+    fn fork_count_preparations() -> std::rc::Rc<std::cell::Cell<usize>> {
+        let phases = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = phases.clone();
+        FORK_AFTER_PREPARATION.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |_: &Db| counted.set(counted.get() + 1)))
+        });
+        phases
+    }
+
+    fn fork_stop_preparations() {
+        FORK_AFTER_PREPARATION.with(|hook| {
+            hook.borrow_mut().take();
+        });
+    }
+
+    fn fork_publish(db: &Db, parsed: &ParsedSession, tail: bool) {
+        if tail {
+            let tail = crate::tail::TailParse {
+                session: parsed.session.clone(),
+                new_messages: Vec::new(),
+                new_file_edits: parsed.file_edits.clone(),
+                new_transcript: String::new(),
+                new_tail_offset: 2,
+                new_fingerprint: String::new(),
+                overlap_digest: String::new(),
+                new_overlap_digest: String::new(),
+            };
+            db.append_tail(&tail, 2, 2).unwrap();
+        } else {
+            db.upsert_session(parsed, 2, 2).unwrap();
+        }
+    }
+
+    /// A child that holds the edit `shared` and an indexed parent that does not yet.
+    struct ForkFamily {
+        dir: tempfile::TempDir,
+        db: Db,
+        provider: Provider,
+        parent: std::path::PathBuf,
+        child: std::path::PathBuf,
+    }
+
+    impl ForkFamily {
+        fn new(provider: Provider) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Db::open(&dir.path().join("index.db")).unwrap();
+            let parent = dir.path().join("parent.jsonl");
+            let child = dir.path().join("child.jsonl");
+            fs::write(&parent, fork_parent_text(provider, "parent", &[])).unwrap();
+            fs::write(
+                &child,
+                fork_child_text(provider, "child", "parent", &["shared"], &[]),
+            )
+            .unwrap();
+            fork_index(&db, provider, &child);
+            fork_index(&db, provider, &parent);
+            assert_eq!(db.file_edit_count().unwrap(), 1);
+            ForkFamily {
+                dir,
+                db,
+                provider,
+                parent,
+                child,
+            }
+        }
+
+        /// Write the parent's new edit and parse it, ready to publish.
+        fn parent_with_shared_edit(&self) -> ParsedSession {
+            fs::write(
+                &self.parent,
+                fork_parent_text(self.provider, "parent", &["shared"]),
+            )
+            .unwrap();
+            fork_parse(self.provider, &self.parent)
+        }
+
+        fn fresh_rows(&self) -> Vec<String> {
+            let fresh = Db::open(&self.dir.path().join("fresh.db")).unwrap();
+            fork_index(&fresh, self.provider, &self.parent);
+            fork_index(&fresh, self.provider, &self.child);
+            fork_rows(&fresh)
+        }
+    }
+
+    #[test]
+    fn fork_publication_parses_pi_descendants_under_the_write_lock() {
+        fork_pi_family_case(Provider::Pi);
+    }
+
+    #[test]
+    fn fork_publication_parses_prime_agent_descendants_under_the_write_lock() {
+        fork_pi_family_case(Provider::PrimeAgent);
+    }
+
+    /// Pi-family parsing reads parent source files, so these parents never prepare before the
+    /// transaction: the descendant is parsed once, with the writer lock held.
+    fn fork_pi_family_case(provider: Provider) {
+        for tail in [false, true] {
+            let family = ForkFamily::new(provider);
+            let parsed = family.parent_with_shared_edit();
+            fork_start_counting();
+            let phases = fork_count_preparations();
+            fork_publish(&family.db, &parsed, tail);
+            fork_stop_preparations();
+            let counts = fork_stop_counting();
+            assert_eq!(phases.get(), 0, "provider {provider:?}, tail {tail}");
+            // One read under the lock, counted as the one locked-path publication.
+            assert_eq!(counts, (1, 1, 1), "provider {provider:?}, tail {tail}");
+            assert_eq!(family.db.file_edit_count().unwrap(), 1);
+            assert_eq!(fork_rows(&family.db), family.fresh_rows());
+        }
+    }
+
+    #[test]
+    fn fork_preparation_selects_child_of_a_retired_alias_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let (parent, child, legacy) = (
+            dir.path().join("parent.jsonl"),
+            dir.path().join("child.jsonl"),
+            dir.path().join("legacy.jsonl"),
+        );
+        fs::write(&parent, fork_parent_text(Provider::Codex, "parent", &[])).unwrap();
+        fs::write(
+            &child,
+            fork_child_text(Provider::Codex, "child", "parent", &["shared"], &[]),
+        )
+        .unwrap();
+        // The source now parses as `codex:parent` with no edits; it was indexed as `codex:legacy`
+        // under another path, whose stored edit moves to the replacement identity.
+        fs::write(
+            &legacy,
+            fork_parent_text(Provider::Codex, "legacy", &["shared"]),
+        )
+        .unwrap();
+        fork_index(&db, Provider::Codex, &child);
+        fork_index(&db, Provider::Codex, &legacy);
+        let aliases = [crate::util::normalize_path(&legacy)];
+        let (mtime, size) = fork_source_stamp(&parent).unwrap();
+        let parsed = fork_parse(Provider::Codex, &parent);
+        assert!(parsed.file_edits.is_empty() && parsed.retracted.file_edits.is_empty());
+        fork_start_counting();
+        let phases = fork_count_preparations();
+        db.upsert_session_reconciling_sources(&parsed, mtime, size, &aliases, false)
+            .unwrap();
+        fork_stop_preparations();
+        // The child is prepared before the transaction: the retired identity's edit selects it.
+        assert_eq!(fork_stop_counting(), (1, 0, 0));
+        assert_eq!(phases.get(), 1);
+        assert_eq!(fork_edit_count_of(&db, "codex:parent"), 1);
+        assert_eq!(fork_edit_count_of(&db, "codex:child"), 0);
+        // The same publications, with the child indexed last.
+        let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+        fork_index(&fresh, Provider::Codex, &child);
+        fork_index(&fresh, Provider::Codex, &legacy);
+        fresh
+            .upsert_session_reconciling_sources(&parsed, mtime, size, &aliases, false)
+            .unwrap();
+        fork_index(&fresh, Provider::Codex, &child);
+        assert_eq!(fork_rows(&db), fork_rows(&fresh));
+    }
+
+    #[test]
+    fn fork_preparation_selects_child_of_an_edit_the_parse_retracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let (parent, child) = (
+            dir.path().join("parent.jsonl"),
+            dir.path().join("child.jsonl"),
+        );
+        // The parent replays an edit from an ancestor that is not indexed, so the edit is
+        // retracted from its own rows; its child replays the same edit.
+        fs::write(
+            &parent,
+            fork_child_text(Provider::Codex, "parent", "ancestor", &["shared"], &[]),
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            fork_child_text(Provider::Codex, "child", "parent", &["shared"], &[]),
+        )
+        .unwrap();
+        fork_index(&db, Provider::Codex, &child);
+        let parsed = fork_parse(Provider::Codex, &parent);
+        assert!(parsed.file_edits.is_empty());
+        assert_eq!(parsed.retracted.file_edits.len(), 1);
+        fork_start_counting();
+        let phases = fork_count_preparations();
+        fork_publish(&db, &parsed, false);
+        fork_stop_preparations();
+        assert_eq!(fork_stop_counting(), (1, 0, 0));
+        assert_eq!(phases.get(), 1);
+        // No indexed ancestor holds the edit, so the parent keeps it and the child drops its copy.
+        assert_eq!(fork_edit_count_of(&db, "codex:parent"), 1);
+        assert_eq!(fork_edit_count_of(&db, "codex:child"), 0);
+        let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+        fork_index(&fresh, Provider::Codex, &parent);
+        fork_index(&fresh, Provider::Codex, &child);
+        assert_eq!(fork_rows(&db), fork_rows(&fresh));
+    }
+
+    #[test]
+    fn fork_preparation_selects_child_through_an_ancestors_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let (grandparent, parent, child) = (
+            dir.path().join("grandparent.jsonl"),
+            dir.path().join("parent.jsonl"),
+            dir.path().join("child.jsonl"),
+        );
+        fs::write(
+            &grandparent,
+            fork_parent_text(Provider::Codex, "grandparent", &["shared"]),
+        )
+        .unwrap();
+        // The publisher holds no edit of its own and retracts none.
+        fs::write(
+            &parent,
+            fork_child_text(Provider::Codex, "parent", "grandparent", &[], &[]),
+        )
+        .unwrap();
+        fs::write(
+            &child,
+            fork_child_text(Provider::Codex, "child", "parent", &["shared"], &[]),
+        )
+        .unwrap();
+        fork_index(&db, Provider::Codex, &child);
+        fork_index(&db, Provider::Codex, &grandparent);
+        assert_eq!(fork_edit_count_of(&db, "codex:child"), 1);
+        let parsed = fork_parse(Provider::Codex, &parent);
+        assert!(parsed.file_edits.is_empty() && parsed.retracted.file_edits.is_empty());
+        fork_start_counting();
+        let phases = fork_count_preparations();
+        fork_publish(&db, &parsed, false);
+        fork_stop_preparations();
+        assert_eq!(fork_stop_counting(), (1, 0, 0));
+        assert_eq!(phases.get(), 1);
+        assert_eq!(fork_edit_count_of(&db, "codex:child"), 0);
+        let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+        for path in [&grandparent, &parent, &child] {
+            fork_index(&fresh, Provider::Codex, path);
+        }
+        assert_eq!(fork_rows(&db), fork_rows(&fresh));
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn fork_publication_through_replace_session_prepares_descendants() {
+        let family = ForkFamily::new(Provider::Codex);
+        let parsed = family.parent_with_shared_edit();
+        fork_start_counting();
+        let phases = fork_count_preparations();
+        family.db.replace_session(&parsed, 2, 2).unwrap();
+        fork_stop_preparations();
+        assert_eq!(fork_stop_counting(), (1, 0, 0));
+        assert_eq!(phases.get(), 1);
+        assert_eq!(fork_rows(&family.db), family.fresh_rows());
+    }
+
+    #[test]
+    fn fork_tail_without_file_edits_runs_no_preparation() {
+        let family = ForkFamily::new(Provider::Codex);
+        let mut parsed = family.parent_with_shared_edit();
+        parsed.file_edits.clear();
+        let before = fork_rows(&family.db);
+        fork_start_counting();
+        let phases = fork_count_preparations();
+        fork_publish(&family.db, &parsed, true);
+        fork_stop_preparations();
+        let (reads, _, locked) = fork_stop_counting();
+        assert_eq!((phases.get(), reads, locked), (0, 0, 0));
+        assert_eq!(fork_rows(&family.db), before);
     }
 
     #[test]
