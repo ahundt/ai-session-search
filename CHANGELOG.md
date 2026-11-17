@@ -22,6 +22,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 3. The Rust and Python APIs are beta and may change in a minor release; the CLI and MCP server
    are stable. The README, the library guide, and the crate README now say so.
 
+### Fixed
+
+1. `aise doctor` no longer reports the rollout files of a reverted Codex thread as unindexed.
+   Codex `thread/revert` keeps a thread in several `rollout-<time>-<thread>_<rollout>.jsonl`
+   files, and their messages were already searchable as one session in time order, but
+   `doctor` said the extra files produced no session, that their content was absent from every
+   search result, and prescribed an `aise reindex` that could never clear the count. New
+   messages in such a thread are now read incrementally instead of by rereading its newest file.
+
 ### Security
 
 1. RUSTSEC-2026-0543 reports `chrono` as unmaintained. It names no vulnerability, and no patched
