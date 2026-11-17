@@ -8580,6 +8580,7 @@ thread_local! {
     static FORK_LOCKED_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FORK_SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FORK_FALLBACKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FORK_BEFORE_RECONCILE: std::cell::Cell<Option<fn(&Path)>> = const { std::cell::Cell::new(None) };
 }
 
 const CODEX_FORK_CHILDREN_SQL: &str = "select s.id, s.source_path, f.mtime_ns, f.size_bytes
@@ -8853,16 +8854,21 @@ fn reconcile_codex_fork_edits(
     new_edits: Option<&[FileEdit]>,
     prepared: Option<&HashMap<String, PreparedFork>>,
 ) -> Result<()> {
+    #[cfg(test)]
+    FORK_BEFORE_RECONCILE.with(|hook| {
+        if let Some(before) = hook.take() {
+            before(Path::new(&session.source_path));
+        }
+    });
     for (id, parent, source) in select_fork_sources(tx, session, new_edits, &Default::default())? {
-        if let Some(prepared) = prepared {
-            let fork = prepared.get(&id).ok_or_else(|| {
-                anyhow::anyhow!("fork preparation omitted selected descendant {id}; retry indexing")
-            })?;
-            anyhow::ensure!(
-                fork_source_stamp(&fork.source.path) == fork.stamp,
-                "fork source {} changed after preparation; retry indexing",
-                fork.source.path.display()
-            );
+        // A descendant the preparation did not cover, or whose file changed after it was
+        // parsed, takes the locked path: the stored stamp is rechecked and, if the file no
+        // longer matches it, the source is invalidated for a later reparse rather than failing
+        // the publication.
+        let usable = prepared
+            .and_then(|prepared| prepared.get(&id))
+            .filter(|fork| fork_source_stamp(&fork.source.path) == fork.stamp);
+        if let Some(fork) = usable {
             if fork.invalidate {
                 invalidate_fork_source(tx, &source)?;
             }
@@ -8871,7 +8877,13 @@ fn reconcile_codex_fork_edits(
             } else {
                 invalidate_fork_source(tx, &source)?;
             }
-        } else if let Some(parsed) = parse_fork_source(&id, &parent, &source) {
+            continue;
+        }
+        #[cfg(test)]
+        if prepared.is_some() {
+            FORK_FALLBACKS.with(|count| count.set(count.get() + 1));
+        }
+        if let Some(parsed) = parse_fork_source(&id, &parent, &source) {
             store_parsed_file_edits(tx, &parsed, true)?;
         } else {
             invalidate_fork_source(tx, &source)?;
@@ -10493,6 +10505,142 @@ mod tests {
             }
             assert_eq!(rows(&db), rows(&fresh));
         }
+    }
+
+    #[test]
+    fn fork_publication_survives_source_changed_after_lock() {
+        fork_late_case("changed");
+    }
+
+    #[test]
+    fn fork_publication_parses_selected_descendant_missing_from_preparation() {
+        fork_late_case("absent");
+    }
+
+    fn fork_edit_text(name: &str) -> String {
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call","call_id":name,"name":"apply_patch","input":format!("*** Begin Patch\n*** Add File: /synthetic/{name}.rs\n+content\n*** End Patch")}}),
+            serde_json::json!({"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":name,"output":format!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA /synthetic/{name}.rs\n")}})
+        )
+    }
+
+    fn fork_late_case(mode: &'static str) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("index.db")).unwrap();
+        let adapter = crate::providers::codex::CodexAdapter::new(Vec::new());
+        let parse = |path: &Path| {
+            let mut parsed = adapter
+                .parse_reader(std::io::BufReader::new(fs::File::open(path).unwrap()), path)
+                .unwrap();
+            crate::util::backfill_parsed_dates(&mut parsed, fork_source_stamp(path).unwrap().0);
+            parsed
+        };
+        let index = |db: &Db, path: &Path| {
+            let (mtime, size) = fork_source_stamp(path).unwrap();
+            db.upsert_session(&parse(path), mtime, size).unwrap();
+        };
+        let child = dir.path().join("child.jsonl");
+        let child_header = serde_json::json!({"type":"session_meta","payload":{"id":"child","forked_from_id":"parent"}});
+        let child_body =
+            |extra: &str| format!("{child_header}\n{}{extra}", fork_edit_text("shared"));
+        // In "absent" mode the child already holds an edit that its stored rows lack.
+        fs::write(
+            &child,
+            child_body(&if mode == "absent" {
+                fork_edit_text("later")
+            } else {
+                String::new()
+            }),
+        )
+        .unwrap();
+        index(&db, &child);
+        let parent = dir.path().join("parent.jsonl");
+        let header = serde_json::json!({"type":"session_meta","payload":{"id":"parent"}});
+        fs::write(&parent, format!("{header}\n")).unwrap();
+        db.upsert_session(&parse(&parent), 1, 1).unwrap();
+        fs::write(&parent, format!("{header}\n{}", fork_edit_text("shared"))).unwrap();
+        let parsed = parse(&parent);
+        FORK_SOURCE_READS.with(|count| count.set(0));
+        FORK_FALLBACKS.with(|count| count.set(0));
+        FORK_LOCKED_READS.with(|count| count.set(0));
+        FORK_BEFORE_SOURCE_READ.with(|hook| {
+            hook.set(Some(|path| {
+                let peer = Connection::open(path.parent().unwrap().join("index.db")).unwrap();
+                peer.busy_timeout(std::time::Duration::ZERO).unwrap();
+                if peer.execute_batch("begin immediate; rollback;").is_err() {
+                    FORK_LOCKED_READS.with(|count| count.set(count.get() + 1));
+                }
+            }))
+        });
+        if mode == "changed" {
+            // The source changes after the writer lock is held and before reconciliation.
+            FORK_BEFORE_RECONCILE.with(|hook| {
+                hook.set(Some(|path| {
+                    use std::io::Write as _;
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(path.with_file_name("child.jsonl"))
+                        .unwrap()
+                        .write_all(fork_edit_text("later").as_bytes())
+                        .unwrap();
+                }))
+            });
+            db.upsert_session(&parsed, 2, 2).unwrap();
+            assert!(FORK_BEFORE_RECONCILE.with(|hook| hook.take()).is_none());
+            assert_eq!(FORK_SOURCE_READS.with(|count| count.get()), 1);
+            // The stale child is invalidated for a later reparse, not read under the lock.
+            assert_eq!(FORK_FALLBACKS.with(|count| count.get()), 1);
+            assert_eq!(FORK_LOCKED_READS.with(|count| count.get()), 0);
+            let stored: String = db
+                .conn
+                .query_row(
+                    "select parse_version from files_seen where source_path like '%child.jsonl'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stored, "");
+            assert_eq!(
+                db.conn
+                    .query_row(
+                        "select count(*) from file_edits where session_id = 'codex:parent'",
+                        [],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                1
+            );
+            index(&db, &child);
+        } else {
+            // A selection that the preparation did not cover: the child's stored edit is lost
+            // after publication and reconciliation runs with an empty prepared set.
+            db.upsert_session(&parsed, 2, 2).unwrap();
+            FORK_SOURCE_READS.with(|count| count.set(0));
+            FORK_FALLBACKS.with(|count| count.set(0));
+            FORK_LOCKED_READS.with(|count| count.set(0));
+            db.conn
+                .execute(
+                    "delete from file_edits where session_id = 'codex:child' and file_path like '%later.rs'",
+                    [],
+                )
+                .unwrap();
+            let tx = Transaction::new_unchecked(&db.conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            reconcile_codex_fork_edits(&tx, &parsed.session, None, Some(&HashMap::new())).unwrap();
+            tx.commit().unwrap();
+            assert_eq!(FORK_SOURCE_READS.with(|count| count.get()), 1);
+            assert_eq!(FORK_FALLBACKS.with(|count| count.get()), 1);
+            assert_eq!(FORK_LOCKED_READS.with(|count| count.get()), 1);
+        }
+        FORK_BEFORE_SOURCE_READ.with(|hook| hook.set(None));
+        let rows = |db: &Db| {
+            db.conn.prepare("select json_array(session_id,provider,seq,ts,tool,file_path,file_name,new_content,edits_json) from file_edits order by session_id,seq,id").unwrap().query_map([], |r| r.get::<_, String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let fresh = Db::open(&dir.path().join("fresh.db")).unwrap();
+        index(&fresh, &parent);
+        index(&fresh, &child);
+        assert_eq!(rows(&db), rows(&fresh));
     }
 
     #[test]
