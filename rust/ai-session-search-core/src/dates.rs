@@ -482,8 +482,11 @@ fn day_x_span(
 /// The local time zone: the `TZ` environment variable when set, otherwise the system zone
 /// (`/etc/localtime` on Unix, the Windows zone mapped to IANA). Falls back to UTC when neither
 /// can be determined.
+///
+/// Crate-private so no jiff type is part of the public API: a jiff major upgrade is then not a
+/// breaking change for callers.
 #[allow(clippy::disallowed_methods)] // the one place the system zone is read
-pub fn local_time_zone() -> TimeZone {
+pub(crate) fn local_time_zone() -> TimeZone {
     TimeZone::try_system().unwrap_or(TimeZone::UTC)
 }
 
