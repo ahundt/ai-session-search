@@ -2443,26 +2443,28 @@ pub(crate) fn rollout_sibling(path: &Path) -> Option<PathBuf> {
 /// thread, so the thread is the ID ending the name, or the first ID of a `<thread>_<rollout>` pair.
 /// An ID is accepted exactly as this parser always accepted one, so older names resolve as before.
 pub(crate) fn rollout_thread_id(path: &Path) -> Option<&str> {
-    let name = path.file_name()?.to_str()?;
+    // Bytes, not `&str`: a name that is not UTF-8 still holds an ASCII ID, and slicing a `&str`
+    // 36 bytes from its end panics inside a multi-byte character.
+    let name = path.file_name()?.as_encoded_bytes();
     let stem = name
-        .strip_suffix(".jsonl.zst")
-        .or_else(|| name.strip_suffix(".jsonl"))?;
+        .strip_suffix(b".jsonl.zst")
+        .or_else(|| name.strip_suffix(b".jsonl"))?;
     let last = trailing_codex_id(stem)?;
     let thread = stem[..stem.len() - last.len()]
-        .strip_suffix('_')
+        .strip_suffix(b"_")
         .and_then(trailing_codex_id);
-    Some(thread.unwrap_or(last))
+    std::str::from_utf8(thread.unwrap_or(last)).ok()
 }
 
 /// The ID ending `text`: eight lowercase hex digits, a hyphen, then 27 lowercase hex digits or
-/// hyphens, the shape of the UUIDs Codex writes.
-fn trailing_codex_id(text: &str) -> Option<&str> {
+/// hyphens, the shape of the UUIDs Codex writes. Every byte is ASCII, so the slice is valid UTF-8.
+fn trailing_codex_id(text: &[u8]) -> Option<&[u8]> {
     let id = text.get(text.len().checked_sub(36)?..)?;
     let (head, tail) = id.split_at(8);
-    let hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
-    (head.bytes().all(hex)
-        && tail.starts_with('-')
-        && tail.bytes().all(|byte| byte == b'-' || hex(byte)))
+    let hex = |byte: &u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte);
+    (head.iter().all(hex)
+        && tail.starts_with(b"-")
+        && tail.iter().all(|byte| *byte == b'-' || hex(byte)))
     .then_some(id)
 }
 
@@ -2721,6 +2723,62 @@ mod tests {
                 None,
                 "{name}"
             );
+        }
+    }
+
+    /// A name whose trailing 36 bytes cut a multi-byte character is not an ID and must not panic.
+    #[test]
+    fn a_rollout_name_with_a_multibyte_character_in_its_id_window_has_no_thread() {
+        let uuid = "01a13899-5fe0-7651-a51f-0b42469588e6";
+        let mut names = vec![
+            // 36 bytes of 3-byte characters: byte 8 of the window is inside a character.
+            "\u{4f1a}\u{8a71}\u{30ed}\u{30b0}\u{4f1a}\u{8a71}\u{30ed}\u{30b0}\u{4f1a}\u{8a71}\u{30ed}\u{30b0}.jsonl".to_string(),
+            // 7 ASCII bytes, a 2-byte character, then 27 ASCII bytes.
+            format!("abcdefg\u{e9}{}.jsonl", "a".repeat(27)),
+        ];
+        // A 2-byte and a 3-byte character at every offset inside the ID or just after it (one
+        // before the ID is outside its 36 bytes and leaves it intact).
+        for offset in 1..=uuid.len() {
+            for character in ['\u{e9}', '\u{4f1a}'] {
+                let mut name = uuid.to_string();
+                name.insert(offset, character);
+                names.push(format!("rollout-2026-10-14T12-08-58-{name}.jsonl"));
+                names.push(format!("rollout-2026-10-14T12-08-58-{name}.jsonl.zst"));
+            }
+        }
+        for name in names {
+            assert_eq!(
+                rollout_thread_id(std::path::Path::new(&name)),
+                None,
+                "{name}"
+            );
+        }
+    }
+
+    /// The old matcher ran on the lossy path string, so a name that is not UTF-8 still gave its ID.
+    #[cfg(unix)]
+    #[test]
+    fn a_rollout_name_that_is_not_utf8_still_gives_its_thread() {
+        use std::os::unix::ffi::OsStrExt;
+        let thread = "01a13899-5fe0-7651-a51f-0b42469588e6";
+        let rollout = "01a1389c-f5fc-76b3-ba16-9ae7e18559d6";
+        for (name, expected) in [
+            (format!("rollout-\u{ff}-{thread}.jsonl"), thread),
+            (
+                format!("rollout-\u{ff}-{thread}_{rollout}.jsonl.zst"),
+                thread,
+            ),
+        ] {
+            let mut bytes = name.into_bytes();
+            // Replace the UTF-8 encoding of U+00FF with the lone byte 0xff.
+            let at = bytes
+                .windows(2)
+                .position(|pair| pair == [0xc3, 0xbf])
+                .unwrap();
+            bytes.splice(at..at + 2, [0xff]);
+            let path = Path::new(std::ffi::OsStr::from_bytes(&bytes));
+            assert!(path.file_name().unwrap().to_str().is_none());
+            assert_eq!(rollout_thread_id(path), Some(expected));
         }
     }
 

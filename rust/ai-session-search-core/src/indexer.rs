@@ -6351,6 +6351,73 @@ mod tests {
         );
     }
 
+    /// One Codex rollout: a `session_meta` line naming `id`, then one user message per prompt.
+    fn codex_rollout_text(id: &str, prompts: &[&str]) -> String {
+        let mut text =
+            serde_json::json!({"type":"session_meta","payload":{"id":id,"cwd":"/tmp/codex"}})
+                .to_string()
+                + "\n";
+        for prompt in prompts {
+            text += &serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}})
+                .to_string();
+            text += "\n";
+        }
+        text
+    }
+
+    /// A config reading only `<dir>/codex`, and the index it writes to `<dir>/index.db`.
+    fn codex_config_and_db(dir: &std::path::Path) -> (Config, Db) {
+        let db_path = dir.join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![normalize_path(&dir.join("codex"))];
+        (config, Db::open(&db_path).unwrap())
+    }
+
+    /// A file named for no thread, or for a name whose trailing 36 bytes cut a multi-byte
+    /// character, sits among rollouts because the Codex walk takes any `*.jsonl`. Reading a thread
+    /// from its name must give such a file no thread, not panic the whole reindex.
+    #[test]
+    fn a_codex_file_with_a_non_ascii_name_does_not_stop_the_reindex() {
+        use crate::models::MessageFilters;
+
+        let thread = "01a13899-5fe0-7651-a51f-0b42469588e6";
+        let stray = [
+            // 36 bytes of 3-byte characters, so byte 8 of the trailing 36 is inside a character.
+            "\u{4f1a}\u{8a71}\u{30ed}\u{30b0}\u{4f1a}\u{8a71}\u{30ed}\u{30b0}\u{4f1a}\u{8a71}\u{30ed}\u{30b0}.jsonl".to_string(),
+            format!("rollout-abcdefg\u{e9}{}.jsonl", "a".repeat(27)),
+        ];
+        for (name, content) in stray.iter().zip([
+            codex_rollout_text("stray-thread", &["stray prompt"]),
+            "not json at all\n".to_string(),
+        ]) {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("codex/2026/10/14");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join(format!("rollout-2026-10-14T12-08-58-{thread}.jsonl")),
+                codex_rollout_text(thread, &["normal prompt"]),
+            )
+            .unwrap();
+            std::fs::write(root.join(name), content).unwrap();
+            let (config, db) = codex_config_and_db(dir.path());
+
+            reindex(&config, &db, false, None).unwrap_or_else(|error| panic!("{name}: {error:#}"));
+            let hits = db
+                .search_messages(
+                    "prompt",
+                    &MessageFilters {
+                        session_id: Some(format!("codex:{thread}")),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{name}");
+            crate::diagnostics::collect(&config, &db).unwrap();
+            crate::diagnostics::explain_unindexed(&config, &db).unwrap();
+        }
+    }
+
     #[test]
     fn incremental_reindex_reclaims_an_id_from_an_unavailable_holder() {
         use crate::models::MessageFilters;
