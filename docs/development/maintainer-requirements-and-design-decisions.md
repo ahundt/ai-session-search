@@ -750,7 +750,7 @@ Public Rust result signatures expose `anyhow::Error`; callers may downcast servi
 before converting them. Dependency major-version changes therefore require API compatibility
 review even when application code changes little.
 
-The six deprecated `trigram_index` connection helpers use rusqlite 0.41 in 1.1.0 instead of
+The six deprecated `trigram_index` connection helpers use rusqlite 0.43 in 1.1.0 instead of
 1.0.0's 0.40. This accepted Rust type break picks up the bundled SQLite fix for
 RUSTSEC-2026-0459. `ai_session_search::rusqlite` re-exports the exact dependency so callers can
 construct a matching `Connection` without a separate dependency. Prefer

@@ -11,6 +11,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+1. Rust callers of deprecated `trigram_index` helpers now use rusqlite 0.43 connections through
+   `ai_session_search::rusqlite`; bundled SQLite remains 3.54.1.
+
 ## [1.1.0rc1] - 2026-11-15
 
 1.1.0 preserves indexed history when transcripts are shortened or rewritten, finds human input
