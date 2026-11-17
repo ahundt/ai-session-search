@@ -6418,6 +6418,111 @@ mod tests {
         }
     }
 
+    /// Two rollouts named for different threads whose `session_meta.id` is one ID are a real ID
+    /// collision, not two rollouts of one thread: the loser's content is in no session.
+    #[test]
+    fn two_codex_files_of_different_threads_claiming_one_id_still_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex/2026/10/14");
+        std::fs::create_dir_all(&root).unwrap();
+        let claimed = "01a13899-5fe0-7651-a51f-0b42469588e6";
+        let first =
+            root.join("rollout-2026-10-14T12-08-58-01a1389c-f5fc-76b3-ba16-9ae7e18559d6.jsonl");
+        let second =
+            root.join("rollout-2026-10-14T12-12-53-01a138a8-1dee-7c11-90fc-42dc004cffa2.jsonl");
+        std::fs::write(&first, codex_rollout_text(claimed, &["first prompt"])).unwrap();
+        std::fs::write(&second, codex_rollout_text(claimed, &["second prompt"])).unwrap();
+        let (config, db) = codex_config_and_db(dir.path());
+
+        reindex(&config, &db, false, None).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+
+        let unindexed = crate::diagnostics::explain_unindexed(&config, &db).unwrap();
+        assert_eq!(unindexed.len(), 1, "{unindexed:?}");
+        assert_eq!(
+            crate::diagnostics::collect(&config, &db)
+                .unwrap()
+                .index_status
+                .unindexed_files,
+            1
+        );
+        assert_eq!(unindexed[0].resolves_to, claimed);
+        let holder = unindexed[0].id_already_held_by.as_deref().unwrap();
+        assert_ne!(Path::new(holder), Path::new(&unindexed[0].path));
+    }
+
+    /// Prompts of `session_id` in sequence order.
+    fn codex_prompts(db: &Db, session_id: &str) -> Vec<String> {
+        use crate::models::MessageFilters;
+        let mut hits = db
+            .search_messages(
+                "prompt",
+                &MessageFilters {
+                    session_id: Some(format!("codex:{session_id}")),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        hits.sort_by_key(|hit| hit.seq);
+        hits.into_iter().map(|hit| hit.content).collect()
+    }
+
+    /// A rollout named `<T>_<R>` whose `session_meta.id` is Q is read as a rollout of T by name,
+    /// and doctor hides a rollout of a held thread. Its content must still be searchable: it is
+    /// indexed under Q, and stays there after another file of Q arrives and takes over the ID.
+    #[test]
+    fn a_codex_file_named_for_one_thread_and_holding_another_is_indexed_under_the_one_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex/2026/10/14");
+        std::fs::create_dir_all(&root).unwrap();
+        let named = "01a13899-5fe0-7651-a51f-0b42469588e6";
+        let held = "01a138a8-1dee-7c11-90fc-42dc004cffa2";
+        let revert = "01a1389c-f5fc-76b3-ba16-9ae7e18559d6";
+        std::fs::write(
+            root.join(format!("rollout-2026-10-14T12-08-58-{named}.jsonl")),
+            codex_rollout_text(named, &["genuine prompt"]),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join(format!(
+                "rollout-2026-10-14T12-12-53-{named}_{revert}.jsonl"
+            )),
+            codex_rollout_text(held, &["misnamed prompt"]),
+        )
+        .unwrap();
+        let (config, db) = codex_config_and_db(dir.path());
+        let unindexed = |db: &Db| {
+            crate::diagnostics::collect(&config, db)
+                .unwrap()
+                .index_status
+                .unindexed_files
+        };
+
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(codex_prompts(&db, named), ["genuine prompt"]);
+        assert_eq!(codex_prompts(&db, held), ["misnamed prompt"]);
+        assert_eq!(unindexed(&db), 0);
+        assert!(crate::diagnostics::explain_unindexed(&config, &db)
+            .unwrap()
+            .is_empty());
+
+        // A file named for Q arrives and takes over Q. The misnamed file is no longer Q's source
+        // path, so only its receipt marks it as read, and its content must still be in Q.
+        std::fs::write(
+            root.join(format!("rollout-2026-10-14T12-20-00-{held}.jsonl")),
+            codex_rollout_text(held, &["holder prompt"]),
+        )
+        .unwrap();
+        for full in [false, false, true] {
+            reindex(&config, &db, full, None).unwrap();
+            let mut prompts = codex_prompts(&db, held);
+            prompts.sort();
+            assert_eq!(prompts, ["holder prompt", "misnamed prompt"], "full={full}");
+            assert_eq!(codex_prompts(&db, named), ["genuine prompt"], "full={full}");
+            assert_eq!(unindexed(&db), 0, "full={full}");
+        }
+    }
+
     #[test]
     fn incremental_reindex_reclaims_an_id_from_an_unavailable_holder() {
         use crate::models::MessageFilters;
