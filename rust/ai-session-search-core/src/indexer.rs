@@ -2987,11 +2987,34 @@ mod tests {
                     |_| panic!("parent publication parsed a fork without a matching stored edit")
                 }))
             });
+            crate::db::FORK_SOURCE_READS.with(|count| count.set(0));
+            crate::db::FORK_FALLBACKS.with(|count| count.set(0));
+            crate::db::FORK_LOCKED_READS.with(|count| count.set(0));
+            crate::db::FORK_BEFORE_SOURCE_READ.with(|hook| {
+                // The database sits two directories above the fork source in this layout.
+                hook.set(Some(|path| {
+                    crate::db::probe_fork_writer_lock(
+                        &path.parent().unwrap().parent().unwrap().join("index.db"),
+                    )
+                }))
+            });
             if full {
                 reindex(&config, &db, true, None).unwrap();
             } else {
                 reindex_tail_outcome(&config, &db, TailOutcome::Appended);
             }
+            crate::db::FORK_BEFORE_SOURCE_READ.with(|hook| hook.set(None));
+            // A matching fork is parsed once, before the write transaction; a publication with
+            // no matching fork never reads one. Neither falls back to a read under the lock.
+            assert_eq!(
+                (
+                    crate::db::FORK_SOURCE_READS.with(|count| count.get()),
+                    crate::db::FORK_FALLBACKS.with(|count| count.get()),
+                    crate::db::FORK_LOCKED_READS.with(|count| count.get()),
+                ),
+                (usize::from(matching), 0, 0),
+                "matching {matching}, full {full}"
+            );
             assert_eq!(
                 crate::db::CODEX_FORK_AFTER_READ
                     .with(|hook| hook.take())
