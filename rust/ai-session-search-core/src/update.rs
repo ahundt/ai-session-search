@@ -639,6 +639,13 @@ fn update_action_for_release(
     }
 }
 
+fn release_phases() -> impl Iterator<Item = (&'static str, &'static str)> {
+    include_str!("release-phases.txt")
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| line.split_once(' '))
+}
+
 fn python_version(version: &Version) -> Result<String> {
     if version.pre.is_empty() {
         return Ok(format!(
@@ -650,12 +657,9 @@ fn python_version(version: &Version) -> Result<String> {
     let (phase, number) = prerelease
         .split_once('.')
         .context("release prerelease must use a named phase and numeric component")?;
-    let phase = match phase {
-        "alpha" => "a",
-        "beta" => "b",
-        "rc" => "rc",
-        _ => bail!("unsupported release prerelease phase {phase:?}"),
-    };
+    let phase = release_phases()
+        .find_map(|(cargo, python)| (cargo == phase).then_some(python))
+        .with_context(|| format!("unsupported release prerelease phase {phase:?}"))?;
     if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
         bail!("release prerelease number is invalid");
     }
@@ -1045,18 +1049,16 @@ fn parse_release_tag(tag: &str) -> Result<Version> {
     }
     let phase_start = value
         .char_indices()
-        .find_map(|(index, character)| matches!(character, 'a' | 'b' | 'r').then_some(index))
+        .find_map(|(index, character)| {
+            release_phases()
+                .any(|(_, python)| python.starts_with(character))
+                .then_some(index)
+        })
         .context("release tag is neither Cargo SemVer nor supported Python release spelling")?;
     let (release, suffix) = value.split_at(phase_start);
-    let (phase, number) = if let Some(number) = suffix.strip_prefix("rc") {
-        ("rc", number)
-    } else if let Some(number) = suffix.strip_prefix('a') {
-        ("alpha", number)
-    } else if let Some(number) = suffix.strip_prefix('b') {
-        ("beta", number)
-    } else {
-        bail!("unsupported Python release phase in tag {tag:?}");
-    };
+    let (phase, number) = release_phases()
+        .find_map(|(cargo, python)| suffix.strip_prefix(python).map(|number| (cargo, number)))
+        .with_context(|| format!("unsupported Python release phase in tag {tag:?}"))?;
     if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
         bail!("release tag {tag:?} has an invalid pre-release number");
     }
@@ -2115,6 +2117,53 @@ mod tests {
         assert!(confirmation_answer_applies(Some("YES\n")));
         assert!(!confirmation_answer_applies(Some("no\n")));
         assert!(!confirmation_answer_applies(None));
+    }
+
+    #[test]
+    fn release_phase_mapping_preserves_spellings_and_errors() {
+        for (cargo, python) in [
+            ("1.2.3", "1.2.3"),
+            ("1.2.3-alpha.4", "1.2.3a4"),
+            ("1.2.3-beta.5", "1.2.3b5"),
+            ("1.2.3-rc.6", "1.2.3rc6"),
+        ] {
+            let version = Version::parse(cargo).unwrap();
+            assert_eq!(python_version(&version).unwrap(), python);
+            assert_eq!(parse_release_tag(python).unwrap(), version);
+            assert_eq!(parse_release_tag(&format!("v{python}")).unwrap(), version);
+        }
+        for (tag, error) in [
+            (
+                "1.2.3r1",
+                "unsupported Python release phase in tag \"1.2.3r1\"",
+            ),
+            (
+                "1.2.3rc",
+                "release tag \"1.2.3rc\" has an invalid pre-release number",
+            ),
+            (
+                "1.2.3b-1",
+                "release tag \"1.2.3b-1\" has an invalid pre-release number",
+            ),
+            (
+                "1.2.3c1",
+                "release tag is neither Cargo SemVer nor supported Python release spelling",
+            ),
+        ] {
+            assert_eq!(parse_release_tag(tag).unwrap_err().to_string(), error);
+        }
+        assert_eq!(
+            python_version(&Version::parse("1.2.3-preview.1").unwrap())
+                .unwrap_err()
+                .to_string(),
+            "unsupported release prerelease phase \"preview\""
+        );
+        assert_eq!(
+            python_version(&Version::parse("1.2.3-alpha.x").unwrap())
+                .unwrap_err()
+                .to_string(),
+            "release prerelease number is invalid"
+        );
     }
 
     #[test]
