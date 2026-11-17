@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
 use anyhow::Result;
 
@@ -172,12 +173,26 @@ pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>>
     Ok(explained)
 }
 
-/// Source paths represented by canonical sessions or unambiguous persisted Gemini families.
-/// Processing receipts alone do not prove representation. The family lookup adds one metadata
-/// scan over Gemini sessions, O(G) rows plus their metadata bytes; transcripts are never read.
+/// Source paths represented by canonical sessions, unambiguous persisted Gemini families, or the
+/// rollouts of a reverted Codex thread. Processing receipts alone do not prove representation.
+/// The family lookup adds one metadata scan over Gemini sessions, O(G) rows plus their metadata
+/// bytes, and the Codex lookup one scan of Codex receipts; transcripts are never read.
 fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {
-    let mut indexed: HashSet<_> = db
-        .indexed_source_identities()?
+    let identities = db.indexed_source_identities()?;
+    // Codex `thread/revert` starts another rollout file for the same thread, and every rollout's
+    // parse is reconciled into the thread's one session, which keeps rows a later parse no longer
+    // holds. Only one rollout can be its source path; another is represented when its thread's
+    // session is held by a rollout of that thread and its receipt is at the current parser.
+    let held_codex_threads: HashSet<String> = identities
+        .iter()
+        .filter(|source| source.provider == Provider::Codex)
+        .filter_map(|source| {
+            let thread =
+                crate::providers::codex::rollout_thread_id(Path::new(&source.source_path))?;
+            (source.session_id == format!("codex:{thread}")).then(|| thread.to_string())
+        })
+        .collect();
+    let mut indexed: HashSet<_> = identities
         .into_iter()
         .map(|source| (source.provider, source.source_path))
         .collect();
@@ -186,6 +201,18 @@ fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {
             .into_keys()
             .map(|path| (Provider::GeminiCli, path)),
     );
+    if !held_codex_threads.is_empty() {
+        let parse_version = crate::util::provider_parse_version(Provider::Codex);
+        indexed.extend(
+            db.receipt_paths_at_parse_version(Provider::Codex, parse_version)?
+                .into_iter()
+                .filter(|path| {
+                    crate::providers::codex::rollout_thread_id(Path::new(path))
+                        .is_some_and(|thread| held_codex_threads.contains(thread))
+                })
+                .map(|path| (Provider::Codex, path)),
+        );
+    }
     Ok(indexed)
 }
 

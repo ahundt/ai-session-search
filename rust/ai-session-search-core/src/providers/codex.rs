@@ -649,7 +649,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use regex::Regex;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 
@@ -703,7 +702,6 @@ pub struct CodexAdapter {
     roots: Vec<PathBuf>,
     metadata: Vec<CodexRootMetadata>,
     sidecar_warnings: Vec<CodexSidecarWarning>,
-    id_re: Regex,
 }
 
 impl CodexAdapter {
@@ -726,8 +724,6 @@ impl CodexAdapter {
             roots,
             metadata,
             sidecar_warnings,
-            id_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl(?:\.zst)?$")
-                .expect("valid regex"),
         }
     }
 
@@ -1470,11 +1466,7 @@ impl CodexAdapter {
     }
 
     fn extract_id(&self, path: &Path) -> Option<String> {
-        let value = path.to_string_lossy();
-        self.id_re
-            .captures(&value)
-            .and_then(|captures| captures.get(1))
-            .map(|match_| match_.as_str().to_string())
+        rollout_thread_id(path).map(str::to_owned)
     }
 }
 
@@ -2442,6 +2434,38 @@ pub(crate) fn rollout_sibling(path: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The thread a rollout file belongs to, read from its name.
+///
+/// Codex names a thread's original rollout `rollout-<time>-<thread>.jsonl` and each rollout that
+/// `thread/revert` starts afterwards `rollout-<time>-<thread>_<rollout>.jsonl`, either form
+/// optionally compressed to `.jsonl.zst` (`RolloutFileName` in
+/// codex-rs/rollout/src/rollout_file_name.rs). Every rollout's `session_meta.id` names the same
+/// thread, so the thread is the ID ending the name, or the first ID of a `<thread>_<rollout>` pair.
+/// An ID is accepted exactly as this parser always accepted one, so older names resolve as before.
+pub(crate) fn rollout_thread_id(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| name.strip_suffix(".jsonl"))?;
+    let last = trailing_codex_id(stem)?;
+    let thread = stem[..stem.len() - last.len()]
+        .strip_suffix('_')
+        .and_then(trailing_codex_id);
+    Some(thread.unwrap_or(last))
+}
+
+/// The ID ending `text`: eight lowercase hex digits, a hyphen, then 27 lowercase hex digits or
+/// hyphens, the shape of the UUIDs Codex writes.
+fn trailing_codex_id(text: &str) -> Option<&str> {
+    let id = text.get(text.len().checked_sub(36)?..)?;
+    let (head, tail) = id.split_at(8);
+    let hex = |byte: u8| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte);
+    (head.bytes().all(hex)
+        && tail.starts_with('-')
+        && tail.bytes().all(|byte| byte == b'-' || hex(byte)))
+    .then_some(id)
+}
+
 pub(crate) fn codex_home_from_session_root(root: &Path) -> PathBuf {
     root.parent().unwrap_or(root).to_path_buf()
 }
@@ -2652,16 +2676,53 @@ mod tests {
     use super::{
         codex_apply_patch_succeeded, codex_native_shell_command_attribution, codex_output_text,
         codex_spawn_origin, codex_user_shell_command_parts, is_codex_injected_context,
-        CodexAdapter, CodexShellCommandAttribution,
+        rollout_thread_id, CodexAdapter, CodexShellCommandAttribution,
     };
     use crate::models::{
         ContentPartAuthorship, ContentPartOrigin, MessageAuthorship, MessageInputOrigin, Provider,
         Role,
     };
     use serde_json::json;
+
     use std::fs;
     use std::path::{Path, PathBuf};
     use tempfile::tempdir;
+
+    #[test]
+    fn a_rollout_name_gives_its_thread_with_or_without_a_revert_suffix() {
+        let thread = "01a13899-5fe0-7651-a51f-0b42469588e6";
+        let rollout = "01a1389c-f5fc-76b3-ba16-9ae7e18559d6";
+        for name in [
+            format!("rollout-2026-10-14T12-08-58-{thread}.jsonl"),
+            format!("rollout-2026-10-14T12-12-53-{thread}_{rollout}.jsonl"),
+            format!("rollout-2026-10-14T12-12-53-{thread}_{rollout}.jsonl.zst"),
+            // Names this parser has always accepted resolve as they did.
+            format!("rollout-{thread}.jsonl"),
+            format!("{thread}.jsonl.zst"),
+            format!("rollout-2026-10-14T12-08-58-x_{thread}.jsonl"),
+        ] {
+            assert_eq!(
+                rollout_thread_id(std::path::Path::new(&name)),
+                Some(thread),
+                "{name}"
+            );
+        }
+        for name in [
+            "rollout-2026-10-14T12-08-58.jsonl".to_string(),
+            format!("rollout-2026-10-14T12-08-58-{thread}.json"),
+            format!(
+                "rollout-2026-10-14T12-08-58-{}.jsonl",
+                thread.to_uppercase()
+            ),
+            "rollout-\u{e9}-0123456789abcdef0123456789abcdef.jsonl".to_string(),
+        ] {
+            assert_eq!(
+                rollout_thread_id(std::path::Path::new(&name)),
+                None,
+                "{name}"
+            );
+        }
+    }
 
     fn write_rollout(root: &Path, session_id: &str, cwd: &str, prompt: &str) -> PathBuf {
         fs::create_dir_all(root).unwrap();

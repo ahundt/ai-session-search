@@ -6206,6 +6206,151 @@ mod tests {
         }
     }
 
+    /// Codex `thread/revert` keeps the thread ID and starts a new rollout file named
+    /// `rollout-<time>-<thread>_<rollout>.jsonl`, whose `history_base` inherits a prefix of the
+    /// previous rollout. Every rollout names the thread in `session_meta.id`, so their parses are
+    /// reconciled into one session, which keeps rows a later parse no longer holds. Doctor counted
+    /// every rollout but the session's source path as unindexed, said its content was absent
+    /// from search, and prescribed an `aise reindex` that could never clear the count.
+    #[test]
+    fn a_reverted_codex_thread_is_one_session_and_none_of_its_rollouts_is_unindexed() {
+        use crate::models::MessageFilters;
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex/2026/10/14");
+        std::fs::create_dir_all(&root).unwrap();
+        let thread = "01a13899-5fe0-7651-a51f-0b42469588e6";
+        let revert = "01a1389c-f5fc-76b3-ba16-9ae7e18559d6";
+        // `aise` reads neither `history_mode` nor `history_base`; they make the fixture match the
+        // rollouts Codex writes.
+        let meta = |base: Option<&str>| {
+            let mut meta = serde_json::json!({"id":thread,"session_id":thread,"cwd":"/tmp/reverted","history_mode":"paginated"});
+            if let Some(rollout) = base {
+                meta["history_base"] = serde_json::json!({"thread_id":rollout,"end_ordinal_exclusive":2,"end_byte_offset":100});
+            }
+            meta
+        };
+        let user_line = |prompt: &str| {
+            serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}).to_string() + "\n"
+        };
+        let rollout = |meta: serde_json::Value, prompts: &[&str]| {
+            serde_json::json!({"type":"session_meta","payload":meta}).to_string()
+                + "\n"
+                + &prompts
+                    .iter()
+                    .map(|prompt| user_line(prompt))
+                    .collect::<String>()
+        };
+        std::fs::write(
+            root.join(format!("rollout-2026-10-14T12-08-58-{thread}.jsonl")),
+            rollout(
+                meta(None),
+                &["original rollout prompt", "reverted away prompt"],
+            ),
+        )
+        .unwrap();
+        let second = root.join(format!(
+            "rollout-2026-10-14T12-12-53-{thread}_{revert}.jsonl"
+        ));
+
+        let db_path = dir.path().join("index.db");
+        let mut config = config_with_no_providers(&db_path);
+        config.providers.codex.enabled = true;
+        config.providers.codex.paths = vec![normalize_path(&dir.path().join("codex"))];
+        let db = Db::open(&db_path).unwrap();
+        let session_id = format!("codex:{thread}");
+        let prompts_in_order = |db: &Db| {
+            let mut hits = db
+                .search_messages(
+                    "prompt",
+                    &MessageFilters {
+                        session_id: Some(session_id.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            hits.sort_by_key(|hit| hit.seq);
+            hits.into_iter().map(|hit| hit.content).collect::<Vec<_>>()
+        };
+        let unindexed = |db: &Db| {
+            crate::diagnostics::collect(&config, db)
+                .unwrap()
+                .index_status
+                .unindexed_files
+        };
+
+        // Codex writes the revert's rollout after the original was indexed, and a later full
+        // reindex reads both; either way the thread is one session in time order. A reverted
+        // turn is still work the user did, so it stays searchable.
+        reindex(&config, &db, false, None).unwrap();
+        // Long enough for the incremental tail parse, which appends below exercise.
+        let padding = serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(2 * crate::tail::OVERLAP_BYTES as usize)}]}}).to_string() + "\n";
+        std::fs::write(
+            &second,
+            rollout(meta(Some(thread)), &["second rollout prompt"]) + &padding,
+        )
+        .unwrap();
+        assert_eq!(unindexed(&db), 1, "a rollout not yet read is pending");
+        for full in [false, true] {
+            reindex(&config, &db, full, None).unwrap();
+            assert_eq!(
+                prompts_in_order(&db),
+                [
+                    "original rollout prompt",
+                    "reverted away prompt",
+                    "second rollout prompt"
+                ],
+                "full={full}"
+            );
+            assert_eq!(unindexed(&db), 0, "full={full}");
+            assert!(crate::diagnostics::explain_unindexed(&config, &db)
+                .unwrap()
+                .is_empty());
+        }
+
+        // Codex appends to the newest rollout, and a second revert adds a third file.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&second)
+            .unwrap()
+            .write_all(user_line("appended prompt").as_bytes())
+            .unwrap();
+        TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().clear());
+        reindex(&config, &db, false, None).unwrap();
+        assert!(
+            TEST_TAIL_OUTCOMES
+                .with(|outcomes| matches!(outcomes.borrow().as_slice(), [TailOutcome::Appended])),
+            "an append to a revert rollout is read as a tail, not by rereading the file"
+        );
+        let third = "01a138a8-1dee-7c11-90fc-42dc004cffa2";
+        std::fs::write(
+            root.join(format!(
+                "rollout-2026-10-14T12-25-04-{thread}_{third}.jsonl"
+            )),
+            rollout(meta(Some(revert)), &["third rollout prompt"]),
+        )
+        .unwrap();
+        assert_eq!(unindexed(&db), 1, "a rollout not yet read is pending");
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            prompts_in_order(&db),
+            [
+                "original rollout prompt",
+                "reverted away prompt",
+                "second rollout prompt",
+                "appended prompt",
+                "third rollout prompt"
+            ]
+        );
+        assert_eq!(unindexed(&db), 0);
+        assert_eq!(
+            reindex(&config, &db, false, None).unwrap().1,
+            0,
+            "a current thread is skipped"
+        );
+    }
+
     #[test]
     fn incremental_reindex_reclaims_an_id_from_an_unavailable_holder() {
         use crate::models::MessageFilters;
