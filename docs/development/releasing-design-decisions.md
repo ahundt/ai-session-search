@@ -25,7 +25,8 @@ use the normalized `X.Y.ZrcN` form defined by the
 [PyPA version specifier specification](https://packaging.python.org/en/latest/specifications/version-specifiers/).
 Cargo requires SemVer prerelease syntax after `-`, as documented by the
 [Cargo manifest reference](https://doc.rust-lang.org/cargo/reference/manifest.html#the-version-field).
-`scripts/release_versions.py` is the sole mapping implementation, and
+`rust/ai-session-search-core/src/release-phases.txt` is the sole phase mapping, read by both
+`scripts/release_versions.py` and `update.rs`, and
 `python -m scripts.verify_release_metadata --tag vX.Y.ZrcN` rejects mismatched
 manifests, dependencies, or tags before packaging starts.
 
