@@ -11,11 +11,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.1.0rc2] - 2026-11-17
+
+1.1.0rc2 corrects `aise doctor` and refresh for Codex threads rewound with `thread/revert`, and
+moves rusqlite to 0.43. Upgrading from 1.1.0rc1 changes no stored format and reparses no transcript.
+Two items under Changed affect Rust callers of 1.1.0rc1.
+
 ### Changed
 
 1. rusqlite moves from 0.41 to 0.43; bundled SQLite stays at 3.54.1. Rust callers of the
-   deprecated `trigram_index` helpers must pass 0.43 connections, available through
-   `ai_session_search::rusqlite`.
+   deprecated `trigram_index` helpers must pass a rusqlite 0.43 `Connection`, which the crate
+   re-exports as `ai_session_search::rusqlite`.
 2. Rust `dates::local_time_zone()` is no longer public. It was added in 1.1.0rc1 and was the only
    public signature that named a `jiff` type. To read the system zone with the same UTC fallback,
    call `jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)`.
@@ -26,10 +32,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 1. `aise doctor` no longer reports the rollout files of a reverted Codex thread as unindexed.
    Codex `thread/revert` keeps a thread in several `rollout-<time>-<thread>_<rollout>.jsonl`
-   files, and their messages were already searchable as one session in time order, but
-   `doctor` said the extra files produced no session, that their content was absent from every
-   search result, and prescribed an `aise reindex` that could never clear the count. New
-   messages in such a thread are now read incrementally instead of by rereading its newest file.
+   files, and their messages were already searchable as one session in time order. `doctor`
+   said the extra files produced no session and that their content was absent from every search
+   result, then prescribed an `aise reindex` that could never clear the count. An append to the
+   newest rollout of such a thread is now read from the appended part; before, the whole file
+   was reread.
 2. A refresh no longer rereads the unchanged rollout files of a reverted Codex thread. Each
    refresh parsed every rollout of such a thread in full, except the one stored as the session's
    source, even when no file had changed. A rollout that changed, is new, or was last read by an
@@ -38,8 +45,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Security
 
 1. RUSTSEC-2026-0543 reports `chrono` as unmaintained. It names no vulnerability, and no patched
-   version exists to move to. aise's own date types and `rmcp` use `chrono`, so it stays a
-   dependency, and `deny.toml` records the advisory.
+   version exists to move to. aise's date handling, `rmcp`, `rusqlite`, `schemars` and `edtf`
+   use `chrono`, so it stays a dependency, and `deny.toml` records the advisory.
 
 ### For contributors
 
@@ -350,6 +357,7 @@ the four release candidates, 1.0.0rc1 to 1.0.0rc4, are in
    this class was missed then. `DateRange` keeps its `Default`, which is how the Python binding
    and any other caller build one.
 
-[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.1.0rc1...HEAD
+[Unreleased]: https://github.com/ahundt/ai-session-search/compare/v1.1.0rc2...HEAD
+[1.1.0rc2]: https://github.com/ahundt/ai-session-search/compare/v1.1.0rc1...v1.1.0rc2
 [1.1.0rc1]: https://github.com/ahundt/ai-session-search/compare/v1.0.0...v1.1.0rc1
 [1.0.0]: https://github.com/ahundt/ai-session-search/compare/v1.0.0rc4...v1.0.0
