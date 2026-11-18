@@ -14,49 +14,55 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [1.1.0rc2] - 2026-11-18
 
 1.1.0rc2 corrects `aise doctor` and refresh for Codex threads rewound with `thread/revert`, and
-moves rusqlite to 0.43. Upgrading from 1.1.0rc1 changes no stored format and reparses no transcript.
-Two items under Changed affect Rust callers of 1.1.0rc1.
+moves rusqlite to 0.43. The index format and parser versions are the same as in 1.1.0rc1, so the
+first refresh after upgrading reads only transcripts that changed. Two items under Changed affect
+Rust callers of 1.1.0rc1.
 
 ### Changed
 
 1. rusqlite moves from 0.41 to 0.43; bundled SQLite stays at 3.54.1. Rust callers of the
    deprecated `trigram_index` helpers must pass a rusqlite 0.43 `Connection`, which the crate
    re-exports as `ai_session_search::rusqlite`.
-2. Rust `dates::local_time_zone()` is no longer public. It was added in 1.1.0rc1 and was the only
-   public signature that named a `jiff` type. To read the system zone with the same UTC fallback,
-   call `jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)`.
+2. Rust `dates::local_time_zone()` is now private to the crate. It was added in 1.1.0rc1 and was
+   the only public signature that named a `jiff` type. To read the system zone with the same UTC
+   fallback, call `jiff::tz::TimeZone::try_system().unwrap_or(jiff::tz::TimeZone::UTC)`.
 3. The Rust and Python APIs are beta and may change in a minor release; the CLI and MCP server
    are stable. The README, the library guide, and the crate README now say so.
 
 ### Fixed
 
-1. `aise doctor` no longer reports the rollout files of a reverted Codex thread as unindexed.
-   Codex `thread/revert` keeps a thread in several `rollout-<time>-<thread>_<rollout>.jsonl`
-   files, and their messages were already searchable as one session in time order. `doctor`
-   said the extra files produced no session and that their content was absent from every search
-   result, then prescribed an `aise reindex` that could never clear the count. An append to the
-   newest rollout of such a thread is now read from the appended part; before, the whole file
-   was reread.
-2. A refresh no longer rereads the unchanged rollout files of a reverted Codex thread. Each
+1. `aise doctor` now counts every rollout file of a reverted Codex thread as indexed. Codex
+   `thread/revert` keeps a thread in several `rollout-<time>-<thread>_<rollout>.jsonl` files, and
+   1.1.0rc1 already made their messages searchable as one session in time order. Its `doctor`
+   still reported all but one of those files as producing no session, with their content missing
+   from search results, and recommended an `aise reindex` that left the count unchanged. When the
+   newest rollout of such a thread grows, a refresh now reads only the appended part; 1.1.0rc1
+   reread the whole file.
+2. A refresh now skips the unchanged rollout files of a reverted Codex thread. In 1.1.0rc1 each
    refresh parsed every rollout of such a thread in full, except the one stored as the session's
-   source, even when no file had changed. A rollout that changed, is new, or was last read by an
-   older parser is still read.
+   source, even when every file was unchanged. A refresh still reads a rollout that changed, is
+   new, or was last read by an older parser.
 
 ### Security
 
-1. RUSTSEC-2026-0543 reports `chrono` as unmaintained. It names no vulnerability, and no patched
-   version exists to move to. aise's date handling, `rmcp`, `rusqlite`, `schemars` and `edtf`
-   use `chrono`, so it stays a dependency, and `deny.toml` records the advisory.
+1. RUSTSEC-2026-0543 reports `chrono` as unmaintained. The advisory concerns maintenance status
+   only: it lists no vulnerability and offers no patched version. aise's date handling, `rmcp`,
+   `rusqlite`, `schemars` and `edtf` use `chrono`, so it stays a dependency, and `deny.toml`
+   records the advisory.
 
 ### For contributors
 
-1. Codex fork descendants are parsed before the SQLite write transaction and revalidated inside
-   it, so that transaction is no longer open while those files are read. The `aise` CLI, MCP
-   server, TUI and Python package already serialize index writes with the cross-process index
-   writer lock, so they behave as before; only a Rust caller that writes through a second
-   connection without that lock waits less. A descendant that changed after preparation, or that
-   preparation did not cover, is parsed or invalidated inside the transaction. Pi and Prime Agent
-   descendants are still parsed inside it.
+1. Codex fork descendants are now parsed before the SQLite write transaction opens, so that
+   transaction stays open for less time. Each descendant file is still read once per publication:
+   inside the transaction, aise compares the file's size and modification time with the values
+   recorded when it was parsed and reuses that parse when they match. A descendant whose file
+   changed in between, or that was selected only inside the transaction, is parsed there, as
+   every descendant was in 1.1.0rc1; if its file has changed again, it is marked for the next
+   refresh to reparse. The `aise` CLI, MCP server, TUI and Python package take the cross-process
+   index writer lock before writing, so their refresh time and peak memory match 1.1.0rc1: a full
+   reindex of 197 rollout files from Codex fork families measured the same within run-to-run
+   variation. A Rust caller that writes through a second connection without that lock waits for
+   less time. Pi and Prime Agent descendants are parsed inside the transaction, as in 1.1.0rc1.
 
 ## [1.1.0rc1] - 2026-11-15
 
