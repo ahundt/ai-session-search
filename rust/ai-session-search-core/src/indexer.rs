@@ -802,8 +802,9 @@ pub(crate) fn reindex_until(
         .iter()
         .map(|source| (source.provider, normalize_path(&source.path)))
         .collect::<HashSet<_>>();
-    let indexed_source_paths = db
-        .indexed_source_identities()?
+    let indexed_identities = db.indexed_source_identities()?;
+    let held_codex_threads = crate::providers::codex::held_rollout_threads(&indexed_identities);
+    let indexed_source_paths = indexed_identities
         .into_iter()
         .map(|source| (source.provider, source.source_path))
         .collect::<HashSet<_>>();
@@ -904,10 +905,17 @@ pub(crate) fn reindex_until(
         let family_current = family
             .as_ref()
             .is_some_and(|family| !family.requires_reparse);
+        // A rollout of a reverted Codex thread is reconciled into the thread's one session, which
+        // names a single rollout as its source. Another rollout whose receipt is current is
+        // represented by that session, as doctor counts it, and has nothing to parse.
+        let held_by_thread_session = source.provider == Provider::Codex
+            && crate::providers::codex::rollout_thread_id(&source.path)
+                .is_some_and(|thread| held_codex_threads.contains(thread));
         let current_without_session = !full
             && refresh_state == SourceFileRefreshState::Current
             && reconciliation.is_none()
-            && !family_current;
+            && !family_current
+            && !held_by_thread_session;
         let family_requires_reparse = family
             .as_ref()
             .is_some_and(|family| family.requires_reparse);
@@ -1062,6 +1070,8 @@ pub(crate) fn reindex_until(
         } else {
             None
         };
+        #[cfg(test)]
+        TEST_FULL_PARSES.with(|parses| parses.borrow_mut().push(source.path.clone()));
         let mut parsed = match parsed_from_family {
             Some(parsed) => parsed,
             None => match adapters.parse_until_with_clock_seed(
@@ -1769,6 +1779,8 @@ enum TailOutcome {
 #[cfg(test)]
 thread_local! {
     static TEST_TAIL_OUTCOMES: std::cell::RefCell<Vec<TailOutcome>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Sources `reindex` read in full, in order, since a test last cleared it.
+    static TEST_FULL_PARSES: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Read a parser's conservative marker when records depend on an earlier prefix.
@@ -6465,6 +6477,504 @@ mod tests {
             .unwrap();
         hits.sort_by_key(|hit| hit.seq);
         hits.into_iter().map(|hit| hit.content).collect()
+    }
+
+    const REVERT_THREAD: &str = "01a13899-5fe0-7651-a51f-0b42469588e6";
+    const REVERT_ROLLOUT_B: &str = "01a1389c-f5fc-76b3-ba16-9ae7e18559d6";
+    const REVERT_ROLLOUT_C: &str = "01a138a8-1dee-7c11-90fc-42dc004cffa2";
+    const REVERT_ROLLOUT_D: &str = "01a138b0-0000-7c11-90fc-42dc004cffa3";
+
+    /// A rollout of the reverted thread: `session_meta` naming the thread, then one user message
+    /// per prompt, then `padding` bytes of assistant text so an append is long enough for the
+    /// incremental tail parse.
+    fn revert_rollout_text(base: Option<&str>, prompts: &[&str], padding: usize) -> String {
+        let mut meta = serde_json::json!({"id":REVERT_THREAD,"cwd":"/tmp/reverted"});
+        if let Some(rollout) = base {
+            meta["history_base"] = serde_json::json!({"thread_id":rollout});
+        }
+        let mut text = serde_json::json!({"type":"session_meta","payload":meta}).to_string() + "\n";
+        for prompt in prompts {
+            text += &revert_user_line(prompt);
+        }
+        if padding > 0 {
+            text += &(serde_json::json!({"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(padding)}]}}).to_string() + "\n");
+        }
+        text
+    }
+
+    fn revert_user_line(prompt: &str) -> String {
+        serde_json::json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":prompt}]}}).to_string() + "\n"
+    }
+
+    /// The three rollouts of one reverted thread in a temp directory, indexed once.
+    struct RevertedThread {
+        _dir: tempfile::TempDir,
+        db_path: PathBuf,
+        root: PathBuf,
+        config: Config,
+        db: Db,
+        files: [PathBuf; 3],
+    }
+
+    impl RevertedThread {
+        fn rollout_path(root: &Path, time: &str, rollout: Option<&str>) -> PathBuf {
+            match rollout {
+                None => root.join(format!("rollout-{time}-{REVERT_THREAD}.jsonl")),
+                Some(rollout) => {
+                    root.join(format!("rollout-{time}-{REVERT_THREAD}_{rollout}.jsonl"))
+                }
+            }
+        }
+
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join("codex/2026/10/14");
+            std::fs::create_dir_all(&root).unwrap();
+            let padding = 2 * crate::tail::OVERLAP_BYTES as usize;
+            let files = [
+                Self::rollout_path(&root, "2026-10-14T12-08-58", None),
+                Self::rollout_path(&root, "2026-10-14T12-12-53", Some(REVERT_ROLLOUT_B)),
+                Self::rollout_path(&root, "2026-10-14T12-25-04", Some(REVERT_ROLLOUT_C)),
+            ];
+            std::fs::write(
+                &files[0],
+                revert_rollout_text(None, &["first prompt", "first reverted prompt"], 0),
+            )
+            .unwrap();
+            std::fs::write(
+                &files[1],
+                revert_rollout_text(Some(REVERT_THREAD), &["second prompt"], 0),
+            )
+            .unwrap();
+            std::fs::write(
+                &files[2],
+                revert_rollout_text(Some(REVERT_ROLLOUT_B), &["third prompt"], padding),
+            )
+            .unwrap();
+            let (config, db) = codex_config_and_db(dir.path());
+            reindex(&config, &db, false, None).unwrap();
+            let db_path = dir.path().join("index.db");
+            Self {
+                _dir: dir,
+                db_path,
+                root,
+                config,
+                db,
+                files,
+            }
+        }
+
+        /// Run a refresh and return the sorted file names read in full and the tail outcomes.
+        fn refresh(&self, full: bool) -> (Vec<String>, Vec<TailOutcome>) {
+            TEST_FULL_PARSES.with(|parses| parses.borrow_mut().clear());
+            TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow_mut().clear());
+            reindex(&self.config, &self.db, full, None).unwrap();
+            let mut full_parses = TEST_FULL_PARSES.with(|parses| {
+                parses
+                    .borrow()
+                    .iter()
+                    .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            });
+            full_parses.sort();
+            let tails = TEST_TAIL_OUTCOMES.with(|outcomes| outcomes.borrow().clone());
+            (full_parses, tails)
+        }
+
+        fn name(path: &Path) -> String {
+            path.file_name().unwrap().to_string_lossy().into_owned()
+        }
+
+        /// Stored sessions and messages, without receipts.
+        fn content(db_path: &Path) -> Vec<String> {
+            let conn = rusqlite::Connection::open(db_path).unwrap();
+            let mut rows = Vec::new();
+            let mut sessions = conn
+                .prepare("select id, message_count from sessions order by id")
+                .unwrap();
+            rows.extend(
+                sessions
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "session {} messages={}",
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<i64>>(1)?.unwrap_or(-1)
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap),
+            );
+            let mut messages = conn
+                .prepare("select session_id, seq, role, content from messages order by session_id, seq, id")
+                .unwrap();
+            rows.extend(
+                messages
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "{} {} {} {}",
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?
+                                .chars()
+                                .take(40)
+                                .collect::<String>()
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap),
+            );
+            rows
+        }
+
+        /// Stored content plus every receipt column a refresh writes, and the session's source.
+        fn stored(&self) -> Vec<String> {
+            let mut rows = Self::content(&self.db_path);
+            let conn = rusqlite::Connection::open(&self.db_path).unwrap();
+            let mut sessions = conn
+                .prepare("select id, source_path from sessions order by id")
+                .unwrap();
+            rows.extend(
+                sessions
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "source {} {}",
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap),
+            );
+            let mut receipts = conn
+                .prepare(
+                    "select source_path, mtime_ns, size_bytes, parse_version, tail_byte_offset, \
+                     last_indexed_at, prefix_fingerprint, overlap_digest from files_seen order by source_path",
+                )
+                .unwrap();
+            rows.extend(
+                receipts
+                    .query_map([], |row| {
+                        Ok(format!(
+                            "receipt {} {} {} {} {:?} {} {:?} {:?}",
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?
+                        ))
+                    })
+                    .unwrap()
+                    .map(Result::unwrap),
+            );
+            rows
+        }
+
+        /// The rollout of the thread that holds the stored session.
+        fn holder(&self) -> String {
+            let path = self
+                .db
+                .exact_session_source_path(&format!("codex:{REVERT_THREAD}"))
+                .unwrap()
+                .unwrap();
+            Self::name(Path::new(&path))
+        }
+    }
+
+    fn stored_prompts(db: &Db) -> Vec<String> {
+        codex_prompts(db, REVERT_THREAD)
+    }
+
+    /// Nothing changed on disk: no rollout of the thread is read again, and nothing is rewritten.
+    #[test]
+    fn an_unchanged_reverted_codex_thread_reads_no_rollout_on_refresh() {
+        let thread = RevertedThread::new();
+        thread.refresh(false);
+        let before = thread.stored();
+        for round in 0..2 {
+            let (full_parses, tails) = thread.refresh(false);
+            assert!(
+                full_parses.is_empty() && tails.is_empty(),
+                "round {round}: unchanged rollouts were read: full={full_parses:?} tail={tails:?}"
+            );
+            assert_eq!(thread.stored(), before, "round {round}");
+        }
+        assert_eq!(stored_prompts(&thread.db).len(), 4);
+    }
+
+    /// An append to the newest rollout is read as a tail, and no other rollout is read.
+    #[test]
+    fn appending_to_the_newest_reverted_rollout_reads_only_that_tail() {
+        use std::io::Write as _;
+        let thread = RevertedThread::new();
+        thread.refresh(false);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&thread.files[2])
+            .unwrap()
+            .write_all(revert_user_line("appended prompt").as_bytes())
+            .unwrap();
+        let (full_parses, tails) = thread.refresh(false);
+        assert!(full_parses.is_empty(), "{full_parses:?}");
+        assert_eq!(tails, [TailOutcome::Appended]);
+        assert_eq!(
+            stored_prompts(&thread.db).last().map(String::as_str),
+            Some("appended prompt")
+        );
+        assert_eq!(stored_prompts(&thread.db).len(), 5);
+        let (full_parses, tails) = thread.refresh(false);
+        assert!(full_parses.is_empty() && tails.is_empty());
+    }
+
+    /// A new revert adds a rollout: only the new file is read, never the unchanged older ones.
+    #[test]
+    fn a_new_revert_rollout_is_read_and_the_older_ones_are_not() {
+        let thread = RevertedThread::new();
+        thread.refresh(false);
+        let fourth = RevertedThread::rollout_path(
+            &thread.root,
+            "2026-10-14T12-40-00",
+            Some(REVERT_ROLLOUT_D),
+        );
+        std::fs::write(
+            &fourth,
+            revert_rollout_text(Some(REVERT_ROLLOUT_C), &["fourth prompt"], 0),
+        )
+        .unwrap();
+        let (full_parses, tails) = thread.refresh(false);
+        assert_eq!(full_parses, [RevertedThread::name(&fourth)]);
+        assert!(
+            tails.is_empty() || tails == [TailOutcome::FullParse],
+            "{tails:?}"
+        );
+        assert_eq!(
+            stored_prompts(&thread.db),
+            [
+                "first prompt",
+                "first reverted prompt",
+                "second prompt",
+                "third prompt",
+                "fourth prompt"
+            ]
+        );
+        let (full_parses, tails) = thread.refresh(false);
+        assert!(
+            full_parses.is_empty() && tails.is_empty(),
+            "{full_parses:?}"
+        );
+    }
+
+    /// Changed bytes in an older rollout that is not the session's source are read again, and
+    /// the stored thread equals a fresh index of the same files.
+    #[test]
+    fn a_changed_older_reverted_rollout_is_read_and_matches_a_fresh_index() {
+        let thread = RevertedThread::new();
+        thread.refresh(false);
+        let older = &thread.files[0];
+        assert_ne!(thread.holder(), RevertedThread::name(older));
+        std::fs::write(
+            older,
+            revert_rollout_text(
+                None,
+                &[
+                    "first prompt",
+                    "first reverted prompt",
+                    "first edited prompt",
+                ],
+                0,
+            ),
+        )
+        .unwrap();
+        let (full_parses, tails) = thread.refresh(false);
+        let read: Vec<_> = full_parses
+            .iter()
+            .cloned()
+            .chain(tails.iter().map(|tail| format!("tail {tail:?}")))
+            .collect();
+        assert!(
+            full_parses == [RevertedThread::name(older)] || tails == [TailOutcome::Appended],
+            "the changed rollout must be read, and only it: {read:?}"
+        );
+        assert!(
+            stored_prompts(&thread.db).contains(&"first edited prompt".to_string()),
+            "{:?}",
+            stored_prompts(&thread.db)
+        );
+
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_root = fresh.path().join("codex/2026/10/14");
+        std::fs::create_dir_all(&fresh_root).unwrap();
+        for file in &thread.files {
+            std::fs::copy(file, fresh_root.join(file.file_name().unwrap())).unwrap();
+        }
+        let (fresh_config, fresh_db) = codex_config_and_db(fresh.path());
+        reindex(&fresh_config, &fresh_db, true, None).unwrap();
+        // Rows a later parse adds to a thread follow the rows already stored, so a fresh index
+        // may number them differently; the same rows must exist.
+        let as_set = |mut rows: Vec<String>| {
+            rows.iter_mut().for_each(|row| {
+                if let Some((id, rest)) = row.split_once(' ') {
+                    if let Some((_, rest)) = rest.split_once(' ') {
+                        *row = format!("{id} {rest}");
+                    }
+                }
+            });
+            rows.sort();
+            rows
+        };
+        assert_eq!(
+            as_set(RevertedThread::content(&thread.db_path)),
+            as_set(RevertedThread::content(&fresh.path().join("index.db")))
+        );
+        let (full_parses, tails) = thread.refresh(false);
+        assert!(
+            full_parses.is_empty() && tails.is_empty(),
+            "{full_parses:?}"
+        );
+    }
+
+    /// Deleting a rollout that is not the session's source keeps every stored row, and the
+    /// surviving rollouts keep matching their receipts.
+    #[test]
+    fn deleting_a_non_holder_reverted_rollout_keeps_the_history() {
+        let thread = RevertedThread::new();
+        thread.refresh(false);
+        let holder = thread.holder();
+        let before = RevertedThread::content(&thread.db_path);
+        let victim = thread
+            .files
+            .iter()
+            .find(|file| RevertedThread::name(file) != holder)
+            .unwrap()
+            .clone();
+        std::fs::remove_file(&victim).unwrap();
+        thread.refresh(false);
+        assert_eq!(RevertedThread::content(&thread.db_path), before);
+        assert_eq!(thread.holder(), holder);
+        assert_eq!(stored_prompts(&thread.db).len(), 4);
+        let receipt_paths = {
+            let conn = rusqlite::Connection::open(&thread.db_path).unwrap();
+            let mut statement = conn
+                .prepare("select source_path from files_seen order by source_path")
+                .unwrap();
+            let paths = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            paths
+        };
+        assert_eq!(receipt_paths.len(), 3, "{receipt_paths:?}");
+    }
+
+    /// A rollout whose receipt records an older parser is read again even though its thread is
+    /// held by another rollout.
+    #[test]
+    fn a_reverted_rollout_with_an_older_parser_receipt_is_read_again() {
+        let thread = RevertedThread::new();
+        thread.refresh(false);
+        let holder = thread.holder();
+        let stale = thread
+            .files
+            .iter()
+            .find(|file| RevertedThread::name(file) != holder)
+            .unwrap()
+            .clone();
+        let before = RevertedThread::content(&thread.db_path);
+        let marked = rusqlite::Connection::open(&thread.db_path)
+            .unwrap()
+            .execute(
+                "update files_seen set parse_version = 'stale' where source_path like ?1",
+                [format!("%{}", RevertedThread::name(&stale))],
+            )
+            .unwrap();
+        assert_eq!(marked, 1);
+        let (full_parses, _) = thread.refresh(false);
+        assert_eq!(full_parses, [RevertedThread::name(&stale)]);
+        assert_eq!(RevertedThread::content(&thread.db_path), before);
+        let (full_parses, tails) = thread.refresh(false);
+        assert!(
+            full_parses.is_empty() && tails.is_empty(),
+            "{full_parses:?}"
+        );
+    }
+
+    /// A full reindex still reads every rollout.
+    #[test]
+    fn a_full_reindex_reads_every_reverted_rollout() {
+        let thread = RevertedThread::new();
+        thread.refresh(false);
+        let (full_parses, _) = thread.refresh(true);
+        let mut expected: Vec<_> = thread
+            .files
+            .iter()
+            .map(|file| RevertedThread::name(file))
+            .collect();
+        expected.sort();
+        assert_eq!(full_parses, expected);
+        assert_eq!(stored_prompts(&thread.db).len(), 4);
+    }
+
+    /// Two files claim one session ID but share a thread in their names, so neither is a held
+    /// rollout of that thread: the session is not the thread's. The file that is not the
+    /// session's source is not skipped as represented, and takes the session over when the
+    /// source file is deleted.
+    #[test]
+    fn a_codex_id_collision_within_one_named_thread_is_not_skipped_as_represented() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex/2026/10/14");
+        std::fs::create_dir_all(&root).unwrap();
+        let named = "01a13899-5fe0-7651-a51f-0b42469588e6";
+        let claimed = "01a138a8-1dee-7c11-90fc-42dc004cffa2";
+        let revert = "01a1389c-f5fc-76b3-ba16-9ae7e18559d6";
+        let plain = root.join(format!("rollout-2026-10-14T12-08-58-{named}.jsonl"));
+        let suffixed = root.join(format!(
+            "rollout-2026-10-14T12-12-53-{named}_{revert}.jsonl"
+        ));
+        std::fs::write(&plain, codex_rollout_text(claimed, &["plain prompt"])).unwrap();
+        std::fs::write(&suffixed, codex_rollout_text(claimed, &["suffixed prompt"])).unwrap();
+        let (config, db) = codex_config_and_db(dir.path());
+        reindex(&config, &db, false, None).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        let session_id = format!("codex:{claimed}");
+        let holder = PathBuf::from(db.exact_session_source_path(&session_id).unwrap().unwrap());
+        let (survivor, survivor_prompt) = if holder.file_name() == plain.file_name() {
+            (&suffixed, "suffixed prompt")
+        } else {
+            (&plain, "plain prompt")
+        };
+        std::fs::remove_file(&holder).unwrap();
+        reindex(&config, &db, false, None).unwrap();
+        assert_eq!(
+            db.exact_session_source_path(&session_id)
+                .unwrap()
+                .map(|path| PathBuf::from(path).file_name().unwrap().to_owned()),
+            survivor.file_name().map(|name| name.to_owned()),
+            "the surviving file must take over the session"
+        );
+        assert!(
+            codex_prompts_for(&db, &session_id).contains(&survivor_prompt.to_string()),
+            "{:?}",
+            codex_prompts_for(&db, &session_id)
+        );
+    }
+
+    fn codex_prompts_for(db: &Db, session_id: &str) -> Vec<String> {
+        use crate::models::MessageFilters;
+        db.search_messages(
+            "prompt",
+            &MessageFilters {
+                session_id: Some(session_id.to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .into_iter()
+        .map(|hit| hit.content)
+        .collect()
     }
 
     /// A rollout named `<T>_<R>` whose `session_meta.id` is Q is read as a rollout of T by name,
