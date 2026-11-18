@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.release_versions import cargo_version_for_python, release_sort_key
+from scripts.release_versions import cargo_version_for_python, parse_release_phases, release_sort_key
 from scripts.verify_release_metadata import (
     ReleaseMetadataError,
     check_notes_shape,
@@ -410,3 +410,17 @@ def test_registry_metadata_version_tracks_the_release(tmp_path: Path, package: b
     path.write_text(json.dumps(metadata))
     with pytest.raises(ReleaseMetadataError, match=r"server\.json.*version"):
         verify_release_metadata(tmp_path, "v1.0.0")
+
+
+@pytest.mark.parametrize("row", ["alpha", "alpha a extra", "alpha\ta b"])
+def test_a_malformed_release_phase_row_names_the_file_the_row_and_the_expected_form(row: str) -> None:
+    with pytest.raises(ValueError) as error:
+        parse_release_phases(f"# comment\nrc rc\n{row}\n", "release-phases.txt")
+    message = str(error.value)
+    assert "release-phases.txt" in message
+    assert repr(row) in message
+    assert "<cargo phase> <python phase>" in message
+
+
+def test_release_phase_rows_skip_comments_and_blank_lines() -> None:
+    assert parse_release_phases("# c\n\nalpha a\nrc rc\n", "release-phases.txt") == [("alpha", "a"), ("rc", "rc")]

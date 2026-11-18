@@ -8,13 +8,23 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-_PHASES = [
-    line.split()
-    for line in (Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/src/release-phases.txt")
-    .read_text(encoding="utf-8")
-    .splitlines()
-    if line and not line.startswith("#")
-]
+_PHASES_FILE = Path(__file__).resolve().parents[1] / "rust/ai-session-search-core/src/release-phases.txt"
+
+
+def parse_release_phases(text: str, source: str) -> list[tuple[str, str]]:
+    """Return the `(cargo phase, python phase)` pairs of a release-phases file, named `source` in errors."""
+    phases = []
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) != 2:
+            raise ValueError(f'{source} row {line!r} must be "<cargo phase> <python phase>"')
+        phases.append((fields[0], fields[1]))
+    return phases
+
+
+_PHASES = parse_release_phases(_PHASES_FILE.read_text(encoding="utf-8"), _PHASES_FILE.name)
 _CARGO_PHASE = {python: cargo for cargo, python in _PHASES}
 
 PYTHON_RELEASE_VERSION = re.compile(
