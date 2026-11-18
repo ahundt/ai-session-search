@@ -183,15 +183,7 @@ fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {
     // parse is reconciled into the thread's one session, which keeps rows a later parse no longer
     // holds. Only one rollout can be its source path; another is represented when its thread's
     // session is held by a rollout of that thread and its receipt is at the current parser.
-    let held_codex_threads: HashSet<String> = identities
-        .iter()
-        .filter(|source| source.provider == Provider::Codex)
-        .filter_map(|source| {
-            let thread =
-                crate::providers::codex::rollout_thread_id(Path::new(&source.source_path))?;
-            (source.session_id == format!("codex:{thread}")).then(|| thread.to_string())
-        })
-        .collect();
+    let held_codex_threads = crate::providers::codex::held_rollout_threads(&identities);
     let mut indexed: HashSet<_> = identities
         .into_iter()
         .map(|source| (source.provider, source.source_path))
