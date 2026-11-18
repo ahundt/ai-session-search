@@ -2619,8 +2619,8 @@ impl Db {
         new_edits: Option<&[FileEdit]>,
         aliases: &[String],
     ) -> Result<(Transaction<'_>, Option<HashMap<String, PreparedFork>>)> {
-        // Three speculative preparations bound wasted I/O under contention. The fourth
-        // attempt uses the original locked reconciliation instead of retrying indefinitely.
+        // Three speculative preparations bound wasted I/O under contention. After three failed
+        // preparations, reconciliation runs under the writer lock instead of retrying.
         // Pi-family parsing also depends on parent source files, so it retains the locked path.
         let mut changed_sources = std::collections::HashSet::new();
         for _ in 0..3 {
@@ -2641,9 +2641,9 @@ impl Db {
                 .exists([&session.id])?;
             if let Some(parsed) = full.filter(|_| has_children) {
                 // A retracted publisher key is either recovered locally or still held by
-                // an ancestor. Thus this union describes its post-publication key set even
-                // when counted reconciliation removes local copies. Follow pending ancestry,
-                // not the stored link that this publication may replace.
+                // an ancestor. The union therefore holds every key the publisher has after
+                // publication, even when counted reconciliation removes local copies. Follow
+                // pending ancestry, not the stored link that this publication may replace.
                 for edit in parsed.file_edits.iter().chain(&parsed.retracted.file_edits) {
                     extra_keys.insert(parsed_file_edit_keys(edit)?.edit);
                 }
@@ -8681,6 +8681,9 @@ fn fork_probe_edit_key(row: &rusqlite::Row<'_>) -> Result<RowDigest> {
     ))
 }
 
+/// Return the `(id, parent id, source)` of each indexed descendant whose stored edits share a key
+/// with the publisher's edits and so need reconciling, in the order the ancestry is walked.
+///
 /// Reconcile indexed descendants before publishing changed Codex or Pi-family edits. For S sessions and R
 /// receipts, each parent lookup costs O(log S + K(log S + log R)) for K children, retaining
 /// O(K) paths plus O(D) visited identities for D reachable descendants. A no-fork publication
@@ -8695,8 +8698,9 @@ fn fork_probe_edit_key(row: &rusqlite::Row<'_>) -> Result<RowDigest> {
 /// parsed edit rows, discarding conversation bodies after each parse. Retained memory adds the
 /// sum of candidate edit bytes and session metadata; peak parser memory adds one source's parsed
 /// rows. Publication repeats exact selection under the writer lock and applies cached edits
-/// against current ancestry. Codex opens descendant sources under the write lock only after
-/// exhausting preparation retries; Pi-family publications retain their original locked path.
+/// against current ancestry. Codex opens a descendant source under the write lock only after
+/// preparation retries are exhausted, or when the selected descendant was not prepared or its
+/// file changed after preparation; Pi-family publications always open sources under the write lock.
 fn select_fork_sources(
     tx: &Connection,
     session: &SessionRecord,
