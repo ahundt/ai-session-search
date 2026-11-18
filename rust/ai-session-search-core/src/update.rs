@@ -667,7 +667,13 @@ fn python_version(version: &Version) -> Result<String> {
         .context("release prerelease must use a named phase and numeric component")?;
     let phase = release_phases()
         .find_map(|(cargo, python)| (cargo == phase).then_some(python))
-        .with_context(|| format!("unsupported release prerelease phase {phase:?}"))?;
+        .with_context(|| {
+            let supported = release_phases()
+                .map(|(cargo, _)| cargo)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("unsupported release prerelease phase {phase:?}; supported phases: {supported}")
+        })?;
     if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
         bail!("release prerelease number is invalid");
     }
@@ -2173,7 +2179,7 @@ mod tests {
             python_version(&Version::parse("1.2.3-preview.1").unwrap())
                 .unwrap_err()
                 .to_string(),
-            "unsupported release prerelease phase \"preview\""
+            "unsupported release prerelease phase \"preview\"; supported phases: alpha, beta, rc"
         );
         assert_eq!(
             python_version(&Version::parse("1.2.3-alpha.x").unwrap())
