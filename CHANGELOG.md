@@ -11,7 +11,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-## [1.1.0rc2] - 2026-11-17
+## [1.1.0rc2] - 2026-11-18
 
 1.1.0rc2 corrects `aise doctor` and refresh for Codex threads rewound with `thread/revert`, and
 moves rusqlite to 0.43. Upgrading from 1.1.0rc1 changes no stored format and reparses no transcript.
