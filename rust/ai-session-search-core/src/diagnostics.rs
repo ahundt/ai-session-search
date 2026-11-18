@@ -16,7 +16,7 @@ pub fn collect(config: &Config, db: &Db) -> Result<DiagnosticStatus> {
     let discovery_warnings = inventory.warnings.clone();
     let parser_health = db.parser_health()?;
     let stale_sources = db.stale_session_sources()?;
-    let indexed = indexed_source_set(db)?;
+    let indexed = indexed_source_set(db, &inventory.discovered)?;
     let mut index_status = classify_index_status(
         parser_health,
         &stale_sources,
@@ -107,7 +107,7 @@ fn index_status_for_discovered(
 ) -> Result<IndexStatus> {
     let parser_health = db.parser_health()?;
     let stale_sources = db.stale_session_sources()?;
-    let indexed = indexed_source_set(db)?;
+    let indexed = indexed_source_set(db, discovered)?;
     Ok(classify_index_status(
         parser_health,
         &stale_sources,
@@ -138,16 +138,21 @@ pub struct UnindexedFile {
 /// from the file itself, and the set is small by construction: if it were large the index
 /// would be broadly broken, which is a different problem.
 pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>> {
-    let indexed = indexed_source_set(db)?;
+    let providers = crate::source::ProviderSet::new(config);
+    let sources = providers.discover_enabled(config).sources;
+    let discovered = sources
+        .iter()
+        .map(|source| (source.provider, normalize_path(&source.path)))
+        .collect::<HashSet<_>>();
+    let indexed = indexed_source_set(db, &discovered)?;
     let holders: HashMap<(Provider, String), String> = db
         .indexed_source_identities()?
         .into_iter()
         .map(|source| ((source.provider, source.session_id), source.source_path))
         .collect();
 
-    let providers = crate::source::ProviderSet::new(config);
     let mut explained = Vec::new();
-    for source in providers.discover_enabled(config).sources {
+    for source in sources {
         let key = (source.provider, normalize_path(&source.path));
         if indexed.contains(&key) {
             continue;
@@ -177,13 +182,16 @@ pub fn explain_unindexed(config: &Config, db: &Db) -> Result<Vec<UnindexedFile>>
 /// rollouts of a reverted Codex thread. Processing receipts alone do not prove representation.
 /// The family lookup adds one metadata scan over Gemini sessions, O(G) rows plus their metadata
 /// bytes, and the Codex lookup one scan of Codex receipts; transcripts are never read.
-fn indexed_source_set(db: &Db) -> Result<HashSet<(Provider, String)>> {
+fn indexed_source_set(
+    db: &Db,
+    discovered: &HashSet<(Provider, String)>,
+) -> Result<HashSet<(Provider, String)>> {
     let identities = db.indexed_source_identities()?;
     // Codex `thread/revert` starts another rollout file for the same thread, and every rollout's
     // parse is reconciled into the thread's one session, which keeps rows a later parse no longer
     // holds. Only one rollout can be its source path; another is represented when its thread's
     // session is held by a rollout of that thread and its receipt is at the current parser.
-    let held_codex_threads = crate::providers::codex::held_rollout_threads(&identities);
+    let held_codex_threads = crate::providers::codex::held_rollout_threads(&identities, discovered);
     let mut indexed: HashSet<_> = identities
         .into_iter()
         .map(|source| (source.provider, source.source_path))
@@ -479,10 +487,12 @@ mod tests {
         std::fs::rename(&path, &renamed).unwrap();
         crate::indexer::reindex(&config, &db, false, None).unwrap();
         assert_represented(&config, &db, Provider::Claude, 1);
-        assert!(indexed_source_set(&db).unwrap().contains(&(
-            Provider::Claude,
-            normalize_path(&renamed.canonicalize().unwrap())
-        )));
+        assert!(indexed_source_set(&db, &HashSet::new())
+            .unwrap()
+            .contains(&(
+                Provider::Claude,
+                normalize_path(&renamed.canonicalize().unwrap())
+            )));
     }
 
     #[test]

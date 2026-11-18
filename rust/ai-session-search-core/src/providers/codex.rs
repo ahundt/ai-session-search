@@ -2437,13 +2437,17 @@ pub(crate) fn rollout_sibling(path: &Path) -> Option<PathBuf> {
 /// Threads whose stored session is held by one of their own rollouts: the stored source path is
 /// a rollout named for the thread whose ID is the session's. A rollout of such a thread that is
 /// not the source path is still represented, because every rollout's parse is reconciled into
-/// that one session. Doctor and the incremental refresh both use this, so they agree.
+/// that one session. A holder that discovery no longer finds does not hold its thread: a surviving
+/// rollout is read and takes over as the session's source path. Doctor and the incremental refresh
+/// both use this, so they agree.
 pub(crate) fn held_rollout_threads(
     identities: &[crate::db::IndexedSourceIdentity],
+    discovered: &HashSet<(Provider, String)>,
 ) -> HashSet<String> {
     identities
         .iter()
         .filter(|source| source.provider == Provider::Codex)
+        .filter(|source| discovered.contains(&(source.provider, source.source_path.clone())))
         .filter_map(|source| {
             let thread = rollout_thread_id(Path::new(&source.source_path))?;
             (source.session_id == format!("codex:{thread}")).then(|| thread.to_string())

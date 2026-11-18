@@ -803,7 +803,10 @@ pub(crate) fn reindex_until(
         .map(|source| (source.provider, normalize_path(&source.path)))
         .collect::<HashSet<_>>();
     let indexed_identities = db.indexed_source_identities()?;
-    let held_codex_threads = crate::providers::codex::held_rollout_threads(&indexed_identities);
+    let held_codex_threads = crate::providers::codex::held_rollout_threads(
+        &indexed_identities,
+        &discovered_source_paths,
+    );
     let indexed_source_paths = indexed_identities
         .into_iter()
         .map(|source| (source.provider, source.source_path))
@@ -6379,11 +6382,19 @@ mod tests {
             ]
         );
         assert_eq!(unindexed(&db), 0);
+        TEST_FULL_PARSES.with(|parses| parses.borrow_mut().clear());
         assert_eq!(
             reindex(&config, &db, false, None).unwrap().1,
             0,
             "a current thread is skipped"
         );
+        TEST_FULL_PARSES.with(|parses| {
+            assert!(
+                parses.borrow().is_empty(),
+                "a current thread read rollouts in full: {:?}",
+                parses.borrow()
+            )
+        });
     }
 
     /// One Codex rollout: a `session_meta` line naming `id`, then one user message per prompt.
@@ -6891,6 +6902,60 @@ mod tests {
             paths
         };
         assert_eq!(receipt_paths.len(), 3, "{receipt_paths:?}");
+    }
+
+    /// Deleting the rollout that holds the session leaves the thread's other rollouts unchanged.
+    /// The next refresh reads each of them once and one becomes the session's source, every stored
+    /// message keeps its place, nothing is reported unindexed, and a refresh after that reads
+    /// nothing.
+    #[test]
+    fn deleting_the_holder_of_a_reverted_thread_hands_the_session_to_a_surviving_rollout() {
+        let thread = RevertedThread::new();
+        thread.refresh(false);
+        let holder = thread.holder();
+        let before = RevertedThread::content(&thread.db_path);
+        let prompts_before = stored_prompts(&thread.db);
+        let victim = thread
+            .files
+            .iter()
+            .find(|file| RevertedThread::name(file) == holder)
+            .unwrap()
+            .clone();
+        std::fs::remove_file(&victim).unwrap();
+        let (takeover_parses, takeover_tails) = thread.refresh(false);
+        let mut survivors = thread
+            .files
+            .iter()
+            .map(|file| RevertedThread::name(file))
+            .filter(|name| *name != holder)
+            .collect::<Vec<_>>();
+        survivors.sort();
+        assert_eq!(
+            takeover_parses, survivors,
+            "each surviving rollout is read in full once"
+        );
+        assert!(takeover_tails.is_empty(), "{takeover_tails:?}");
+        assert_eq!(RevertedThread::content(&thread.db_path), before);
+        assert_eq!(stored_prompts(&thread.db), prompts_before);
+        let source = thread
+            .db
+            .exact_session_source_path(&format!("codex:{REVERT_THREAD}"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            Path::new(&source).exists(),
+            "the session's source_path {source} names a rollout that is gone"
+        );
+        let unindexed = crate::diagnostics::collect(&thread.config, &thread.db)
+            .unwrap()
+            .index_status
+            .unindexed_files;
+        assert_eq!(unindexed, 0);
+        let (full_parses, tails) = thread.refresh(false);
+        assert!(
+            full_parses.is_empty() && tails.is_empty(),
+            "an unchanged refresh read rollouts: full={full_parses:?} tail={tails:?}"
+        );
     }
 
     /// A rollout whose receipt records an older parser is read again even though its thread is
