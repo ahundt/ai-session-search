@@ -26,8 +26,9 @@ One release has one identity, spelled the way each ecosystem requires:
 | Release candidate N of X.Y.Z | `X.Y.ZrcN`, tag `vX.Y.ZrcN` | `X.Y.Z-rc.N` |
 | Final X.Y.Z (including patch releases) | `X.Y.Z`, tag `vX.Y.Z` | `X.Y.Z` |
 
-`rust/ai-session-search-core/src/release-phases.txt` is the sole mapping between the two spellings'
-phases; `scripts/release_versions.py` and `update.rs` both read it. Preparing a
+`rust/ai-session-search-core/src/release-phases.txt` lists how each pre-release phase (alpha, beta,
+rc) is spelled in the Cargo and Python forms; `scripts/release_versions.py` and `update.rs` both
+read it. Preparing a
 release means setting all nine declarations to the new version, then running
 `cargo update --workspace` and `uv lock` so both lockfiles record it (the gate's lockfile checks
 fail otherwise), in one commit, and tagging that commit. The consumer crate stays unpublished at `0.0.0`; only its requirement on the released

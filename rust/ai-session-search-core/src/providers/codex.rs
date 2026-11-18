@@ -2462,7 +2462,7 @@ pub(crate) fn held_rollout_threads(
 /// optionally compressed to `.jsonl.zst` (`RolloutFileName` in
 /// codex-rs/rollout/src/rollout_file_name.rs). Every rollout's `session_meta.id` names the same
 /// thread, so the thread is the ID ending the name, or the first ID of a `<thread>_<rollout>` pair.
-/// An ID is accepted exactly as this parser always accepted one, so older names resolve as before.
+/// Whatever precedes the ID is ignored, so `rollout-<ID>.jsonl` and `<ID>.jsonl.zst` also resolve.
 pub(crate) fn rollout_thread_id(path: &Path) -> Option<&str> {
     // Bytes, not `&str`: a name that is not UTF-8 still holds an ASCII ID, and slicing a `&str`
     // 36 bytes from its end panics inside a multi-byte character.
@@ -2719,7 +2719,7 @@ mod tests {
             format!("rollout-2026-10-14T12-08-58-{thread}.jsonl"),
             format!("rollout-2026-10-14T12-12-53-{thread}_{rollout}.jsonl"),
             format!("rollout-2026-10-14T12-12-53-{thread}_{rollout}.jsonl.zst"),
-            // Names this parser has always accepted resolve as they did.
+            // Only the ID ending the stem matters, not what precedes it.
             format!("rollout-{thread}.jsonl"),
             format!("{thread}.jsonl.zst"),
             format!("rollout-2026-10-14T12-08-58-x_{thread}.jsonl"),
@@ -2776,7 +2776,7 @@ mod tests {
         }
     }
 
-    /// The old matcher ran on the lossy path string, so a name that is not UTF-8 still gave its ID.
+    /// The ID is read from the name's bytes, so a name that is not UTF-8 still gives its thread.
     #[cfg(unix)]
     #[test]
     fn a_rollout_name_that_is_not_utf8_still_gives_its_thread() {

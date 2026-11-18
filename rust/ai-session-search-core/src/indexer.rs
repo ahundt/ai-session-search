@@ -6247,9 +6247,9 @@ mod tests {
     /// Codex `thread/revert` keeps the thread ID and starts a new rollout file named
     /// `rollout-<time>-<thread>_<rollout>.jsonl`, whose `history_base` inherits a prefix of the
     /// previous rollout. Every rollout names the thread in `session_meta.id`, so their parses are
-    /// reconciled into one session, which keeps rows a later parse no longer holds. Doctor counted
-    /// every rollout but the session's source path as unindexed, said its content was absent
-    /// from search, and prescribed an `aise reindex` that could never clear the count.
+    /// reconciled into one session, which keeps rows a later parse no longer holds. Every rollout
+    /// whose receipt is current counts as indexed, the session keeps all rollouts' messages in time
+    /// order, and an unchanged refresh reads none of them again.
     #[test]
     fn a_reverted_codex_thread_is_one_session_and_none_of_its_rollouts_is_unindexed() {
         use crate::models::MessageFilters;
