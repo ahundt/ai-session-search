@@ -30,6 +30,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
    `doctor` said the extra files produced no session, that their content was absent from every
    search result, and prescribed an `aise reindex` that could never clear the count. New
    messages in such a thread are now read incrementally instead of by rereading its newest file.
+2. A refresh no longer rereads the unchanged rollout files of a reverted Codex thread. Each
+   refresh parsed every rollout of such a thread in full, except the one stored as the session's
+   source, even when no file had changed. A rollout that changed, is new, or was last read by an
+   older parser is still read.
 
 ### Security
 
